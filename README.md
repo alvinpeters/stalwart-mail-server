@@ -1,3 +1,18 @@
+# striczkof's Stalwart Mail Server
+
+This is the current source code of the
+mail server running in my FreeBSD clusters.
+
+## Building on FreeBSD (with FoundationDB)
+
+```sh
+RUSTFLAGS="-L /usr/local/lib -C target-cpu=native" \
+  cargo build --release --no-default-features \
+  --features "foundationdb rocks sqlite postgres mysql elastic s3 redis"
+```
+
+---
+
 <p align="center">
     <a href="https://stalw.art">
     <img src="./img/logo-red.svg" height="150">
