@@ -23,6 +23,7 @@
 
 use std::str::FromStr;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hyper::Method;
 use jmap_proto::error::request::RequestError;
 use mail_auth::{
@@ -61,6 +62,7 @@ pub struct Message {
     pub priority: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_id: Option<String>,
+    pub blob_hash: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -133,14 +135,18 @@ impl JMAP {
                 let to = params.get("to");
                 let before = params.parse::<Timestamp>("before").map(|t| t.into_inner());
                 let after = params.parse::<Timestamp>("after").map(|t| t.into_inner());
-                let page: usize = params.parse::<usize>("page").unwrap_or_default();
-                let limit: usize = params.parse::<usize>("limit").unwrap_or_default();
+                let page = params.parse::<usize>("page").unwrap_or_default();
+                let limit = params.parse::<usize>("limit").unwrap_or_default();
                 let values = params.has_key("values");
+
+                let range_start = params.parse::<u64>("range-start").unwrap_or_default();
+                let range_end = params.parse::<u64>("range-end").unwrap_or(u64::MAX);
+                let max_total = params.parse::<usize>("max-total").unwrap_or_default();
 
                 let mut result_ids = Vec::new();
                 let mut result_values = Vec::new();
-                let from_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(0)));
-                let to_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(u64::MAX)));
+                let from_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(range_start)));
+                let to_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(range_end)));
                 let has_filters = text.is_some()
                     || from.is_some()
                     || to.is_some()
@@ -190,7 +196,7 @@ impl JMAP {
                                         if values {
                                             result_values.push(Message::from(&message));
                                         } else {
-                                            result_ids.push(key.deserialize_be_u64(1)?);
+                                            result_ids.push(key.deserialize_be_u64(0)?);
                                         }
                                         total_returned += 1;
                                     }
@@ -201,7 +207,7 @@ impl JMAP {
                                 total += 1;
                             }
 
-                            Ok(true)
+                            Ok(max_total == 0 || total < max_total)
                         },
                     )
                     .await;
@@ -374,10 +380,14 @@ impl JMAP {
                 let page: usize = params.parse("page").unwrap_or_default();
                 let limit: usize = params.parse("limit").unwrap_or_default();
 
+                let range_start = params.parse::<u64>("range-start").unwrap_or_default();
+                let range_end = params.parse::<u64>("range-end").unwrap_or(u64::MAX);
+                let max_total = params.parse::<usize>("max-total").unwrap_or_default();
+
                 let mut result = Vec::new();
                 let from_key = ValueKey::from(ValueClass::Queue(QueueClass::DmarcReportHeader(
                     ReportEvent {
-                        due: 0,
+                        due: range_start,
                         policy_hash: 0,
                         seq_id: 0,
                         domain: String::new(),
@@ -385,7 +395,7 @@ impl JMAP {
                 )));
                 let to_key = ValueKey::from(ValueClass::Queue(QueueClass::TlsReportHeader(
                     ReportEvent {
-                        due: u64::MAX,
+                        due: range_end,
                         policy_hash: 0,
                         seq_id: 0,
                         domain: String::new(),
@@ -426,7 +436,7 @@ impl JMAP {
                                 }
                             }
 
-                            Ok(true)
+                            Ok(max_total == 0 || total < max_total)
                         },
                     )
                     .await;
@@ -559,6 +569,7 @@ impl From<&queue::Message> for Message {
                     expires: DateTime::from_timestamp(domain.expires as i64),
                 })
                 .collect(),
+            blob_hash: URL_SAFE_NO_PAD.encode::<&[u8]>(message.blob_hash.as_ref()),
         }
     }
 }

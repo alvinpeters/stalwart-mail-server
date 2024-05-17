@@ -35,7 +35,11 @@ pub mod search;
 pub mod store;
 pub mod thread;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ::managesieve::core::ManageSieveSessionManager;
 use common::{
@@ -270,7 +274,7 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
             .replace("{TMP}", &temp_dir.path.display().to_string()),
     )
     .unwrap();
-    config.resolve_macros().await;
+    config.resolve_all_macros().await;
 
     // Parse servers
     let mut servers = Servers::parse(&mut config);
@@ -303,7 +307,7 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
     config.assert_no_errors();
 
     // Spawn servers
-    let shutdown_tx = servers.spawn(|server, acceptor, shutdown_rx| {
+    let (shutdown_tx, _) = servers.spawn(|server, acceptor, shutdown_rx| {
         match &server.protocol {
             ServerProtocol::Smtp | ServerProtocol::Lmtp => server.spawn(
                 SmtpSessionManager::new(smtp.clone()),
@@ -394,6 +398,7 @@ pub async fn imap_tests() {
     }
 
     // Prepare settings
+    let start_time = Instant::now();
     let delete = true;
     let handle = init_imap_tests(
         &std::env::var("STORE")
@@ -447,6 +452,14 @@ pub async fn imap_tests() {
 
     // Run ManageSieve tests
     managesieve::test().await;
+
+    // Print elapsed time
+    let elapsed = start_time.elapsed();
+    println!(
+        "Elapsed: {}.{:03}s",
+        elapsed.as_secs(),
+        elapsed.subsec_millis()
+    );
 
     // Remove test data
     if delete {

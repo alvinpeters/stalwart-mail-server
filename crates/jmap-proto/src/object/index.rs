@@ -26,7 +26,7 @@ use std::{borrow::Cow, collections::HashSet};
 use store::{
     write::{
         assert::HashedValue, BatchBuilder, BitmapClass, BitmapHash, IntoOperations, Operation,
-        TagValue, TokenizeText, ValueClass, ValueOp,
+        TokenizeText, ValueClass, ValueOp,
     },
     Serialize,
 };
@@ -440,7 +440,7 @@ fn merge_batch(
     if has_changes {
         batch.ops.push(Operation::Value {
             class: Property::Value.into(),
-            op: ValueOp::Set(current.serialize()),
+            op: ValueOp::Set(current.serialize().into()),
         });
     }
 }
@@ -629,17 +629,8 @@ impl IntoIndex for &Id {
     }
 }
 
-impl From<Property> for ValueClass {
+impl<T> From<Property> for ValueClass<T> {
     fn from(value: Property) -> Self {
         ValueClass::Property(value.into())
-    }
-}
-
-impl From<Property> for BitmapClass {
-    fn from(value: Property) -> Self {
-        BitmapClass::Tag {
-            field: value.into(),
-            value: TagValue::Static(0),
-        }
     }
 }

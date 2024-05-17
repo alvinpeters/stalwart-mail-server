@@ -80,10 +80,11 @@ impl BootManager {
         if config_path.is_none() {
             let mut args = std::env::args().skip(1);
 
-            while let Some(arg) = args
-                .next()
-                .and_then(|arg| arg.strip_prefix("--").map(|arg| arg.to_string()))
-            {
+            while let Some(arg) = args.next().and_then(|arg| {
+                arg.strip_prefix("--")
+                    .or_else(|| arg.strip_prefix('-'))
+                    .map(|arg| arg.to_string())
+            }) {
                 let (key, value) = if let Some((key, value)) = arg.split_once('=') {
                     (key.to_string(), Some(value.trim().to_string()))
                 } else {
@@ -144,14 +145,17 @@ impl BootManager {
         }
         let cfg_local = config.keys.clone();
 
-        // Resolve macros
-        config.resolve_macros().await;
+        // Resolve environment macros
+        config.resolve_macros(&["env"]).await;
 
         // Parser servers
         let mut servers = Servers::parse(&mut config);
 
         // Bind ports and drop privileges
         servers.bind_and_drop_priv(&mut config);
+
+        // Resolve file and configuration macros
+        config.resolve_macros(&["file", "cfg"]).await;
 
         // Load stores
         let mut stores = Stores::parse(&mut config).await;
@@ -209,6 +213,22 @@ impl BootManager {
                 {
                     insert_keys.push(ConfigKey::from((
                         "oauth.key",
+                        thread_rng()
+                            .sample_iter(Alphanumeric)
+                            .take(64)
+                            .map(char::from)
+                            .collect::<String>(),
+                    )));
+                }
+
+                // Generate a Cluster encryption key if missing
+                if config
+                    .value("cluster.key")
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                {
+                    insert_keys.push(ConfigKey::from((
+                        "cluster.key",
                         thread_rng()
                             .sample_iter(Alphanumeric)
                             .take(64)

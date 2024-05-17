@@ -32,12 +32,10 @@ use utils::BlobHash;
 use crate::core::SMTP;
 
 use super::{
-    Domain, Event, Message, QueueId, QuotaKey, Recipient, Schedule, SimpleEnvelope, Status,
+    Domain, Event, Message, QueueEnvelope, QueueId, QuotaKey, Recipient, Schedule, Status,
 };
 
 pub const LOCK_EXPIRY: u64 = 300;
-pub const BLOB_EXPIRY: u64 = 3600;
-pub const SPOOL_ACCOUNT_ID: u32 = u32::MAX - 1;
 
 #[derive(Debug)]
 pub struct QueueEventLock {
@@ -93,15 +91,15 @@ impl SMTP {
                 IterateParams::new(from_key, to_key).ascending(),
                 |key, value| {
                     let event = QueueEventLock {
-                        due: key.deserialize_be_u64(1)?,
-                        queue_id: key.deserialize_be_u64(U64_LEN + 1)?,
+                        due: key.deserialize_be_u64(0)?,
+                        queue_id: key.deserialize_be_u64(U64_LEN)?,
                         lock_expiry: u64::deserialize(value)?,
                     };
                     let do_continue = event.due <= now;
                     if event.lock_expiry < now {
                         events.push(event);
                     } else {
-                        tracing::debug!(
+                        tracing::trace!(
                             context = "queue",
                             event = "locked",
                             id = event.queue_id,
@@ -152,17 +150,12 @@ impl SMTP {
                     event = "locked",
                     id = event.queue_id,
                     due = event.due,
-                    "Failed to lock event: Event already locked."
+                    "Lock busy: Event already locked."
                 );
                 None
             }
             Err(err) => {
-                tracing::error!(
-                    context = "queue",
-                    event = "error",
-                    "Failed to lock event: {}",
-                    err
-                );
+                tracing::error!(context = "queue", event = "error", "Lock error: {}", err);
                 None
             }
         }
@@ -219,10 +212,11 @@ impl Message {
 
         // Reserve and write blob
         let mut batch = BatchBuilder::new();
-        batch.with_account_id(SPOOL_ACCOUNT_ID).set(
+        let reserve_until = now() + 120;
+        batch.set(
             BlobOp::Reserve {
                 hash: self.blob_hash.clone(),
-                until: self.next_delivery_event() + BLOB_EXPIRY,
+                until: reserve_until,
             },
             0u32.serialize(),
         );
@@ -293,6 +287,17 @@ impl Message {
                 })),
                 0u64.serialize(),
             )
+            .clear(BlobOp::Reserve {
+                hash: self.blob_hash.clone(),
+                until: reserve_until,
+            })
+            .set(
+                BlobOp::LinkId {
+                    hash: self.blob_hash.clone(),
+                    id: self.id,
+                },
+                vec![],
+            )
             .set(
                 BlobOp::Commit {
                     hash: self.blob_hash.clone(),
@@ -341,22 +346,26 @@ impl Message {
                 idx
             } else {
                 let idx = self.domains.len();
-                let expires = core
-                    .core
-                    .eval_if(
-                        &core.core.smtp.queue.expire,
-                        &SimpleEnvelope::new(self, &rcpt_domain),
-                    )
-                    .await
-                    .unwrap_or_else(|| Duration::from_secs(5 * 86400));
+
                 self.domains.push(Domain {
                     domain: rcpt_domain,
                     retry: Schedule::now(),
-                    notify: Schedule::later(expires + Duration::from_secs(10)),
-                    expires: now() + expires.as_secs(),
+                    notify: Schedule::now(),
+                    expires: 0,
                     status: Status::Scheduled,
-                    disable_tls: false,
                 });
+
+                let expires = core
+                    .core
+                    .eval_if(&core.core.smtp.queue.expire, &QueueEnvelope::new(self, idx))
+                    .await
+                    .unwrap_or_else(|| Duration::from_secs(5 * 86400));
+
+                // Update expiration
+                let domain = self.domains.last_mut().unwrap();
+                domain.notify = Schedule::later(expires + Duration::from_secs(10));
+                domain.expires = now() + expires.as_secs();
+
                 idx
             };
         self.recipients.push(Recipient {
@@ -407,14 +416,6 @@ impl Message {
                 );
         }
 
-        batch.with_account_id(SPOOL_ACCOUNT_ID).set(
-            BlobOp::Reserve {
-                hash: self.blob_hash.clone(),
-                until: self.next_delivery_event() + BLOB_EXPIRY,
-            },
-            0u32.serialize(),
-        );
-
         batch.set(
             ValueClass::Queue(QueueClass::Message(self.id)),
             Bincode::new(self).serialize(),
@@ -452,18 +453,10 @@ impl Message {
         }
 
         batch
-            .with_account_id(SPOOL_ACCOUNT_ID)
-            .clear(BlobOp::Reserve {
+            .clear(BlobOp::LinkId {
                 hash: self.blob_hash.clone(),
-                until: prev_event + BLOB_EXPIRY,
+                id: self.id,
             })
-            .set(
-                BlobOp::Reserve {
-                    hash: self.blob_hash.clone(),
-                    until: now() - 1,
-                },
-                0u32.serialize(),
-            )
             .clear(ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
                 due: prev_event,
                 queue_id: self.id,

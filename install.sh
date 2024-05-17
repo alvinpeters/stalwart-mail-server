@@ -115,7 +115,6 @@ main() {
     # Create service file
     say "🚀 Starting service..."
     if [ "${_os}" = "linux" ]; then
-        printf "\n[server.run-as]\nuser = \"stalwart-mail\"\ngroup = \"stalwart-mail\"\n" >> "$_dir/etc/config.toml"
         create_service_linux "$_dir"
     elif [ "${_os}" = "macos" ]; then
         create_service_macos "$_dir"
@@ -137,7 +136,7 @@ Description=Stalwart Mail Server Server
 Conflicts=postfix.service sendmail.service exim4.service
 ConditionPathExists=__PATH__/etc/config.toml
 After=network-online.target
- 
+
 [Service]
 Type=simple
 LimitNOFILE=65536
@@ -147,10 +146,11 @@ Restart=on-failure
 RestartSec=5
 ExecStart=__PATH__/bin/stalwart-mail --config=__PATH__/etc/config.toml
 PermissionsStartOnly=true
-StandardOutput=syslog
-StandardError=syslog
 SyslogIdentifier=stalwart-mail
- 
+User=stalwart-mail
+Group=stalwart-mail
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
 [Install]
 WantedBy=multi-user.target
 EOF

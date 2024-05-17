@@ -46,10 +46,10 @@ use jmap_proto::{
 };
 
 use crate::{
-    auth::{oauth::OAuthMetadata, AccessToken},
+    auth::oauth::OAuthMetadata,
     blob::{DownloadResponse, UploadResponse},
     services::state,
-    JMAP,
+    JmapInstance, JMAP,
 };
 
 use super::{HtmlResponse, HttpRequest, HttpResponse, JmapSessionManager, JsonResponse};
@@ -72,7 +72,7 @@ impl JMAP {
         let mut path = req.uri().path().split('/');
         path.next();
 
-        match path.next().unwrap_or("") {
+        match path.next().unwrap_or_default() {
             "jmap" => {
                 // Authenticate request
                 let (_in_flight, access_token) =
@@ -88,16 +88,21 @@ impl JMAP {
                         Err(err) => return err.into_http_response(),
                     };
 
-                match (path.next().unwrap_or(""), req.method()) {
+                match (path.next().unwrap_or_default(), req.method()) {
                     ("", &Method::POST) => {
                         return match fetch_body(
                             &mut req,
-                            self.core.jmap.request_max_size,
-                            &access_token,
+                            if !access_token.is_super_user() {
+                                self.core.jmap.upload_max_size
+                            } else {
+                                0
+                            },
                         )
                         .await
                         .ok_or_else(|| RequestError::limit(RequestLimitError::SizeRequest))
                         .and_then(|bytes| {
+                            //let c = println!("<- {}", String::from_utf8_lossy(&bytes));
+
                             Request::parse(
                                 &bytes,
                                 self.core.jmap.request_max_calls,
@@ -105,13 +110,18 @@ impl JMAP {
                             )
                         }) {
                             Ok(request) => {
-                                //let _ = println!("<- {}", String::from_utf8_lossy(&bytes));
-
                                 match self
                                     .handle_request(request, access_token, &session.instance)
                                     .await
                                 {
-                                    Ok(response) => response.into_http_response(),
+                                    Ok(response) => {
+                                        /*let c = println!(
+                                            "-> {}",
+                                            serde_json::to_string_pretty(&response).unwrap()
+                                        );*/
+
+                                        response.into_http_response()
+                                    }
                                     Err(err) => err.into_http_response(),
                                 }
                             }
@@ -152,8 +162,11 @@ impl JMAP {
                         {
                             return match fetch_body(
                                 &mut req,
-                                self.core.jmap.upload_max_size,
-                                &access_token,
+                                if !access_token.is_super_user() {
+                                    self.core.jmap.upload_max_size
+                                } else {
+                                    0
+                                },
                             )
                             .await
                             {
@@ -197,7 +210,7 @@ impl JMAP {
                     _ => (),
                 }
             }
-            ".well-known" => match (path.next().unwrap_or(""), req.method()) {
+            ".well-known" => match (path.next().unwrap_or_default(), req.method()) {
                 ("jmap", &Method::GET) => {
                     // Authenticate request
                     let (_in_flight, access_token) =
@@ -247,12 +260,33 @@ impl JMAP {
                         };
                     }
                 }
+                ("mta-sts.txt", &Method::GET) => {
+                    if let Some(policy) = self.core.build_mta_sts_policy() {
+                        return Resource {
+                            content_type: "text/plain",
+                            contents: policy.to_string().into_bytes(),
+                        }
+                        .into_http_response();
+                    } else {
+                        return RequestError::not_found().into_http_response();
+                    }
+                }
+                ("mail-v1.xml", &Method::GET) => {
+                    return self.handle_autoconfig_request(&req).await;
+                }
+                ("autoconfig", &Method::GET) => {
+                    if path.next().unwrap_or_default() == "mail"
+                        && path.next().unwrap_or_default() == "config-v1.1.xml"
+                    {
+                        return self.handle_autoconfig_request(&req).await;
+                    }
+                }
                 (_, &Method::OPTIONS) => {
                     return ().into_http_response();
                 }
                 _ => (),
             },
-            "auth" => match (path.next().unwrap_or(""), req.method()) {
+            "auth" => match (path.next().unwrap_or_default(), req.method()) {
                 ("device", &Method::POST) => {
                     return match self.is_anonymous_allowed(&session.remote_ip).await {
                         Ok(_) => {
@@ -282,13 +316,29 @@ impl JMAP {
                 // Authenticate user
                 return match self.authenticate_headers(&req, session.remote_ip).await {
                     Ok(Some((_, access_token))) => {
-                        let body = fetch_body(&mut req, 8192, &access_token).await;
+                        let body = fetch_body(&mut req, 1024 * 1024).await;
                         self.handle_api_manage_request(&req, body, access_token)
                             .await
                     }
                     Ok(None) => RequestError::unauthorized().into_http_response(),
                     Err(err) => err.into_http_response(),
                 };
+            }
+            "mail" => {
+                if req.method() == Method::GET
+                    && path.next().unwrap_or_default() == "config-v1.1.xml"
+                {
+                    return self.handle_autoconfig_request(&req).await;
+                }
+            }
+            "autodiscover" => {
+                if req.method() == Method::POST
+                    && path.next().unwrap_or_default() == "autodiscover.xml"
+                {
+                    return self
+                        .handle_autodiscover_request(fetch_body(&mut req, 8192).await)
+                        .await;
+                }
             }
             _ => {
                 let path = req.uri().path();
@@ -306,7 +356,9 @@ impl JMAP {
         }
         RequestError::not_found().into_http_response()
     }
+}
 
+impl JmapInstance {
     async fn handle_session<T: SessionStream>(self, session: SessionData<T>) {
         let span = session.span;
         let _in_flight = session.in_flight;
@@ -317,7 +369,7 @@ impl JMAP {
             .serve_connection(
                 TokioIo::new(session.stream),
                 service_fn(|req: hyper::Request<body::Incoming>| {
-                    let jmap = self.clone();
+                    let jmap_instance = self.clone();
                     let span = span.clone();
                     let instance = session.instance.clone();
 
@@ -327,6 +379,7 @@ impl JMAP {
                             event = "request",
                             uri = req.uri().to_string(),
                         );
+                        let jmap = JMAP::from(jmap_instance);
 
                         // Obtain remote IP
                         let remote_ip = if !jmap.core.jmap.http_use_forwarded {
@@ -392,7 +445,7 @@ impl SessionManager for JmapSessionManager {
         self,
         session: SessionData<T>,
     ) -> impl std::future::Future<Output = ()> + Send {
-        JMAP::from(self.inner).handle_session(session)
+        self.inner.handle_session(session)
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -438,16 +491,11 @@ impl HttpSessionData {
     }
 }
 
-pub async fn fetch_body(
-    req: &mut HttpRequest,
-    max_size: usize,
-    access_token: &AccessToken,
-) -> Option<Vec<u8>> {
+pub async fn fetch_body(req: &mut HttpRequest, max_size: usize) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(1024);
     while let Some(Ok(frame)) = req.frame().await {
         if let Some(data) = frame.data_ref() {
-            if bytes.len() + data.len() <= max_size || max_size == 0 || access_token.is_super_user()
-            {
+            if bytes.len() + data.len() <= max_size || max_size == 0 {
                 bytes.extend_from_slice(data);
             } else {
                 return None;

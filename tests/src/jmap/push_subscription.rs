@@ -40,7 +40,6 @@ use jmap::{
         http::{fetch_body, ToHttpResponse},
         HtmlResponse, StateChangeResponse,
     },
-    auth::AccessToken,
     push::ece::ece_encrypt,
 };
 use jmap_client::{mailbox::Role, push_subscription::Keys};
@@ -61,23 +60,20 @@ use super::JMAPTest;
 const SERVER: &str = r#"
 [server]
 hostname = "'jmap-push.example.org'"
-url = "'https://127.0.0.1:9000'"
+http.url = "'https://127.0.0.1:9000'"
 
 [server.listener.jmap]
 bind = ['127.0.0.1:9000']
 protocol = 'http'
+tls.implicit = true
 
 [server.socket]
 reuse-addr = true
 
-[server.tls]
-enable = true
-implicit = false
-certificate = 'default'
-
 [certificate.default]
 cert = '%{file:{CERT}}%'
 private-key = '%{file:{PK}}%'
+default = true
 "#;
 
 pub async fn test(params: &mut JMAPTest) {
@@ -118,8 +114,12 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Start mock push server
     let mut settings = Config::new(add_test_certs(SERVER)).unwrap();
-    settings.resolve_macros().await;
-    let mock_core = Core::default().into_shared();
+    settings.resolve_all_macros().await;
+    let mock_core = Core::parse(&mut settings, Default::default(), Default::default())
+        .await
+        .into_shared();
+    settings.errors.clear();
+    settings.warnings.clear();
     let mut servers = Servers::parse(&mut settings);
     servers.parse_tcp_acceptors(&mut settings, mock_core.clone());
 
@@ -304,16 +304,7 @@ impl common::listener::SessionManager for SessionManager {
             let _ = http1::Builder::new()
                 .keep_alive(false)
                 .serve_connection(
-                    TokioIo::new(
-                        session
-                            .instance
-                            .acceptor
-                            .accept(session.stream, None)
-                            .await
-                            .unwrap_tls()
-                            .await
-                            .unwrap(),
-                    ),
+                    TokioIo::new(session.stream),
                     service_fn(|mut req: hyper::Request<body::Incoming>| {
                         let push = push.clone();
 
@@ -331,9 +322,7 @@ impl common::listener::SessionManager for SessionManager {
                                 .map_or(false, |encoding| {
                                     encoding.to_str().unwrap() == "aes128gcm"
                                 });
-                            let body = fetch_body(&mut req, 1024 * 1024, &AccessToken::default())
-                                .await
-                                .unwrap();
+                            let body = fetch_body(&mut req, 1024 * 1024).await.unwrap();
                             let message = serde_json::from_slice::<PushMessage>(&if is_encrypted {
                                 ece::decrypt(
                                     &push.keypair,

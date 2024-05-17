@@ -42,6 +42,7 @@ use super::{
 
 pub mod dane;
 pub mod extensions;
+pub mod fallback_relay;
 pub mod ip_lookup;
 pub mod lmtp;
 pub mod mta_sts;
@@ -104,7 +105,7 @@ impl TestServer {
         let temp_dir = TempDir::new(name, true);
         let mut config =
             Config::new(temp_dir.update_config(add_test_certs(CONFIG) + config.as_ref())).unwrap();
-        config.resolve_macros().await;
+        config.resolve_all_macros().await;
         let stores = Stores::parse_all(&mut config).await;
         let core = Core::parse(&mut config, stores, Default::default()).await;
         let mut inner = Inner::default();
@@ -158,25 +159,27 @@ impl TestServer {
         let jmap_manager = JmapSessionManager::new(jmap);
         config.assert_no_errors();
 
-        servers.spawn(|server, acceptor, shutdown_rx| {
-            match &server.protocol {
-                ServerProtocol::Smtp | ServerProtocol::Lmtp => server.spawn(
-                    smtp_manager.clone(),
-                    instance.core.clone(),
-                    acceptor,
-                    shutdown_rx,
-                ),
-                ServerProtocol::Http => server.spawn(
-                    jmap_manager.clone(),
-                    instance.core.clone(),
-                    acceptor,
-                    shutdown_rx,
-                ),
-                ServerProtocol::Imap | ServerProtocol::ManageSieve => {
-                    unreachable!()
-                }
-            };
-        })
+        servers
+            .spawn(|server, acceptor, shutdown_rx| {
+                match &server.protocol {
+                    ServerProtocol::Smtp | ServerProtocol::Lmtp => server.spawn(
+                        smtp_manager.clone(),
+                        instance.core.clone(),
+                        acceptor,
+                        shutdown_rx,
+                    ),
+                    ServerProtocol::Http => server.spawn(
+                        jmap_manager.clone(),
+                        instance.core.clone(),
+                        acceptor,
+                        shutdown_rx,
+                    ),
+                    ServerProtocol::Imap | ServerProtocol::ManageSieve => {
+                        unreachable!()
+                    }
+                };
+            })
+            .0
     }
 
     pub fn new_session(&self) -> Session<DummyIo> {

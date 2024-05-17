@@ -27,8 +27,10 @@ use hyper::Method;
 use jmap_proto::error::request::RequestError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha1::Digest;
 use store::ahash::AHashMap;
 use utils::url_params::UrlParams;
+use x509_parser::parse_x509_certificate;
 
 use crate::{
     api::{
@@ -212,15 +214,79 @@ impl JMAP {
             records.push(DnsRecord {
                 typ: "TXT".to_string(),
                 name: format!("{server_name}."),
-                content: "v=spf1 a -all ra=postmaster".to_string(),
+                content: "v=spf1 a ra=postmaster -all".to_string(),
             });
         }
-
         records.push(DnsRecord {
             typ: "TXT".to_string(),
             name: format!("{domain_name}."),
-            content: "v=spf1 mx -all ra=postmaster".to_string(),
+            content: "v=spf1 mx ra=postmaster -all".to_string(),
         });
+
+        let mut has_https = false;
+        for (protocol, port, is_tls) in self
+            .core
+            .storage
+            .config
+            .get_services()
+            .await
+            .unwrap_or_default()
+        {
+            match (protocol.as_str(), port) {
+                ("smtp", port @ 26..=u16::MAX) => {
+                    records.push(DnsRecord {
+                        typ: "SRV".to_string(),
+                        name: format!(
+                            "_submission{}._tcp.{domain_name}.",
+                            if is_tls { "s" } else { "" }
+                        ),
+                        content: format!("0 1 {port} {server_name}."),
+                    });
+                }
+                ("imap" | "pop3", port @ 1..=u16::MAX) => {
+                    records.push(DnsRecord {
+                        typ: "SRV".to_string(),
+                        name: format!(
+                            "_{protocol}{}._tcp.{domain_name}.",
+                            if is_tls { "s" } else { "" }
+                        ),
+                        content: format!("0 1 {port} {server_name}."),
+                    });
+                }
+                ("http", _) if is_tls => {
+                    has_https = true;
+                }
+                _ => (),
+            }
+        }
+
+        if has_https {
+            // Add autoconfig and autodiscover records
+            records.push(DnsRecord {
+                typ: "CNAME".to_string(),
+                name: format!("autoconfig.{domain_name}."),
+                content: format!("{server_name}."),
+            });
+            records.push(DnsRecord {
+                typ: "CNAME".to_string(),
+                name: format!("autodiscover.{domain_name}."),
+                content: format!("{server_name}."),
+            });
+
+            // Add MTA-STS records
+            if let Some(policy) = self.core.build_mta_sts_policy() {
+                records.push(DnsRecord {
+                    typ: "CNAME".to_string(),
+                    name: format!("mta-sts.{domain_name}."),
+                    content: format!("{server_name}."),
+                });
+                records.push(DnsRecord {
+                    typ: "TXT".to_string(),
+                    name: format!("_mta-sts.{domain_name}."),
+                    content: format!("v=STSv1; id={}", policy.id),
+                });
+            }
+        }
 
         // Add DMARC records
         records.push(DnsRecord {
@@ -228,6 +294,46 @@ impl JMAP {
             name: format!("_dmarc.{domain_name}."),
             content: format!("v=DMARC1; p=reject; rua=mailto:postmaster@{domain_name}; ruf=mailto:postmaster@{domain_name}",),
         });
+
+        // Add TLSA records
+        for (name, key) in self.core.tls.certificates.load().iter() {
+            if !name.ends_with(domain_name) {
+                continue;
+            }
+
+            for (cert_num, cert) in key.cert.iter().enumerate() {
+                let parsed_cert = match parse_x509_certificate(cert) {
+                    Ok((_, parsed_cert)) => parsed_cert,
+                    Err(err) => {
+                        tracing::debug!("Failed to parse certificate: {}", err);
+                        continue;
+                    }
+                };
+
+                let name = if !name.starts_with('.') {
+                    format!("_25._tcp.{name}.")
+                } else {
+                    format!("_25._tcp.mail.{name}.")
+                };
+                let cu = if cert_num == 0 { 3 } else { 2 };
+
+                for (s, cert) in [cert, parsed_cert.subject_pki.raw].into_iter().enumerate() {
+                    for (m, hash) in [
+                        format!("{:x}", sha2::Sha256::digest(cert)),
+                        format!("{:x}", sha2::Sha512::digest(cert)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        records.push(DnsRecord {
+                            typ: "TLSA".to_string(),
+                            name: name.clone(),
+                            content: format!("{} {} {} {}", cu, s, m + 1, hash),
+                        });
+                    }
+                }
+            }
+        }
 
         Ok(records)
     }

@@ -123,6 +123,12 @@ pub struct List<T> {
     pub total: u64,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct Response<T> {
+    pub items: T,
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrincipalUpdate {
     action: PrincipalAction,
@@ -200,10 +206,6 @@ impl<T, E: Display> UnwrapResult<T> for Result<T, E> {
             }
         }
     }
-}
-
-trait TableName {
-    fn table_name(&self) -> &'static str;
 }
 
 pub fn read_file(path: &str) -> Vec<u8> {

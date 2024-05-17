@@ -81,7 +81,7 @@ impl JMAP {
                 response.not_found.push(id.into());
                 continue;
             }
-            let mut push = if let Some(push) = self
+            let mut identity = if let Some(identity) = self
                 .get_property::<Object<Value>>(
                     account_id,
                     Collection::Identity,
@@ -90,7 +90,7 @@ impl JMAP {
                 )
                 .await?
             {
-                push
+                identity
             } else {
                 response.not_found.push(id.into());
                 continue;
@@ -104,8 +104,17 @@ impl JMAP {
                     Property::MayDelete => {
                         result.append(Property::MayDelete, Value::Bool(true));
                     }
+                    Property::TextSignature | Property::HtmlSignature => {
+                        result.append(
+                            property.clone(),
+                            identity
+                                .properties
+                                .remove(property)
+                                .unwrap_or(Value::Text(String::new())),
+                        );
+                    }
                     property => {
-                        result.append(property.clone(), push.remove(property));
+                        result.append(property.clone(), identity.remove(property));
                     }
                 }
             }
@@ -159,14 +168,12 @@ impl JMAP {
             .trim()
             .to_string();
         let has_many = principal.emails.len() > 1;
-        for email in principal.emails {
+        for (idx, email) in principal.emails.into_iter().enumerate() {
+            let document_id = idx as u32;
             let email = sanitize_email(&email).unwrap_or_default();
             if email.is_empty() {
                 continue;
             }
-            let identity_id = self
-                .assign_document_id(account_id, Collection::Identity)
-                .await?;
             let name = if name.is_empty() {
                 email.clone()
             } else if has_many {
@@ -174,14 +181,14 @@ impl JMAP {
             } else {
                 name.clone()
             };
-            batch.create_document(identity_id).value(
+            batch.create_document_with_id(document_id).value(
                 Property::Value,
                 Object::with_capacity(4)
                     .with_property(Property::Name, name)
                     .with_property(Property::Email, email),
                 F_VALUE,
             );
-            identity_ids.insert(identity_id);
+            identity_ids.insert(document_id);
         }
         self.core
             .storage

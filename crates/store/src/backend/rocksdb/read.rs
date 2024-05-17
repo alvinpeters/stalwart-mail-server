@@ -24,12 +24,13 @@
 use roaring::RoaringBitmap;
 use rocksdb::{Direction, IteratorMode};
 
-use crate::{
-    write::{BitmapClass, ValueClass},
-    BitmapKey, Deserialize, IterateParams, Key, ValueKey, WITHOUT_BLOCK_NUM,
-};
+use super::RocksDbStore;
 
-use super::{RocksDbStore, CF_BITMAPS, CF_COUNTERS};
+use crate::{
+    backend::rocksdb::CfHandle,
+    write::{key::DeserializeBigEndian, BitmapClass, ValueClass},
+    BitmapKey, Deserialize, IterateParams, Key, ValueKey, U32_LEN,
+};
 
 impl RocksDbStore {
     pub(crate) async fn get_value<U>(&self, key: impl Key) -> crate::Result<Option<U>>
@@ -57,28 +58,30 @@ impl RocksDbStore {
 
     pub(crate) async fn get_bitmap(
         &self,
-        key: BitmapKey<BitmapClass>,
+        mut key: BitmapKey<BitmapClass<u32>>,
     ) -> crate::Result<Option<RoaringBitmap>> {
         let db = self.db.clone();
         self.spawn_worker(move || {
-            db.get_pinned_cf(
-                &db.cf_handle(CF_BITMAPS).unwrap(),
-                &key.serialize(WITHOUT_BLOCK_NUM),
-            )
-            .map_err(Into::into)
-            .and_then(|value| {
-                if let Some(value) = value {
-                    RoaringBitmap::deserialize(&value).map(|rb| {
-                        if !rb.is_empty() {
-                            Some(rb)
-                        } else {
-                            None
-                        }
-                    })
+            let mut bm = RoaringBitmap::new();
+            let subspace = key.subspace();
+            let begin = key.serialize(0);
+            key.document_id = u32::MAX;
+            let end = key.serialize(0);
+            let key_len = begin.len();
+            for row in db.iterator_cf(
+                &db.subspace_handle(subspace),
+                IteratorMode::From(&begin, Direction::Forward),
+            ) {
+                let (key, _) = row?;
+                let key = key.as_ref();
+                if key.len() == key_len && key >= begin.as_slice() && key <= end.as_slice() {
+                    bm.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
                 } else {
-                    Ok(None)
+                    break;
                 }
-            })
+            }
+
+            Ok(if !bm.is_empty() { Some(bm) } else { None })
         })
         .await
     }
@@ -91,9 +94,7 @@ impl RocksDbStore {
         let db = self.db.clone();
 
         self.spawn_worker(move || {
-            let cf = db
-                .cf_handle(std::str::from_utf8(&[params.begin.subspace()]).unwrap())
-                .unwrap();
+            let cf = db.subspace_handle(params.begin.subspace());
             let begin = params.begin.serialize(0);
             let end = params.end.serialize(0);
             let it_mode = if params.ascending {
@@ -120,12 +121,15 @@ impl RocksDbStore {
 
     pub(crate) async fn get_counter(
         &self,
-        key: impl Into<ValueKey<ValueClass>> + Sync + Send,
+        key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
     ) -> crate::Result<i64> {
-        let key = key.into().serialize(0);
+        let key = key.into();
         let db = self.db.clone();
         self.spawn_worker(move || {
-            db.get_pinned_cf(&db.cf_handle(CF_COUNTERS).unwrap(), &key)
+            let cf = self.db.subspace_handle(key.subspace());
+            let key = key.serialize(0);
+
+            db.get_pinned_cf(&cf, &key)
                 .map_err(Into::into)
                 .and_then(|bytes| {
                     Ok(if let Some(bytes) = bytes {

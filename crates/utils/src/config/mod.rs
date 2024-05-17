@@ -48,6 +48,7 @@ pub enum ConfigWarning {
     Missing,
     AppliedDefault { default: String },
     Unread { value: String },
+    Build { error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -73,10 +74,14 @@ pub struct Rate {
 pub type Result<T> = std::result::Result<T, String>;
 
 impl Config {
-    pub async fn resolve_macros(&mut self) {
-        for macro_class in ["env", "file", "cfg"] {
+    pub async fn resolve_macros(&mut self, classes: &[&str]) {
+        for macro_class in classes {
             self.resolve_macro_type(macro_class).await;
         }
+    }
+
+    pub async fn resolve_all_macros(&mut self) {
+        self.resolve_macros(&["env", "file", "cfg"]).await;
     }
 
     async fn resolve_macro_type(&mut self, class: &str) {
@@ -218,6 +223,7 @@ impl Config {
                 ConfigWarning::Unread { value } => {
                     format!("WARNING: Unused setting {key:?} with value {value:?}")
                 }
+                ConfigWarning::Build { error } => format!("WARNING for {key:?}: {error}"),
             };
             if !use_stderr {
                 tracing::debug!("{}", message);

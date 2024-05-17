@@ -41,7 +41,8 @@ relay = true
 hostname = "'badtls.foobar.org'"
 
 [queue.outbound.tls]
-starttls = "optional"
+starttls = [ { if = "retry_num > 0 && last_error == 'tls'", then = "disable"},
+             { else = "optional" }]
 "#;
 
 const REMOTE: &str = r#"
@@ -104,7 +105,6 @@ async fn starttls_optional() {
         .try_deliver(core.clone())
         .await;
     let mut retry = local.qr.expect_message().await;
-    assert!(retry.domains[0].disable_tls);
     let prev_due = retry.domains[0].retry.due;
     let next_due = now();
     let queue_id = retry.id;
