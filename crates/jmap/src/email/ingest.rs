@@ -1,27 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{borrow::Cow, time::Duration};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 use jmap_proto::{
     object::Object,
@@ -45,13 +31,13 @@ use store::{
     },
     BitmapKey, BlobClass, Serialize,
 };
+use trc::{AddContext, MessageIngestEvent};
 use utils::map::vec_map::VecMap;
 
 use crate::{
     email::index::{IndexMessage, VisitValues, MAX_ID_LENGTH},
     mailbox::{UidMailbox, INBOX_ID, JUNK_ID},
-    services::housekeeper::Event,
-    IngestError, JMAP,
+    JMAP,
 };
 
 use super::{
@@ -76,39 +62,40 @@ pub struct IngestEmail<'x> {
     pub mailbox_ids: Vec<u32>,
     pub keywords: Vec<Keyword>,
     pub received_at: Option<u64>,
-    pub skip_duplicates: bool,
+    pub source: IngestSource,
     pub encrypt: bool,
+    pub session_id: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IngestSource {
+    Smtp,
+    Jmap,
+    Imap,
 }
 
 const MAX_RETRIES: u32 = 10;
 
 impl JMAP {
     #[allow(clippy::blocks_in_conditions)]
-    pub async fn email_ingest(
-        &self,
-        mut params: IngestEmail<'_>,
-    ) -> Result<IngestedEmail, IngestError> {
+    pub async fn email_ingest(&self, mut params: IngestEmail<'_>) -> trc::Result<IngestedEmail> {
         // Check quota
+        let start_time = Instant::now();
         let mut raw_message_len = params.raw_message.len() as i64;
-        if params.account_quota > 0
-            && raw_message_len
-                + self
-                    .get_used_quota(params.account_id)
-                    .await
-                    .map_err(|_| IngestError::Temporary)?
-                > params.account_quota
-        {
-            return Err(IngestError::OverQuota);
-        }
+        self.has_available_quota(params.account_id, params.account_quota, raw_message_len)
+            .await
+            .caused_by(trc::location!())?;
 
         // Parse message
         let mut raw_message = Cow::from(params.raw_message);
-        let mut message = params.message.ok_or_else(|| IngestError::Permanent {
-            code: [5, 5, 0],
-            reason: "Failed to parse e-mail message.".to_string(),
+        let mut message = params.message.ok_or_else(|| {
+            trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+                .ctx(trc::Key::Code, 550)
+                .ctx(trc::Key::Reason, "Failed to parse e-mail message.")
         })?;
 
         // Check for Spam headers
+        let mut is_spam = false;
         if let Some((header_name, header_value)) = &self.core.jmap.spam_header {
             if params.mailbox_ids == [INBOX_ID]
                 && message.root_part().headers().iter().any(|header| {
@@ -120,20 +107,21 @@ impl JMAP {
                 })
             {
                 params.mailbox_ids[0] = JUNK_ID;
+                is_spam = true;
             }
         }
 
         // Obtain message references and thread name
+        let mut message_id = String::new();
         let thread_id = {
             let mut references = Vec::with_capacity(5);
             let mut subject = "";
-            let mut message_id = "";
             for header in message.root_part().headers().iter().rev() {
                 match &header.name {
                     HeaderName::MessageId => header.value.visit_text(|id| {
                         if !id.is_empty() && id.len() < MAX_ID_LENGTH {
                             if message_id.is_empty() {
-                                message_id = id;
+                                message_id = id.to_string();
                             }
                             references.push(id);
                         }
@@ -162,7 +150,7 @@ impl JMAP {
             }
 
             // Check for duplicates
-            if params.skip_duplicates
+            if params.source == IngestSource::Smtp
                 && !message_id.is_empty()
                 && !self
                     .core
@@ -171,27 +159,25 @@ impl JMAP {
                     .filter(
                         params.account_id,
                         Collection::Email,
-                        vec![Filter::eq(Property::MessageId, message_id)],
+                        vec![
+                            Filter::eq(Property::MessageId, &message_id),
+                            Filter::is_in_bitmap(
+                                Property::MailboxIds,
+                                params.mailbox_ids.first().copied().unwrap_or(INBOX_ID),
+                            ),
+                        ],
                     )
                     .await
-                    .map_err(|err| {
-                        tracing::error!(
-                            event = "error",
-                            context = "find_duplicates",
-                            error = ?err,
-                            "Duplicate message search failed.");
-                        IngestError::Temporary
-                    })?
+                    .caused_by(trc::location!())?
                     .results
                     .is_empty()
             {
-                tracing::debug!(
-                    context = "email_ingest",
-                    event = "skip",
-                    account_id = ?params.account_id,
-                    from = ?message.from(),
-                    message_id = message_id,
-                    "Duplicate message skipped.");
+                trc::event!(
+                    MessageIngest(MessageIngestEvent::Duplicate),
+                    SpanId = params.session_id,
+                    AccountId = params.account_id,
+                    MessageId = message_id,
+                );
 
                 return Ok(IngestedEmail {
                     id: Id::default(),
@@ -220,7 +206,7 @@ impl JMAP {
                     Property::Parameters,
                 )
                 .await
-                .map_err(|_| IngestError::Temporary)?
+                .caused_by(trc::location!())?
             {
                 match message.encrypt(&encrypt_params).await {
                     Ok(new_raw_message) => {
@@ -228,9 +214,13 @@ impl JMAP {
                         raw_message_len = raw_message.len() as i64;
                         message = MessageParser::default()
                             .parse(raw_message.as_ref())
-                            .ok_or_else(|| IngestError::Permanent {
-                                code: [5, 5, 0],
-                                reason: "Failed to parse encrypted e-mail message.".to_string(),
+                            .ok_or_else(|| {
+                                trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+                                    .ctx(trc::Key::Code, 550)
+                                    .ctx(
+                                        trc::Key::Reason,
+                                        "Failed to parse encrypted e-mail message.",
+                                    )
                             })?;
 
                         // Remove contents from parsed message
@@ -250,12 +240,10 @@ impl JMAP {
                         }
                     }
                     Err(EncryptMessageError::Error(err)) => {
-                        tracing::error!(
-                            event = "error",
-                            context = "email_ingest",
-                            error = ?err,
-                            "Failed to encrypt message.");
-                        return Err(IngestError::Temporary);
+                        trc::bail!(trc::StoreEvent::CryptoError
+                            .into_err()
+                            .caused_by(trc::location!())
+                            .reason(err));
                     }
                     _ => unreachable!(),
                 }
@@ -266,27 +254,13 @@ impl JMAP {
         let change_id = self
             .assign_change_id(params.account_id)
             .await
-            .map_err(|_| {
-                tracing::error!(
-                    event = "error",
-                    context = "email_ingest",
-                    "Failed to assign changeId."
-                );
-                IngestError::Temporary
-            })?;
+            .caused_by(trc::location!())?;
 
         // Store blob
         let blob_id = self
             .put_blob(params.account_id, raw_message.as_ref(), false)
             .await
-            .map_err(|err| {
-                tracing::error!(
-                event = "error",
-                context = "email_ingest",
-                error = ?err,
-                "Failed to write blob.");
-                IngestError::Temporary
-            })?;
+            .caused_by(trc::location!())?;
 
         // Assign IMAP UIDs
         let mut mailbox_ids = Vec::with_capacity(params.mailbox_ids.len());
@@ -295,14 +269,7 @@ impl JMAP {
             let uid = self
                 .assign_imap_uid(params.account_id, *mailbox_id)
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                    event = "error",
-                    context = "email_ingest",
-                    error = ?err,
-                    "Failed to assign IMAP UID.");
-                    IngestError::Temporary
-                })?;
+                .caused_by(trc::location!())?;
             mailbox_ids.push(UidMailbox::new(*mailbox_id, uid));
             imap_uids.push(uid);
         }
@@ -320,6 +287,10 @@ impl JMAP {
         }
 
         // Build write batch
+        let mailbox_ids_event = mailbox_ids
+            .iter()
+            .map(|m| trc::Value::from(m.mailbox_id))
+            .collect::<Vec<_>>();
         let maybe_thread_id = thread_id
             .map(MaybeDynamicId::Static)
             .unwrap_or(MaybeDynamicId::Dynamic(0));
@@ -340,10 +311,8 @@ impl JMAP {
             .set(Property::ThreadId, maybe_thread_id)
             .tag(Property::ThreadId, TagValue::Id(maybe_thread_id), 0)
             .set(
-                ValueClass::FtsQueue(FtsQueueClass::Insert {
-                    seq: self
-                        .generate_snowflake_id()
-                        .map_err(|_| IngestError::Temporary)?,
+                ValueClass::FtsQueue(FtsQueueClass {
+                    seq: self.generate_snowflake_id().caused_by(trc::location!())?,
                     hash: blob_id.hash.clone(),
                 }),
                 0u64.serialize(),
@@ -356,36 +325,38 @@ impl JMAP {
             .data
             .write(batch.build())
             .await
-            .map_err(|err| {
-                tracing::error!(
-                event = "error",
-                context = "email_ingest",
-                error = ?err,
-                "Failed to write message to database.");
-                IngestError::Temporary
-            })?;
+            .caused_by(trc::location!())?;
         let thread_id = match thread_id {
             Some(thread_id) => thread_id,
-            None => ids
-                .first_document_id()
-                .map_err(|_| IngestError::Temporary)?,
+            None => ids.first_document_id().caused_by(trc::location!())?,
         };
-        let document_id = ids.last_document_id().map_err(|_| IngestError::Temporary)?;
+        let document_id = ids.last_document_id().caused_by(trc::location!())?;
         let id = Id::from_parts(thread_id, document_id);
 
         // Request FTS index
-        let _ = self.inner.housekeeper_tx.send(Event::IndexStart).await;
+        self.inner.request_fts_index();
 
-        tracing::debug!(
-            context = "email_ingest",
-            event = "success",
-            account_id = ?params.account_id,
-            document_id = ?document_id,
-            mailbox_ids = ?params.mailbox_ids,
-            change_id = ?change_id,
-            blob_id = ?blob_id.hash,
-            size = raw_message_len,
-            "Ingested e-mail.");
+        trc::event!(
+            MessageIngest(match params.source {
+                IngestSource::Smtp =>
+                    if !is_spam {
+                        MessageIngestEvent::Ham
+                    } else {
+                        MessageIngestEvent::Spam
+                    },
+                IngestSource::Jmap => MessageIngestEvent::JmapAppend,
+                IngestSource::Imap => MessageIngestEvent::ImapAppend,
+            }),
+            SpanId = params.session_id,
+            AccountId = params.account_id,
+            DocumentId = document_id,
+            MailboxId = mailbox_ids_event,
+            BlobId = blob_id.hash.to_hex(),
+            ChangeId = change_id,
+            MessageId = message_id,
+            Size = raw_message_len as u64,
+            Elapsed = start_time.elapsed(),
+        );
 
         Ok(IngestedEmail {
             id,
@@ -409,7 +380,7 @@ impl JMAP {
         account_id: u32,
         thread_name: &str,
         references: &[&str],
-    ) -> Result<Option<u32>, IngestError> {
+    ) -> trc::Result<Option<u32>> {
         let mut try_count = 0;
 
         loop {
@@ -434,14 +405,7 @@ impl JMAP {
                 .data
                 .filter(account_id, Collection::Email, filters)
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                        event = "error",
-                        context = "find_or_merge_thread",
-                        error = ?err,
-                        "Thread search failed.");
-                    IngestError::Temporary
-                })?
+                .caused_by(trc::location!())?
                 .results;
 
             if results.is_empty() {
@@ -452,14 +416,7 @@ impl JMAP {
             let thread_ids = self
                 .get_cached_thread_ids(account_id, results.iter())
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                        event = "error",
-                        context = "find_or_merge_thread",
-                        error = ?err,
-                        "Failed to obtain threadIds.");
-                    IngestError::Temporary
-                })?;
+                .caused_by(trc::location!())?;
 
             if thread_ids.len() == 1 {
                 return Ok(thread_ids
@@ -489,14 +446,10 @@ impl JMAP {
 
             // Delete all but the most common threadId
             let mut batch = BatchBuilder::new();
-            let change_id = self.assign_change_id(account_id).await.map_err(|_| {
-                tracing::error!(
-                    event = "error",
-                    context = "find_or_merge_thread",
-                    "Failed to assign changeId for thread merge."
-                );
-                IngestError::Temporary
-            })?;
+            let change_id = self
+                .assign_change_id(account_id)
+                .await
+                .caused_by(trc::location!())?;
             let mut changes = ChangeLogBuilder::with_change_id(change_id);
             batch
                 .with_account_id(account_id)
@@ -530,14 +483,7 @@ impl JMAP {
                             document_id: 0,
                         })
                         .await
-                        .map_err(|err| {
-                            tracing::error!(
-                            event = "error",
-                            context = "find_or_merge_thread",
-                            error = ?err,
-                            "Failed to obtain threadId bitmap.");
-                            IngestError::Temporary
-                        })?
+                        .caused_by(trc::location!())?
                         .unwrap_or_default()
                     {
                         batch
@@ -557,24 +503,19 @@ impl JMAP {
 
             match self.core.storage.data.write(batch.build()).await {
                 Ok(_) => return Ok(Some(thread_id)),
-                Err(store::Error::AssertValueFailed) if try_count < MAX_RETRIES => {
+                Err(err) if err.is_assertion_failure() && try_count < MAX_RETRIES => {
                     let backoff = rand::thread_rng().gen_range(50..=300);
                     tokio::time::sleep(Duration::from_millis(backoff)).await;
                     try_count += 1;
                 }
                 Err(err) => {
-                    tracing::error!(
-                        event = "error",
-                        context = "find_or_merge_thread",
-                        error = ?err,
-                        "Failed to write thread merge batch.");
-                    return Err(IngestError::Temporary);
+                    return Err(err.caused_by(trc::location!()));
                 }
             }
         }
     }
 
-    pub async fn assign_imap_uid(&self, account_id: u32, mailbox_id: u32) -> store::Result<u32> {
+    pub async fn assign_imap_uid(&self, account_id: u32, mailbox_id: u32) -> trc::Result<u32> {
         // Increment UID next
         let mut batch = BatchBuilder::new();
         batch
@@ -600,7 +541,7 @@ impl LogEmailInsert {
 }
 
 impl SerializeWithId for LogEmailInsert {
-    fn serialize_with_id(&self, ids: &AssignedIds) -> store::Result<Vec<u8>> {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>> {
         let thread_id = match self.0 {
             Some(thread_id) => thread_id,
             None => ids.first_document_id()?,

@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::str::CharIndices;
 
@@ -55,6 +38,7 @@ pub enum TokenType<T> {
     Url(T),
     UrlNoScheme(T),
     UrlNoHost(T),
+    IpAddr(T),
     Email(T),
     Float(T),
 }
@@ -328,7 +312,7 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
 
         // Try parsing hostname
         let mut is_valid_host = true;
-        let (host_start_pos, mut end_pos) = if has_scheme {
+        let (host_start_pos, mut end_pos, is_ip) = if has_scheme {
             let mut start_pos = usize::MAX;
             let mut end_pos = usize::MAX;
             let mut restore_pos = self.peek_pos;
@@ -387,12 +371,11 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
             }
 
             self.peek_pos = restore_pos;
+            let is_ip = is_ipv6 || (int_count == 4 && dot_count == 3 && text_count == 0);
             if end_pos != usize::MAX {
                 is_valid_host =
-                    (last_label_is_tld && dot_count >= 1 && (text_count + int_count) >= 2)
-                        || (int_count == 4 && dot_count == 3)
-                        || is_ipv6;
-                (start_pos, end_pos)
+                    (last_label_is_tld && dot_count >= 1 && (text_count + int_count) >= 2) || is_ip;
+                (start_pos, end_pos, is_ip)
             } else {
                 return None;
             }
@@ -487,15 +470,18 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
             self.peek_pos = restore_pos;
         }
 
+        let word = &self.text[start_pos..end_pos];
         Token {
             word: if has_scheme {
                 if is_valid_host {
-                    TokenType::Url(&self.text[start_pos..end_pos])
+                    TokenType::Url(word)
                 } else {
-                    TokenType::UrlNoHost(&self.text[start_pos..end_pos])
+                    TokenType::UrlNoHost(word)
                 }
+            } else if is_ip && !found_query_start {
+                TokenType::IpAddr(word)
             } else {
-                TokenType::UrlNoScheme(&self.text[start_pos..end_pos])
+                TokenType::UrlNoScheme(word)
             },
             from: start_pos,
             to: end_pos,
@@ -528,7 +514,7 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
         }
 
         // Obtain domain part
-        let (_, end_pos) = self.try_parse_hostname()?;
+        let (_, end_pos, _) = self.try_parse_hostname()?;
 
         Token {
             word: TokenType::Email(&self.text[start_token.from..end_pos]),
@@ -538,7 +524,7 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
         .into()
     }
 
-    fn try_parse_hostname(&mut self) -> Option<(usize, usize)> {
+    fn try_parse_hostname(&mut self) -> Option<(usize, usize, bool)> {
         let mut last_ch = u8::MAX;
         let mut has_int = false;
         let mut has_alpha = false;
@@ -561,7 +547,9 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
                     continue;
                 }
                 TokenType::Punctuation('[') if start_pos == usize::MAX => {
-                    return self.try_parse_ipv6(token.from);
+                    return self
+                        .try_parse_ipv6(token.from)
+                        .map(|(from, to)| (from, to, true));
                 }
                 TokenType::Alphabetic(text) | TokenType::Alphanumeric(text) if text.len() <= 63 => {
                     last_label_is_tld =
@@ -598,11 +586,9 @@ impl<'x, 'y> TypesTokenizer<'x, 'y> {
             dot_count -= 1;
         }
 
-        if end_pos != usize::MAX
-            && dot_count >= 1
-            && (last_label_is_tld || (has_int && !has_alpha && dot_count == 3))
-        {
-            (start_pos, end_pos).into()
+        let is_ipv4 = has_int && !has_alpha && dot_count == 3;
+        if end_pos != usize::MAX && dot_count >= 1 && (last_label_is_tld || is_ipv4) {
+            (start_pos, end_pos, is_ipv4).into()
         } else {
             None
         }
@@ -2352,7 +2338,7 @@ mod test {
                 "https://127.0.0.1/",
                 vec![TokenType::Url("https://127.0.0.1/")],
             ),
-            ("1.0.0.0", vec![TokenType::UrlNoScheme("1.0.0.0")]),
+            ("1.0.0.0", vec![TokenType::IpAddr("1.0.0.0")]),
             (
                 "1.0.0.0/foo/bar",
                 vec![TokenType::UrlNoScheme("1.0.0.0/foo/bar")],
@@ -2373,7 +2359,7 @@ mod test {
                 vec![
                     TokenType::Integer("1"),
                     TokenType::Punctuation('.'),
-                    TokenType::UrlNoScheme("0.0.0.0"),
+                    TokenType::IpAddr("0.0.0.0"),
                 ],
             ),
             (

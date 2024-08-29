@@ -7,7 +7,6 @@ use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use utils::suffixlist::DomainPart;
@@ -17,29 +16,8 @@ use crate::listener::acme::directory::Identifier;
 use crate::listener::acme::ChallengeSettings;
 use crate::Core;
 
-use super::directory::{Account, Auth, AuthStatus, Directory, DirectoryError, Order, OrderStatus};
-use super::jose::JoseError;
-use super::{AcmeError, AcmeProvider};
-
-#[derive(Debug)]
-pub enum OrderError {
-    Acme(DirectoryError),
-    Rcgen(rcgen::Error),
-    BadOrder(Order),
-    BadAuth(Auth),
-    TooManyAttemptsAuth(String),
-    ProcessingTimeout(Order),
-    Store(store::Error),
-    Dns(dns_update::Error),
-}
-
-#[derive(Debug)]
-pub enum CertParseError {
-    X509(x509_parser::nom::Err<x509_parser::error::X509Error>),
-    Pem(pem::PemError),
-    TooFewPem(usize),
-    InvalidPrivateKey,
-}
+use super::directory::{Account, AuthStatus, Directory, OrderStatus};
+use super::AcmeProvider;
 
 impl Core {
     pub(crate) async fn process_cert(
@@ -47,16 +25,8 @@ impl Core {
         provider: &AcmeProvider,
         pem: Vec<u8>,
         cached: bool,
-    ) -> Result<Duration, AcmeError> {
-        let (cert, validity) = match (parse_cert(&pem), cached) {
-            (Ok(r), _) => r,
-            (Err(err), cached) => {
-                return match cached {
-                    true => Err(AcmeError::CachedCertParse(err)),
-                    false => Err(AcmeError::NewCertParse(err)),
-                }
-            }
-        };
+    ) -> trc::Result<Duration> {
+        let (cert, validity) = parse_cert(&pem)?;
 
         self.set_cert(provider, Arc::new(cert));
 
@@ -66,14 +36,14 @@ impl Core {
             .unwrap_or_default();
         let renewal_date = validity[1] - provider.renew_before;
 
-        tracing::info!(
-            context = "acme",
-            event = "process-cert",
-            valid_not_before = %validity[0],
-            valid_not_after = %validity[1],
-            renewal_date = ?renewal_date,
-            domains = ?provider.domains,
-            "Loaded certificate for domains {:?}", provider.domains);
+        trc::event!(
+            Acme(trc::AcmeEvent::ProcessCert),
+            Id = provider.id.to_string(),
+            Hostname = provider.domains.as_slice(),
+            ValidFrom = trc::Value::Timestamp(validity[0].timestamp() as u64),
+            ValidTo = trc::Value::Timestamp(validity[1].timestamp() as u64),
+            Due = trc::Value::Timestamp(renewal_date.timestamp() as u64),
+        );
 
         if !cached {
             self.store_cert(provider, &pem).await?;
@@ -82,29 +52,34 @@ impl Core {
         Ok(renew_at)
     }
 
-    pub async fn renew(&self, provider: &AcmeProvider) -> Result<Duration, AcmeError> {
+    pub async fn renew(&self, provider: &AcmeProvider) -> trc::Result<Duration> {
         let mut backoff = 0;
         loop {
             match self.order(provider).await {
                 Ok(pem) => return self.process_cert(provider, pem, false).await,
                 Err(err) if backoff < 16 => {
-                    tracing::debug!(
-                        context = "acme",
-                        event = "renew-backoff",
-                        domains = ?provider.domains,
-                        attempt = backoff,
-                        reason = ?err,
-                        "Failed to renew certificate, backing off for {} seconds",
-                        1 << backoff);
+                    trc::event!(
+                        Acme(trc::AcmeEvent::RenewBackoff),
+                        Id = provider.id.to_string(),
+                        Hostname = provider.domains.as_slice(),
+                        Total = backoff,
+                        NextRetry = 1 << backoff,
+                        CausedBy = err,
+                    );
                     backoff = (backoff + 1).min(16);
                     tokio::time::sleep(Duration::from_secs(1 << backoff)).await;
                 }
-                Err(err) => return Err(AcmeError::Order(err)),
+                Err(err) => {
+                    return Err(err
+                        .details("Failed to renew certificate")
+                        .ctx_unique(trc::Key::Id, provider.id.to_string())
+                        .ctx_unique(trc::Key::Hostname, provider.domains.as_slice()))
+                }
             }
         }
     }
 
-    async fn order(&self, provider: &AcmeProvider) -> Result<Vec<u8>, OrderError> {
+    async fn order(&self, provider: &AcmeProvider) -> trc::Result<Vec<u8>> {
         let directory = Directory::discover(&provider.directory_url).await?;
         let account = Account::create_with_keypair(
             directory,
@@ -116,7 +91,11 @@ impl Core {
         let mut params = CertificateParams::new(provider.domains.clone());
         params.distinguished_name = DistinguishedName::new();
         params.alg = &PKCS_ECDSA_P256_SHA256;
-        let cert = rcgen::Certificate::from_params(params)?;
+        let cert = rcgen::Certificate::from_params(params).map_err(|err| {
+            trc::EventType::Acme(trc::AcmeEvent::Error)
+                .caused_by(trc::location!())
+                .reason(err)
+        })?;
 
         let (order_url, mut order) = account.new_order(provider.domains.clone()).await?;
         loop {
@@ -127,23 +106,22 @@ impl Core {
                         .iter()
                         .map(|url| self.authorize(provider, &account, url));
                     try_join_all(auth_futures).await?;
-                    tracing::info!(
-                        context = "acme",
-                        event = "auth-complete",
-                        domains = ?provider.domains.as_slice(),
-                        "Completed all authorizations"
+                    trc::event!(
+                        Acme(trc::AcmeEvent::AuthCompleted),
+                        Id = provider.id.to_string(),
+                        Hostname = provider.domains.as_slice(),
                     );
                     order = account.order(&order_url).await?;
                 }
                 OrderStatus::Processing => {
                     for i in 0u64..10 {
-                        tracing::info!(
-                            context = "acme",
-                            event = "processing",
-                            domains = ?provider.domains.as_slice(),
-                            attempt = i,
-                            "Processing order"
+                        trc::event!(
+                            Acme(trc::AcmeEvent::OrderProcessing),
+                            Id = provider.id.to_string(),
+                            Hostname = provider.domains.as_slice(),
+                            Total = i,
                         );
+
                         tokio::time::sleep(Duration::from_secs(1u64 << i)).await;
                         order = account.order(&order_url).await?;
                         if order.status != OrderStatus::Processing {
@@ -151,26 +129,30 @@ impl Core {
                         }
                     }
                     if order.status == OrderStatus::Processing {
-                        return Err(OrderError::ProcessingTimeout(order));
+                        return Err(trc::EventType::Acme(trc::AcmeEvent::Error)
+                            .caused_by(trc::location!())
+                            .details("Order processing timed out"));
                     }
                 }
                 OrderStatus::Ready => {
-                    tracing::info!(
-                        context = "acme",
-                        event = "csr-send",
-                        domains = ?provider.domains.as_slice(),
-                        "Sending CSR"
+                    trc::event!(
+                        Acme(trc::AcmeEvent::OrderReady),
+                        Id = provider.id.to_string(),
+                        Hostname = provider.domains.as_slice(),
                     );
 
-                    let csr = cert.serialize_request_der()?;
+                    let csr = cert.serialize_request_der().map_err(|err| {
+                        trc::EventType::Acme(trc::AcmeEvent::Error)
+                            .caused_by(trc::location!())
+                            .reason(err)
+                    })?;
                     order = account.finalize(order.finalize, csr).await?
                 }
                 OrderStatus::Valid { certificate } => {
-                    tracing::info!(
-                        context = "acme",
-                        event = "download",
-                        domains = ?provider.domains.as_slice(),
-                        "Downloading certificate"
+                    trc::event!(
+                        Acme(trc::AcmeEvent::OrderValid),
+                        Id = provider.id.to_string(),
+                        Hostname = provider.domains.as_slice(),
                     );
 
                     let pem = [
@@ -182,15 +164,15 @@ impl Core {
                     return Ok(pem.into_bytes());
                 }
                 OrderStatus::Invalid => {
-                    tracing::warn!(
-                        context = "acme",
-                        event = "error",
-                        reason = "invalid-order",
-                        domains = ?provider.domains.as_slice(),
-                        "Invalid order"
+                    trc::event!(
+                        Acme(trc::AcmeEvent::OrderInvalid),
+                        Id = provider.id.to_string(),
+                        Hostname = provider.domains.as_slice(),
                     );
 
-                    return Err(OrderError::BadOrder(order));
+                    return Err(trc::EventType::Acme(trc::AcmeEvent::Error)
+                        .into_err()
+                        .details("Invalid ACME order"));
                 }
             }
         }
@@ -201,24 +183,31 @@ impl Core {
         provider: &AcmeProvider,
         account: &Account,
         url: &String,
-    ) -> Result<(), OrderError> {
+    ) -> trc::Result<()> {
         let auth = account.auth(url).await?;
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
                 let challenge_type = provider.challenge.challenge_type();
-                tracing::info!(
-                    context = "acme",
-                    event = "challenge",
-                    domain = domain,
-                    challenge = ?challenge_type,
-                    "Requesting challenge for domain {domain}"
+
+                trc::event!(
+                    Acme(trc::AcmeEvent::AuthStart),
+                    Hostname = domain.to_string(),
+                    Type = challenge_type.as_str(),
+                    Id = provider.id.to_string(),
                 );
+
                 let challenge = auth
                     .challenges
                     .iter()
                     .find(|c| c.typ == challenge_type)
-                    .ok_or(DirectoryError::NoChallenge(challenge_type))?;
+                    .ok_or(
+                        trc::EventType::Acme(trc::AcmeEvent::Error)
+                            .into_err()
+                            .details("Missing Parameter")
+                            .ctx(trc::Key::Id, provider.id.to_string())
+                            .ctx(trc::Key::Type, challenge_type.as_str()),
+                    )?;
 
                 match &provider.challenge {
                     ChallengeSettings::TlsAlpn01 => {
@@ -261,12 +250,12 @@ impl Core {
                         // First try deleting the record
                         if let Err(err) = updater.delete(&name, &origin).await {
                             // Errors are expected if the record does not exist
-                            tracing::trace!(
-                                context = "acme",
-                                event = "dns-delete",
-                                name = name,
-                                origin = origin,
-                                error = ?err,
+                            trc::event!(
+                                Acme(trc::AcmeEvent::DnsRecordDeletionFailed),
+                                Hostname = name.to_string(),
+                                Reason = err.to_string(),
+                                Details = origin.to_string(),
+                                Id = provider.id.to_string(),
                             );
                         }
 
@@ -282,23 +271,20 @@ impl Core {
                             )
                             .await
                         {
-                            tracing::warn!(
-                                context = "acme",
-                                event = "dns-create",
-                                name = name,
-                                origin = origin,
-                                error = ?err,
-                                "Failed to create DNS record.",
-                            );
-                            return Err(OrderError::Dns(err));
+                            return Err(trc::EventType::Acme(
+                                trc::AcmeEvent::DnsRecordCreationFailed,
+                            )
+                            .ctx(trc::Key::Id, provider.id.to_string())
+                            .ctx(trc::Key::Hostname, name)
+                            .ctx(trc::Key::Details, origin)
+                            .reason(err));
                         }
 
-                        tracing::info!(
-                            context = "acme",
-                            event = "dns-create",
-                            name = name,
-                            origin = origin,
-                            "Successfully created DNS record.",
+                        trc::event!(
+                            Acme(trc::AcmeEvent::DnsRecordCreated),
+                            Hostname = name.to_string(),
+                            Details = origin.to_string(),
+                            Id = provider.id.to_string(),
                         );
 
                         // Wait for changes to propagate
@@ -312,25 +298,23 @@ impl Core {
                                         did_propagate = true;
                                         break;
                                     } else {
-                                        tracing::debug!(
-                                            context = "acme",
-                                            event = "dns-lookup",
-                                            name = name,
-                                            origin = origin,
-                                            contents = ?result,
-                                            expected_proof = ?dns_proof,
-                                            "DNS record has not propagated yet.",
+                                        trc::event!(
+                                            Acme(trc::AcmeEvent::DnsRecordNotPropagated),
+                                            Id = provider.id.to_string(),
+                                            Hostname = name.to_string(),
+                                            Details = origin.to_string(),
+                                            Result = result.to_string(),
+                                            Value = dns_proof.to_string(),
                                         );
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::trace!(
-                                        context = "acme",
-                                        event = "dns-lookup",
-                                        name = name,
-                                        origin = origin,
-                                        error = ?err,
-                                        "Failed to lookup DNS record.",
+                                    trc::event!(
+                                        Acme(trc::AcmeEvent::DnsRecordLookupFailed),
+                                        Id = provider.id.to_string(),
+                                        Hostname = name.to_string(),
+                                        Details = origin.to_string(),
+                                        Reason = err.to_string(),
                                     );
                                 }
                             }
@@ -339,20 +323,18 @@ impl Core {
                         }
 
                         if did_propagate {
-                            tracing::info!(
-                                context = "acme",
-                                event = "dns-lookup",
-                                name = name,
-                                origin = origin,
-                                "DNS changes have been propagated.",
+                            trc::event!(
+                                Acme(trc::AcmeEvent::DnsRecordPropagated),
+                                Id = provider.id.to_string(),
+                                Hostname = name.to_string(),
+                                Details = origin.to_string(),
                             );
                         } else {
-                            tracing::warn!(
-                                context = "acme",
-                                event = "dns-lookup",
-                                name = name,
-                                origin = origin,
-                                "DNS changes have not been propagated within the timeout.",
+                            trc::event!(
+                                Acme(trc::AcmeEvent::DnsRecordPropagationTimeout),
+                                Id = provider.id.to_string(),
+                                Hostname = name.to_string(),
+                                Details = origin.to_string(),
                             );
                         }
                     }
@@ -362,7 +344,12 @@ impl Core {
                 (domain, challenge.url.clone())
             }
             AuthStatus::Valid => return Ok(()),
-            _ => return Err(OrderError::BadAuth(auth)),
+            _ => {
+                return Err(trc::EventType::Acme(trc::AcmeEvent::AuthError)
+                    .into_err()
+                    .ctx(trc::Key::Id, provider.id.to_string())
+                    .ctx(trc::Key::Details, auth.status.as_str()))
+            }
         };
 
         for i in 0u64..5 {
@@ -370,42 +357,60 @@ impl Core {
             let auth = account.auth(url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    tracing::info!(
-                        context = "acme",
-                        event = "auth-pending",
-                        domain = domain,
-                        attempt = i,
-                        "Authorization for domain {domain} is still pending",
+                    trc::event!(
+                        Acme(trc::AcmeEvent::AuthPending),
+                        Hostname = domain.to_string(),
+                        Id = provider.id.to_string(),
+                        Total = i,
                     );
+
                     account.challenge(&challenge_url).await?
                 }
                 AuthStatus::Valid => {
-                    tracing::debug!(
-                        context = "acme",
-                        event = "auth-valid",
-                        domain = domain,
-                        "Authorization for domain {domain} is valid",
+                    trc::event!(
+                        Acme(trc::AcmeEvent::AuthValid),
+                        Hostname = domain.to_string(),
+                        Id = provider.id.to_string(),
                     );
 
                     return Ok(());
                 }
-                _ => return Err(OrderError::BadAuth(auth)),
+                _ => {
+                    return Err(trc::EventType::Acme(trc::AcmeEvent::AuthError)
+                        .into_err()
+                        .ctx(trc::Key::Id, provider.id.to_string())
+                        .ctx(trc::Key::Details, auth.status.as_str()))
+                }
             }
         }
-        Err(OrderError::TooManyAttemptsAuth(domain))
+        Err(trc::EventType::Acme(trc::AcmeEvent::AuthTooManyAttempts)
+            .into_err()
+            .ctx(trc::Key::Id, provider.id.to_string())
+            .ctx(trc::Key::Hostname, domain))
     }
 }
 
-fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
-    let mut pems = pem::parse_many(pem)?;
+fn parse_cert(pem: &[u8]) -> trc::Result<(CertifiedKey, [DateTime<Utc>; 2])> {
+    let mut pems = pem::parse_many(pem).map_err(|err| {
+        trc::EventType::Acme(trc::AcmeEvent::Error)
+            .reason(err)
+            .caused_by(trc::location!())
+    })?;
     if pems.len() < 2 {
-        return Err(CertParseError::TooFewPem(pems.len()));
+        return Err(trc::EventType::Acme(trc::AcmeEvent::Error)
+            .caused_by(trc::location!())
+            .ctx(trc::Key::Size, pems.len())
+            .details("Too few PEMs"));
     }
     let pk = match any_ecdsa_type(&PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         pems.remove(0).contents(),
     ))) {
         Ok(pk) => pk,
-        Err(_) => return Err(CertParseError::InvalidPrivateKey),
+        Err(err) => {
+            return Err(trc::EventType::Acme(trc::AcmeEvent::Error)
+                .reason(err)
+                .caused_by(trc::location!()))
+        }
     };
     let cert_chain: Vec<CertificateDer> = pems
         .into_iter()
@@ -420,50 +425,12 @@ fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertPars
                     .unwrap_or_default()
             })
         }
-        Err(err) => return Err(CertParseError::X509(err)),
+        Err(err) => {
+            return Err(trc::EventType::Acme(trc::AcmeEvent::Error)
+                .reason(err)
+                .caused_by(trc::location!()))
+        }
     };
     let cert = CertifiedKey::new(cert_chain, pk);
     Ok((cert, validity))
-}
-
-impl From<DirectoryError> for OrderError {
-    fn from(err: DirectoryError) -> Self {
-        Self::Acme(err)
-    }
-}
-
-impl From<rcgen::Error> for OrderError {
-    fn from(err: rcgen::Error) -> Self {
-        Self::Rcgen(err)
-    }
-}
-
-impl From<x509_parser::nom::Err<x509_parser::error::X509Error>> for CertParseError {
-    fn from(err: x509_parser::nom::Err<x509_parser::error::X509Error>) -> Self {
-        Self::X509(err)
-    }
-}
-
-impl From<pem::PemError> for CertParseError {
-    fn from(err: pem::PemError) -> Self {
-        Self::Pem(err)
-    }
-}
-
-impl From<JoseError> for OrderError {
-    fn from(err: JoseError) -> Self {
-        Self::Acme(DirectoryError::Jose(err))
-    }
-}
-
-impl From<JoseError> for AcmeError {
-    fn from(err: JoseError) -> Self {
-        Self::Order(OrderError::from(err))
-    }
-}
-
-impl From<store::Error> for OrderError {
-    fn from(value: store::Error) -> Self {
-        Self::Store(value)
-    }
 }

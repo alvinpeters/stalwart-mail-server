@@ -1,31 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::import::{ImportEmailRequest, ImportEmailResponse},
     types::{
         acl::Acl,
@@ -39,16 +19,17 @@ use jmap_proto::{
 use mail_parser::MessageParser;
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, IngestError, JMAP};
+use crate::{api::http::HttpSessionData, auth::AccessToken, JMAP};
 
-use super::ingest::IngestEmail;
+use super::ingest::{IngestEmail, IngestSource};
 
 impl JMAP {
     pub async fn email_import(
         &self,
         request: ImportEmailRequest,
         access_token: &AccessToken,
-    ) -> Result<ImportEmailResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> trc::Result<ImportEmailResponse> {
         // Validate state
         let account_id = request.account_id.document_id();
         let old_state: State = self
@@ -140,30 +121,37 @@ impl JMAP {
                     mailbox_ids,
                     keywords: email.keywords,
                     received_at: email.received_at.map(|r| r.into()),
-                    skip_duplicates: true,
+                    source: IngestSource::Jmap,
                     encrypt: self.core.jmap.encrypt && self.core.jmap.encrypt_append,
+                    session_id: session.session_id,
                 })
                 .await
             {
                 Ok(email) => {
                     response.created.append(id, email.into());
                 }
-                Err(IngestError::Permanent { reason, .. }) => {
-                    response.not_created.append(
-                        id,
-                        SetError::new(SetErrorType::InvalidEmail).with_description(reason),
-                    );
-                }
-                Err(IngestError::OverQuota) => {
-                    response.not_created.append(
-                        id,
-                        SetError::new(SetErrorType::OverQuota)
-                            .with_description("You have exceeded your disk quota."),
-                    );
-                }
-                Err(IngestError::Temporary) => {
-                    return Err(MethodError::ServerPartialFail);
-                }
+                Err(mut err) => match err.as_ref() {
+                    trc::EventType::Limit(trc::LimitEvent::Quota) => {
+                        response.not_created.append(
+                            id,
+                            SetError::new(SetErrorType::OverQuota)
+                                .with_description("You have exceeded your disk quota."),
+                        );
+                    }
+                    trc::EventType::MessageIngest(trc::MessageIngestEvent::Error) => {
+                        response.not_created.append(
+                            id,
+                            SetError::new(SetErrorType::InvalidEmail).with_description(
+                                err.take_value(trc::Key::Reason)
+                                    .and_then(|v| v.into_string())
+                                    .unwrap(),
+                            ),
+                        );
+                    }
+                    _ => {
+                        return Err(err);
+                    }
+                },
             }
         }
 

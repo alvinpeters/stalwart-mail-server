@@ -1,36 +1,18 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use ahash::AHashSet;
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
 use store::Stores;
 use utils::config::{ipmask::IpAddrOrMask, utils::ParseValue, Config};
 
 use crate::{
     config::{
         server::{tls::parse_certificates, Servers},
-        tracers::Tracers,
+        telemetry::Telemetry,
     },
     listener::blocked::BLOCKED_IP_KEY,
     Core,
@@ -41,10 +23,11 @@ use super::config::{ConfigManager, Patterns};
 pub struct ReloadResult {
     pub config: Config,
     pub new_core: Option<Core>,
+    pub tracers: Option<Telemetry>,
 }
 
 impl Core {
-    pub async fn reload_blocked_ips(&self) -> store::Result<ReloadResult> {
+    pub async fn reload_blocked_ips(&self) -> trc::Result<ReloadResult> {
         let mut ip_addresses = AHashSet::new();
         let mut config = self.storage.config.build_config(BLOCKED_IP_KEY).await?;
 
@@ -69,7 +52,7 @@ impl Core {
         Ok(config.into())
     }
 
-    pub async fn reload_certificates(&self) -> store::Result<ReloadResult> {
+    pub async fn reload_certificates(&self) -> trc::Result<ReloadResult> {
         let mut config = self.storage.config.build_config("certificate").await?;
         let mut certificates = self.tls.certificates.load().as_ref().clone();
 
@@ -80,7 +63,7 @@ impl Core {
         Ok(config.into())
     }
 
-    pub async fn reload_lookups(&self) -> store::Result<ReloadResult> {
+    pub async fn reload_lookups(&self) -> trc::Result<ReloadResult> {
         let mut config = self.storage.config.build_config("certificate").await?;
         let mut stores = Stores::default();
         stores.parse_memory_stores(&mut config);
@@ -93,14 +76,12 @@ impl Core {
         Ok(ReloadResult {
             config,
             new_core: core.into(),
+            tracers: None,
         })
     }
 
-    pub async fn reload(&self) -> store::Result<ReloadResult> {
+    pub async fn reload(&self) -> trc::Result<ReloadResult> {
         let mut config = self.storage.config.build_config("").await?;
-
-        // Parse tracers
-        Tracers::parse(&mut config);
 
         // Load stores
         let mut stores = Stores {
@@ -112,6 +93,10 @@ impl Core {
         };
         stores.parse_stores(&mut config).await;
         stores.parse_lookups(&mut config).await;
+
+        // Parse tracers
+        let tracers = Telemetry::parse(&mut config, &stores);
+
         if !config.errors.is_empty() {
             return Ok(config.into());
         }
@@ -133,9 +118,6 @@ impl Core {
         if !config.errors.is_empty() {
             return Ok(config.into());
         }
-        // Transfer Sieve cache
-        core.sieve.bayes_cache = self.sieve.bayes_cache.clone();
-        core.sieve.remote_lists = RwLock::new(self.sieve.remote_lists.read().clone());
 
         // Copy ACME certificates
         let mut certificates = core.tls.certificates.load().as_ref().clone();
@@ -145,7 +127,9 @@ impl Core {
                 .or_insert(cert.clone());
         }
         core.tls.certificates.store(certificates.into());
-        core.tls.self_signed_cert = self.tls.self_signed_cert.clone();
+        core.tls
+            .self_signed_cert
+            .clone_from(&self.tls.self_signed_cert);
 
         // Parser servers
         let mut servers = Servers::parse(&mut config);
@@ -155,6 +139,7 @@ impl Core {
             ReloadResult {
                 config,
                 new_core: core.into(),
+                tracers: tracers.into(),
             }
         } else {
             config.into()
@@ -167,6 +152,7 @@ impl From<Config> for ReloadResult {
         Self {
             config,
             new_core: None,
+            tracers: None,
         }
     }
 }

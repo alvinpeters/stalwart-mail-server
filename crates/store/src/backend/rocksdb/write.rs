@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     sync::Arc,
@@ -34,7 +17,7 @@ use rocksdb::{
     OptimisticTransactionOptions, WriteOptions,
 };
 
-use super::{CfHandle, RocksDbStore, CF_INDEXES, CF_LOGS};
+use super::{into_error, CfHandle, RocksDbStore, CF_INDEXES, CF_LOGS};
 use crate::{
     backend::deserialize_i64_le,
     write::{
@@ -45,7 +28,7 @@ use crate::{
 };
 
 impl RocksDbStore {
-    pub(crate) async fn write(&self, batch: Batch) -> crate::Result<AssignedIds> {
+    pub(crate) async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
         let db = self.db.clone();
 
         self.spawn_worker(move || {
@@ -76,7 +59,7 @@ impl RocksDbStore {
                             sleep(Duration::from_millis(backoff));
                             retry_count += 1;
                         }
-                        _ => return Err(err.into()),
+                        _ => return Err(into_error(err)),
                     },
                 }
             }
@@ -84,7 +67,7 @@ impl RocksDbStore {
         .await
     }
 
-    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> crate::Result<()> {
+    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> trc::Result<()> {
         let db = self.db.clone();
         self.spawn_worker(move || {
             let cf = db
@@ -98,7 +81,7 @@ impl RocksDbStore {
             let it_mode = IteratorMode::From(&from, Direction::Forward);
 
             for row in db.iterator_cf(&cf, it_mode) {
-                let (key, _) = row?;
+                let (key, _) = row.map_err(into_error)?;
 
                 if key.as_ref() < from.as_slice() || key.as_ref() >= to.as_slice() {
                     break;
@@ -107,7 +90,7 @@ impl RocksDbStore {
             }
 
             for k in delete_keys {
-                db.delete_cf(&cf, &k)?;
+                db.delete_cf(&cf, &k).map_err(into_error)?;
             }
 
             Ok(())
@@ -115,7 +98,7 @@ impl RocksDbStore {
         .await
     }
 
-    pub(crate) async fn purge_store(&self) -> crate::Result<()> {
+    pub(crate) async fn purge_store(&self) -> trc::Result<()> {
         let db = self.db.clone();
         self.spawn_worker(move || {
             for subspace in [SUBSPACE_QUOTA, SUBSPACE_COUNTER] {
@@ -126,7 +109,7 @@ impl RocksDbStore {
                 let mut delete_keys = Vec::new();
 
                 for row in db.iterator_cf(&cf, IteratorMode::Start) {
-                    let (key, value) = row?;
+                    let (key, value) = row.map_err(into_error)?;
 
                     if i64::deserialize(&value)? == 0 {
                         delete_keys.push(key);
@@ -137,14 +120,15 @@ impl RocksDbStore {
                 for key in delete_keys {
                     let txn = db.transaction_opt(&WriteOptions::default(), &txn_opts);
                     if txn
-                        .get_pinned_for_update_cf(&cf, &key, true)?
+                        .get_pinned_for_update_cf(&cf, &key, true)
+                        .map_err(into_error)?
                         .map(|value| i64::deserialize(&value).map(|v| v == 0).unwrap_or(false))
                         .unwrap_or(false)
                     {
-                        txn.delete_cf(&cf, key)?;
-                        txn.commit()?;
+                        txn.delete_cf(&cf, key).map_err(into_error)?;
+                        txn.commit().map_err(into_error)?;
                     } else {
-                        txn.rollback()?;
+                        txn.rollback().map_err(into_error)?;
                     }
                 }
             }
@@ -164,7 +148,7 @@ struct RocksDBTransaction<'x> {
 }
 
 enum CommitError {
-    Internal(crate::Error),
+    Internal(trc::Error),
     RocksDB(rocksdb::Error),
 }
 
@@ -220,7 +204,7 @@ impl<'x> RocksDBTransaction<'x> {
                                 .map_err(CommitError::from)
                                 .and_then(|bytes| {
                                     if let Some(bytes) = bytes {
-                                        deserialize_i64_le(&bytes)
+                                        deserialize_i64_le(&key, &bytes)
                                             .map(|v| v + *by)
                                             .map_err(CommitError::from)
                                     } else {
@@ -324,7 +308,7 @@ impl<'x> RocksDBTransaction<'x> {
 
                     if !matches {
                         txn.rollback()?;
-                        return Err(CommitError::Internal(crate::Error::AssertValueFailed));
+                        return Err(CommitError::Internal(trc::StoreEvent::AssertValueFailed.into()));
                     }
                 }
             }
@@ -340,8 +324,8 @@ impl From<rocksdb::Error> for CommitError {
     }
 }
 
-impl From<crate::Error> for CommitError {
-    fn from(err: crate::Error) -> Self {
+impl From<trc::Error> for CommitError {
+    fn from(err: trc::Error) -> Self {
         CommitError::Internal(err)
     }
 }

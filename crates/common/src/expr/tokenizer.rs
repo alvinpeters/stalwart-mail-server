@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{borrow::Cow, iter::Peekable, slice::Iter, time::Duration};
 
@@ -47,7 +30,7 @@ pub struct Tokenizer<'x> {
 
 #[derive(Debug, Default, Clone)]
 pub struct TokenMap {
-    pub tokens: AHashMap<&'static str, Token>,
+    pub tokens: AHashMap<Cow<'static, str>, Token>,
 }
 
 impl<'x> Tokenizer<'x> {
@@ -376,19 +359,21 @@ impl TokenMap {
     pub fn with_variables(mut self, variables: &[u32]) -> Self {
         for (name, idx) in VARIABLES_MAP {
             if variables.contains(idx) {
-                self.tokens.insert(name, Token::Variable(*idx));
+                self.tokens
+                    .insert(Cow::Borrowed(name), Token::Variable(*idx));
             }
         }
 
         self
     }
 
-    pub fn with_variables_map<I>(mut self, vars: I) -> Self
+    pub fn with_variables_map<I, V>(mut self, vars: I) -> Self
     where
-        I: IntoIterator<Item = (&'static str, u32)>,
+        I: IntoIterator<Item = (V, u32)>,
+        V: Into<Cow<'static, str>>,
     {
         for (name, idx) in vars {
-            self.tokens.insert(name, Token::Variable(idx));
+            self.tokens.insert(name.into(), Token::Variable(idx));
         }
 
         self
@@ -400,7 +385,8 @@ impl TokenMap {
         T: Into<Constant>,
     {
         for (name, constant) in consts {
-            self.tokens.insert(name, Token::Constant(constant.into()));
+            self.tokens
+                .insert(Cow::Borrowed(name), Token::Constant(constant.into()));
         }
 
         self
@@ -412,7 +398,8 @@ impl TokenMap {
     }
 
     pub fn add_constant(&mut self, name: &'static str, constant: impl Into<Constant>) -> &mut Self {
-        self.tokens.insert(name, Token::Constant(constant.into()));
+        self.tokens
+            .insert(Cow::Borrowed(name), Token::Constant(constant.into()));
         self
     }
 }

@@ -1,11 +1,7 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
- * https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
- * <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
- * option. This file may not be copied, modified, or distributed
- * except according to those terms.
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{borrow::Borrow, hash::Hash, time::Instant};
@@ -16,16 +12,16 @@ pub type TtlDashMap<K, V> = DashMap<K, LruItem<V>, ahash::RandomState>;
 
 #[derive(Debug, Clone)]
 pub struct LruItem<V> {
-    item: V,
+    pub item: V,
     valid_until: Instant,
 }
 
 pub trait TtlMap<K, V>: Sized {
     fn with_capacity(capacity: usize, shard_amount: usize) -> Self;
-    fn get_with_ttl<Q: ?Sized>(&self, name: &Q) -> Option<V>
+    fn get_with_ttl<Q>(&self, name: &Q) -> Option<V>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq;
+        Q: Hash + Eq + ?Sized;
     fn insert_with_ttl(&self, name: K, value: V, valid_until: Instant) -> V;
     fn cleanup(&self);
 }
@@ -39,10 +35,10 @@ impl<K: Hash + Eq, V: Clone> TtlMap<K, V> for TtlDashMap<K, V> {
         )
     }
 
-    fn get_with_ttl<Q: ?Sized>(&self, name: &Q) -> Option<V>
+    fn get_with_ttl<Q>(&self, name: &Q) -> Option<V>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         match self.get(name) {
             Some(entry) if entry.valid_until >= Instant::now() => entry.item.clone().into(),

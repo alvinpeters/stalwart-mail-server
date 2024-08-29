@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::borrow::Cow;
 
 use utils::suffixlist::PublicSuffix;
@@ -118,6 +124,7 @@ impl<'x, 'y> Iterator for BayesTokenizer<'x, 'y> {
                         continue;
                     }
                 }
+                TokenType::IpAddr(word) => word.into(),
                 TokenType::UrlNoScheme(word) => word
                     .split_once('/')
                     .map_or(word, |(h, _)| h)

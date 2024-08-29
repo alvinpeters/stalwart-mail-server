@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::borrow::Cow;
 use std::iter::Peekable;
@@ -31,14 +14,14 @@ use mail_parser::decoders::charsets::DecoderFnc;
 use crate::protocol::search::{self, Filter};
 use crate::protocol::search::{ModSeqEntry, ResultOption};
 use crate::protocol::{Flag, ProtocolVersion};
-use crate::receiver::{Request, Token};
+use crate::receiver::{bad, Request, Token};
 use crate::Command;
 
 use super::{parse_date, parse_number, parse_sequence_set};
 
 impl Request<Command> {
     #[allow(clippy::while_let_on_iterator)]
-    pub fn parse_search(self, version: ProtocolVersion) -> crate::Result<search::Arguments> {
+    pub fn parse_search(self, version: ProtocolVersion) -> trc::Result<search::Arguments> {
         if self.tokens.is_empty() {
             return Err(self.into_error("Missing search criteria."));
         }
@@ -53,15 +36,15 @@ impl Request<Command> {
                 Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"return") => {
                     tokens.next();
                     is_esearch = true;
-                    result_options =
-                        parse_result_options(&mut tokens).map_err(|v| (self.tag.as_str(), v))?;
+                    result_options = parse_result_options(&mut tokens)
+                        .map_err(|v| bad(self.tag.to_string(), v))?;
                 }
                 Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"charset") => {
                     tokens.next();
                     decoder = charset_decoder(
                         &tokens
                             .next()
-                            .ok_or((self.tag.as_str(), "Missing charset."))?
+                            .ok_or_else(|| bad(self.tag.to_string(), "Missing charset."))?
                             .unwrap_bytes(),
                     );
                 }
@@ -69,10 +52,11 @@ impl Request<Command> {
             }
         }
 
-        let filter = parse_filters(&mut tokens, decoder).map_err(|v| (self.tag.as_str(), v))?;
+        let filter =
+            parse_filters(&mut tokens, decoder).map_err(|v| bad(self.tag.to_string(), v))?;
 
         match filter.len() {
-            0 => Err((self.tag.as_str(), "No filters found in command.").into()),
+            0 => Err(bad(self.tag.to_string(), "No filters found in command.")),
             _ => Ok(search::Arguments {
                 tag: self.tag,
                 result_options,

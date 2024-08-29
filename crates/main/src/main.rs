@@ -1,38 +1,19 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
-use common::{config::server::ServerProtocol, manager::boot::BootManager};
+use common::{config::server::ServerProtocol, manager::boot::BootManager, Ipc, IPC_CHANNEL_BUFFER};
 use imap::core::{ImapSessionManager, IMAP};
-use jmap::{
-    api::JmapSessionManager,
-    services::{gossip::spawn::GossiperBuilder, IPC_CHANNEL_BUFFER},
-    JMAP,
-};
+use jmap::{api::JmapSessionManager, services::gossip::spawn::GossiperBuilder, JMAP};
 use managesieve::core::ManageSieveSessionManager;
+use pop3::Pop3SessionManager;
 use smtp::core::{SmtpSessionManager, SMTP};
 use tokio::sync::mpsc;
+use trc::Collector;
 use utils::wait_for_shutdown;
 
 #[cfg(not(target_env = "msvc"))]
@@ -51,16 +32,29 @@ async fn main() -> std::io::Result<()> {
     let mut config = init.config;
     let core = init.core;
 
-    // Init servers
+    // Setup IPC channels
     let (delivery_tx, delivery_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
-    let smtp = SMTP::init(&mut config, core.clone(), delivery_tx).await;
+    let ipc = Ipc { delivery_tx };
+
+    // Init servers
+    let smtp = SMTP::init(
+        &mut config,
+        core.clone(),
+        ipc,
+        init.servers.span_id_gen.clone(),
+    )
+    .await;
     let jmap = JMAP::init(&mut config, delivery_rx, core.clone(), smtp.inner.clone()).await;
     let imap = IMAP::init(&mut config, jmap.clone()).await;
     let gossiper = GossiperBuilder::try_parse(&mut config);
 
     // Log configuration errors
-    config.log_errors(init.guards.is_none());
-    config.log_warnings(init.guards.is_none());
+    config.log_errors();
+    config.log_warnings();
+
+    // Log licensing information
+    #[cfg(feature = "enterprise")]
+    core.load().as_ref().log_license_details();
 
     // Spawn servers
     let (shutdown_tx, shutdown_rx) = init.servers.spawn(|server, acceptor, shutdown_rx| {
@@ -83,6 +77,12 @@ async fn main() -> std::io::Result<()> {
                 acceptor,
                 shutdown_rx,
             ),
+            ServerProtocol::Pop3 => server.spawn(
+                Pop3SessionManager::new(imap.clone()),
+                core.clone(),
+                acceptor,
+                shutdown_rx,
+            ),
             ServerProtocol::ManageSieve => server.spawn(
                 ManageSieveSessionManager::new(imap.clone()),
                 core.clone(),
@@ -94,15 +94,14 @@ async fn main() -> std::io::Result<()> {
 
     // Spawn gossip
     if let Some(gossiper) = gossiper {
-        gossiper.spawn(jmap, shutdown_rx).await;
+        gossiper.spawn(jmap, shutdown_rx.clone()).await;
     }
 
     // Wait for shutdown signal
-    wait_for_shutdown(&format!(
-        "Shutting down Stalwart Mail Server v{}...",
-        env!("CARGO_PKG_VERSION")
-    ))
-    .await;
+    wait_for_shutdown().await;
+
+    // Shutdown collector
+    Collector::shutdown();
 
     // Stop services
     let _ = shutdown_tx.send(true);

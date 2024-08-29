@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use sieve::{runtime::Variable, FunctionMap};
 
@@ -52,7 +35,7 @@ pub fn register(plugin_id: u32, fnc_map: &mut FunctionMap) {
     fnc_map.set_external_function("pyzor_check", plugin_id, 2);
 }
 
-pub fn exec(ctx: PluginContext<'_>) -> Variable {
+pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     // Make sure there is at least one text part
     if !ctx
         .message
@@ -60,7 +43,7 @@ pub fn exec(ctx: PluginContext<'_>) -> Variable {
         .iter()
         .any(|p| matches!(p.body, PartType::Text(_) | PartType::Html(_)))
     {
-        return Variable::default();
+        return Ok(Variable::default());
     }
 
     // Hash message
@@ -71,51 +54,43 @@ pub fn exec(ctx: PluginContext<'_>) -> Variable {
     #[cfg(feature = "test_mode")]
     {
         if request.contains("b5b476f0b5ba6e1c038361d3ded5818dd39c90a2") {
-            return PyzorResponse {
+            return Ok(PyzorResponse {
                 code: 200,
                 count: 1000,
                 wl_count: 0,
             }
-            .into();
+            .into());
         } else if request.contains("d67d4b8bfc3860449e3418bb6017e2612f3e2a99") {
-            return PyzorResponse {
+            return Ok(PyzorResponse {
                 code: 200,
                 count: 60,
                 wl_count: 10,
             }
-            .into();
+            .into());
         } else if request.contains("81763547012b75e57a20d18ce0b93014208cdfdb") {
-            return PyzorResponse {
+            return Ok(PyzorResponse {
                 code: 200,
                 count: 50,
                 wl_count: 20,
             }
-            .into();
+            .into());
         }
     }
 
-    let span = ctx.span;
     let address = ctx.arguments[0].to_string();
-    let timeout = Duration::from_secs(std::cmp::max(
-        std::cmp::min(ctx.arguments[1].to_integer() as u64, 60),
-        5,
-    ));
+    let timeout = Duration::from_secs((ctx.arguments[1].to_integer() as u64).clamp(5, 60));
+
     // Send message to address
-    match ctx
-        .handle
-        .block_on(pyzor_send_message(address.as_ref(), timeout, &request))
-    {
-        Ok(response) => response.into(),
-        Err(err) => {
-            tracing::debug!(
-                parent: span,
-                context = "sieve:pyzor_check",
-                event = "failed",
-                reason = %err,
-            );
-            Variable::default()
-        }
-    }
+    pyzor_send_message(address.as_ref(), timeout, &request)
+        .await
+        .map(Into::into)
+        .map_err(|err| {
+            trc::SpamEvent::PyzorError
+                .into_err()
+                .ctx(trc::Key::Url, address.to_string())
+                .reason(err)
+                .details("Pyzor failed")
+        })
 }
 
 impl From<PyzorResponse> for Variable {
@@ -296,6 +271,7 @@ where
                 | TokenType::Url(_)
                 | TokenType::UrlNoScheme(_)
                 | TokenType::UrlNoHost(_)
+                | TokenType::IpAddr(_)
                 | TokenType::Email(_) => {
                     if token_start != usize::MAX {
                         add_line(&mut clean_line, &line[token_start..token_end]);

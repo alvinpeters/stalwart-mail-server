@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::sync::Arc;
 
 use sieve::{runtime::Variable, Envelope};
@@ -8,7 +14,9 @@ use crate::IntoString;
 pub mod functions;
 pub mod plugins;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "action")]
+#[serde(rename_all = "camelCase")]
 pub enum ScriptModification {
     SetEnvelope {
         name: Envelope,

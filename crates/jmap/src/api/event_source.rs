@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     sync::Arc,
@@ -29,14 +12,14 @@ use std::{
 use http_body_util::{combinators::BoxBody, StreamBody};
 use hyper::{
     body::{Bytes, Frame},
-    header, StatusCode,
+    StatusCode,
 };
-use jmap_proto::{error::request::RequestError, types::type_state::DataType};
+use jmap_proto::types::type_state::DataType;
 use utils::map::bitmap::Bitmap;
 
 use crate::{auth::AccessToken, JMAP, LONG_SLUMBER};
 
-use super::{http::ToHttpResponse, HttpRequest, HttpResponse, StateChangeResponse};
+use super::{HttpRequest, HttpResponse, HttpResponseBody, StateChangeResponse};
 
 struct Ping {
     interval: Duration,
@@ -49,7 +32,7 @@ impl JMAP {
         &self,
         req: HttpRequest,
         access_token: Arc<AccessToken>,
-    ) -> HttpResponse {
+    ) -> trc::Result<HttpResponse> {
         // Parse query
         let mut ping = 0;
         let mut types = Bitmap::default();
@@ -66,7 +49,7 @@ impl JMAP {
                         } else if let Ok(type_state) = DataType::try_from(type_state) {
                             types.insert(type_state);
                         } else {
-                            return RequestError::invalid_parameters().into_http_response();
+                            return Err(trc::ResourceEvent::BadParameters.into_err());
                         }
                     }
                 }
@@ -75,13 +58,13 @@ impl JMAP {
                         close_after_state = true;
                     }
                     "no" => {}
-                    _ => return RequestError::invalid_parameters().into_http_response(),
+                    _ => return Err(trc::ResourceEvent::BadParameters.into_err()),
                 },
                 "ping" => match value.parse::<u32>() {
                     Ok(value) => {
                         ping = value;
                     }
-                    Err(_) => return RequestError::invalid_parameters().into_http_response(),
+                    Err(_) => return Err(trc::ResourceEvent::BadParameters.into_err()),
                 },
                 _ => {}
             }
@@ -109,20 +92,16 @@ impl JMAP {
         let throttle = self.core.jmap.event_source_throttle;
 
         // Register with state manager
-        let mut change_rx = if let Some(change_rx) = self
+        let mut change_rx = self
             .subscribe_state_manager(access_token.primary_id(), types)
-            .await
-        {
-            change_rx
-        } else {
-            return RequestError::internal_server_error().into_http_response();
-        };
+            .await?;
 
-        hyper::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(BoxBody::new(StreamBody::new(async_stream::stream! {
+        Ok(HttpResponse {
+            status: StatusCode::OK,
+            content_type: "text/event-stream".into(),
+            content_disposition: "".into(),
+            cache_control: "no-store".into(),
+            body: HttpResponseBody::Stream(BoxBody::new(StreamBody::new(async_stream::stream! {
                 let mut last_message = Instant::now() - throttle;
                 let mut timeout =
                     ping.as_ref().map(|p| p.interval).unwrap_or(LONG_SLUMBER);
@@ -138,7 +117,6 @@ impl JMAP {
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!("Broadcast channel was closed.");
                             break;
                         }
                         Err(_) => (),
@@ -175,7 +153,7 @@ impl JMAP {
                         LONG_SLUMBER
                     };
                 }
-            })))
-            .unwrap()
+            }))),
+        })
     }
 }

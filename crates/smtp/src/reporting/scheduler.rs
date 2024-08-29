@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use ahash::{AHashMap, RandomState};
 use common::Core;
@@ -28,7 +11,7 @@ use mail_auth::dmarc::Dmarc;
 use std::time::{Duration, Instant, SystemTime};
 use store::{
     write::{now, BatchBuilder, QueueClass, ReportEvent, ValueClass},
-    Deserialize, IterateParams, Serialize, ValueKey,
+    Deserialize, IterateParams, Key, Serialize, ValueKey,
 };
 use tokio::sync::mpsc;
 
@@ -48,7 +31,7 @@ impl SpawnReport for mpsc::Receiver<Event> {
             loop {
                 // Read events
                 let now = now();
-                let events = next_report_event(&core.core.load()).await;
+                let events = next_report_event(&core.core.load_full()).await;
                 next_wake_up = events
                     .last()
                     .and_then(|e| match e {
@@ -107,7 +90,7 @@ impl SpawnReport for mpsc::Receiver<Event> {
                         // Cleanup expired throttles
                         if last_cleanup.elapsed().as_secs() >= 86400 {
                             last_cleanup = Instant::now();
-                            core.spawn_cleanup();
+                            core.cleanup();
                         }
                     }
                 }
@@ -159,12 +142,9 @@ async fn next_report_event(core: &Core) -> Vec<QueueClass> {
         .await;
 
     if let Err(err) = result {
-        tracing::error!(
-            context = "queue",
-            event = "error",
-            "Failed to read from store: {}",
-            err
-        );
+        trc::error!(err
+            .caused_by(trc::location!())
+            .details("Failed to read from store"));
     }
 
     events
@@ -190,53 +170,46 @@ impl SMTP {
                     );
                     match self.core.storage.data.write(batch.build()).await {
                         Ok(_) => true,
-                        Err(store::Error::AssertValueFailed) => {
-                            tracing::debug!(
-                                context = "queue",
-                                event = "locked",
-                                key = ?lock,
-                                "Lock busy: Event already locked."
+                        Err(err) if err.is_assertion_failure() => {
+                            trc::event!(
+                                OutgoingReport(trc::OutgoingReportEvent::LockBusy),
+                                Expires = trc::Value::Timestamp(expiry),
+                                CausedBy = err,
+                                Key = ValueKey::from(ValueClass::Queue(lock)).serialize(0)
                             );
                             false
                         }
                         Err(err) => {
-                            tracing::error!(
-                                context = "queue",
-                                event = "error",
-                                "Lock busy: {}",
-                                err
-                            );
+                            trc::error!(err
+                                .caused_by(trc::location!())
+                                .details("Failed to lock report"));
+
                             false
                         }
                     }
                 } else {
-                    tracing::debug!(
-                        context = "queue",
-                        event = "locked",
-                        key = ?lock,
-                        expiry = expiry - now,
-                        "Lock busy: Report already locked."
+                    trc::event!(
+                        OutgoingReport(trc::OutgoingReportEvent::Locked),
+                        Expires = trc::Value::Timestamp(expiry),
+                        Key = ValueKey::from(ValueClass::Queue(lock)).serialize(0)
                     );
+
                     false
                 }
             }
             Ok(None) => {
-                tracing::debug!(
-                    context = "queue",
-                    event = "locked",
-                    key = ?lock,
-                    "Lock busy: Report lock deleted."
+                trc::event!(
+                    OutgoingReport(trc::OutgoingReportEvent::LockDeleted),
+                    Key = ValueKey::from(ValueClass::Queue(lock)).serialize(0)
                 );
+
                 false
             }
             Err(err) => {
-                tracing::error!(
-                    context = "queue",
-                    event = "error",
-                    key = ?lock,
-                    "Lock error: {}",
-                    err
-                );
+                trc::error!(err
+                    .caused_by(trc::location!())
+                    .details("Failed to lock report"));
+
                 false
             }
         }

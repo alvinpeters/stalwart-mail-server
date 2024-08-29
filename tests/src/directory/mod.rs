@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod imap;
 pub mod internal;
@@ -638,13 +621,13 @@ async fn address_mappings() {
         let subaddressing = AddressMapping::parse(&mut config, (test, "subaddressing"));
 
         assert_eq!(
-            subaddressing.to_subaddress(&core, ADDR).await,
+            subaddressing.to_subaddress(&core, ADDR, 0).await,
             config.value_require((test, "expected-sub")).unwrap(),
             "failed subaddress for {test:?}"
         );
 
         assert_eq!(
-            subaddressing.to_subaddress(&core, ADDR_NO_MATCH).await,
+            subaddressing.to_subaddress(&core, ADDR_NO_MATCH, 0).await,
             config
                 .value_require((test, "expected-sub-nomatch"))
                 .unwrap(),
@@ -652,7 +635,7 @@ async fn address_mappings() {
         );
 
         assert_eq!(
-            catch_all.to_catch_all(&core, ADDR).await,
+            catch_all.to_catch_all(&core, ADDR, 0).await,
             config
                 .property_require::<Option<String>>((test, "expected-catch"))
                 .unwrap()

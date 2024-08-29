@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::{sync::Arc, time::Duration};
 
 use ahash::AHashMap;
@@ -34,6 +40,7 @@ pub struct MailAuthConfig {
 pub struct DkimAuthConfig {
     pub verify: IfBlock,
     pub sign: IfBlock,
+    pub strict: bool,
 }
 
 #[derive(Clone)]
@@ -95,13 +102,14 @@ impl Default for MailAuthConfig {
                     )],
                     "false",
                 ),
+                strict: true,
             },
             arc: ArcAuthConfig {
                 verify: IfBlock::new::<VerifyStrategy>("auth.arc.verify", [], "relaxed"),
                 seal: IfBlock::new::<()>(
                     "auth.arc.seal",
                     [],
-                    "['rsa-' + key_get('default', 'domain'), 'ed25519-' + key_get('default', 'domain')]",
+                    "'rsa-' + key_get('default', 'domain')",
                 ),
             },
             spf: SpfAuthConfig {
@@ -134,7 +142,7 @@ impl Default for MailAuthConfig {
             },
             iprev: IpRevAuthConfig {
                 verify: IfBlock::new::<VerifyStrategy>(
-                    "auth.ipref.verify",
+                    "auth.iprev.verify",
                     [("local_port == 25", "relaxed")],
                     #[cfg(not(feature = "test_mode"))]
                     "disable",
@@ -180,6 +188,9 @@ impl MailAuthConfig {
                 *value = if_block;
             }
         }
+        mail_auth.dkim.strict = config
+            .property_or_default("auth.dkim.strict", "true")
+            .unwrap_or(true);
 
         // Parse signatures
         for id in config
@@ -203,6 +214,7 @@ fn build_signature(config: &mut Config, id: &str) -> Option<(DkimSigner, ArcSeal
         Algorithm::RsaSha256 => {
             let pk = config
                 .value_require(("signature", id, "private-key"))?
+                .trim()
                 .to_string();
             let key = RsaKey::<Sha256>::from_rsa_pem(&pk)
                 .or_else(|_| RsaKey::<Sha256>::from_pkcs8_pem(&pk))
@@ -364,11 +376,6 @@ fn parse_signature<T: SigningKey, U: SigningKey<Hasher = Sha256>>(
         sealer = sealer.expiration(c.as_secs());
     }
 
-    if let Some(true) = config.property::<bool>(("signature", id, "set-body-length")) {
-        signer = signer.body_length(true);
-        sealer = sealer.body_length(true);
-    }
-
     if let Some(true) = config.property::<bool>(("signature", id, "report")) {
         signer = signer.reporting(true);
     }
@@ -450,7 +457,7 @@ impl ConstantValue for VerifyStrategy {
 }
 
 impl ParseValue for DkimCanonicalization {
-    fn parse_value(value: &str) -> utils::config::Result<Self> {
+    fn parse_value(value: &str) -> Result<Self, String> {
         if let Some((headers, body)) = value.split_once('/') {
             Ok(DkimCanonicalization {
                 headers: Canonicalization::parse_value(headers.trim())?,

@@ -1,29 +1,12 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use directory::QueryBy;
 use jmap_proto::{
-    error::{method::MethodError, set::SetError},
+    error::set::SetError,
     object::Object,
     types::{
         acl::Acl,
@@ -38,6 +21,7 @@ use store::{
     write::{assert::HashedValue, ValueClass},
     ValueKey,
 };
+use trc::AddContext;
 use utils::map::bitmap::{Bitmap, BitmapItem};
 
 use crate::JMAP;
@@ -45,7 +29,10 @@ use crate::JMAP;
 use super::AccessToken;
 
 impl JMAP {
-    pub async fn update_access_token(&self, mut access_token: AccessToken) -> Option<AccessToken> {
+    pub async fn update_access_token(
+        &self,
+        mut access_token: AccessToken,
+    ) -> trc::Result<AccessToken> {
         for &grant_account_id in [access_token.primary_id]
             .iter()
             .chain(access_token.member_of.clone().iter())
@@ -56,26 +43,17 @@ impl JMAP {
                 .data
                 .acl_query(AclQuery::HasAccess { grant_account_id })
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                    event = "error",
-                    context = "update_access_token",
-                    error = ?err,
-                    "Failed to iterate ACLs.");
-                })
-                .ok()?
+                .caused_by(trc::location!())?
             {
                 if !access_token.is_member(acl_item.to_account_id) {
                     let acl = Bitmap::<Acl>::from(acl_item.permissions);
                     let collection = Collection::from(acl_item.to_collection);
                     if !collection.is_valid() {
-                        tracing::warn!(
-                            event = "error",
-                            context = "update_access_token",
-                            error = ?acl_item,
-                            "Found corrupted collection in key"
-                        );
-                        return None;
+                        return Err(trc::StoreEvent::DataCorruption
+                            .ctx(trc::Key::Reason, "Corrupted collection found in ACL key.")
+                            .details(format!("{acl_item:?}"))
+                            .account_id(grant_account_id)
+                            .caused_by(trc::location!()));
                     }
 
                     let mut collections: Bitmap<Collection> = Bitmap::new();
@@ -104,7 +82,8 @@ impl JMAP {
                 }
             }
         }
-        access_token.into()
+
+        Ok(access_token)
     }
 
     pub async fn shared_documents(
@@ -113,7 +92,7 @@ impl JMAP {
         to_account_id: u32,
         to_collection: Collection,
         check_acls: impl Into<Bitmap<Acl>>,
-    ) -> Result<RoaringBitmap, MethodError> {
+    ) -> trc::Result<RoaringBitmap> {
         let check_acls = check_acls.into();
         let mut document_ids = RoaringBitmap::new();
         let to_collection = u8::from(to_collection);
@@ -131,14 +110,7 @@ impl JMAP {
                     to_collection,
                 })
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                        event = "error",
-                        context = "shared_documents",
-                        error = ?err,
-                        "Failed to iterate ACLs.");
-                    MethodError::ServerPartialFail
-                })?
+                .caused_by(trc::location!())?
             {
                 let mut acls = Bitmap::<Acl>::from(acl_item.permissions);
 
@@ -157,7 +129,7 @@ impl JMAP {
         access_token: &AccessToken,
         to_account_id: u32,
         check_acls: impl Into<Bitmap<Acl>>,
-    ) -> Result<RoaringBitmap, MethodError> {
+    ) -> trc::Result<RoaringBitmap> {
         let check_acls = check_acls.into();
         let shared_mailboxes = self
             .shared_documents(access_token, to_account_id, Collection::Mailbox, check_acls)
@@ -189,7 +161,7 @@ impl JMAP {
         account_id: u32,
         collection: Collection,
         check_acls: impl Into<Bitmap<Acl>>,
-    ) -> Result<RoaringBitmap, MethodError> {
+    ) -> trc::Result<RoaringBitmap> {
         let check_acls = check_acls.into();
         let mut document_ids = self
             .get_document_ids(account_id, collection)
@@ -208,7 +180,7 @@ impl JMAP {
         access_token: &AccessToken,
         account_id: u32,
         check_acls: impl Into<Bitmap<Acl>>,
-    ) -> Result<RoaringBitmap, MethodError> {
+    ) -> trc::Result<RoaringBitmap> {
         let check_acls = check_acls.into();
         let mut document_ids = self
             .get_document_ids(account_id, Collection::Email)
@@ -229,7 +201,7 @@ impl JMAP {
         to_collection: impl Into<u8>,
         to_document_id: u32,
         check_acls: impl Into<Bitmap<Acl>>,
-    ) -> Result<bool, MethodError> {
+    ) -> trc::Result<bool> {
         let to_collection = to_collection.into();
         let check_acls = check_acls.into();
         for &grant_account_id in [access_token.primary_id]
@@ -258,12 +230,7 @@ impl JMAP {
                 }
                 Ok(None) => (),
                 Err(err) => {
-                    tracing::error!(
-                    event = "error",
-                    context = "has_access_to_document",
-                    error = ?err,
-                    "Failed to verify ACL.");
-                    return Err(MethodError::ServerPartialFail);
+                    return Err(err.caused_by(trc::location!()));
                 }
             }
         }

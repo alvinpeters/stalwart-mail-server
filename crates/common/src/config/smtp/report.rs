@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::time::Duration;
 
 use utils::config::{utils::ParseValue, Config};
@@ -208,7 +214,7 @@ impl Default for ReportConfig {
 }
 
 impl ParseValue for AggregateFrequency {
-    fn parse_value(value: &str) -> utils::config::Result<Self> {
+    fn parse_value(value: &str) -> Result<Self, String> {
         match value {
             "daily" | "day" => Ok(AggregateFrequency::Daily),
             "hourly" | "hour" => Ok(AggregateFrequency::Hourly),
@@ -261,7 +267,7 @@ impl ConstantValue for AggregateFrequency {
 }
 
 impl ParseValue for AddressMatch {
-    fn parse_value(value: &str) -> utils::config::Result<Self> {
+    fn parse_value(value: &str) -> Result<Self, String> {
         if let Some(value) = value.strip_prefix('*').map(|v| v.trim()) {
             if !value.is_empty() {
                 return Ok(AddressMatch::EndsWith(value.to_lowercase()));

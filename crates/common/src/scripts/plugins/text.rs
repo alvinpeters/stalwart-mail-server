@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level store of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use nlp::tokenizers::types::{TokenType, TypesTokenizer};
 use sieve::{runtime::Variable, FunctionMap};
@@ -37,18 +20,18 @@ pub fn register_domain_part(plugin_id: u32, fnc_map: &mut FunctionMap) {
     fnc_map.set_external_function("domain_part", plugin_id, 2);
 }
 
-pub fn exec_tokenize(ctx: PluginContext<'_>) -> Variable {
+pub fn exec_tokenize(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let mut v = ctx.arguments;
     let (urls, urls_without_scheme, emails) = match v[1].to_string().as_ref() {
-        "html" => return html_to_tokens(v[0].to_string().as_ref()).into(),
-        "words" => return tokenize_words(&v[0]),
+        "html" => return Ok(html_to_tokens(v[0].to_string().as_ref()).into()),
+        "words" => return Ok(tokenize_words(&v[0])),
         "uri" | "url" => (true, true, true),
         "uri_strict" | "url_strict" => (true, false, false),
         "email" => (false, false, true),
-        _ => return Variable::default(),
+        _ => return Ok(Variable::default()),
     };
 
-    match v.remove(0) {
+    Ok(match v.remove(0) {
         v @ (Variable::String(_) | Variable::Array(_)) => {
             TypesTokenizer::new(v.to_string().as_ref(), &ctx.core.smtp.resolvers.psl)
                 .tokenize_numbers(false)
@@ -67,19 +50,19 @@ pub fn exec_tokenize(ctx: PluginContext<'_>) -> Variable {
                 .into()
         }
         v => v,
-    }
+    })
 }
 
-pub fn exec_domain_part(ctx: PluginContext<'_>) -> Variable {
+pub fn exec_domain_part(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let v = ctx.arguments;
     let part = match v[1].to_string().as_ref() {
         "sld" => DomainPart::Sld,
         "tld" => DomainPart::Tld,
         "host" => DomainPart::Host,
-        _ => return Variable::default(),
+        _ => return Ok(Variable::default()),
     };
 
-    v[0].transform(|domain| {
+    Ok(v[0].transform(|domain| {
         ctx.core
             .smtp
             .resolvers
@@ -87,5 +70,5 @@ pub fn exec_domain_part(ctx: PluginContext<'_>) -> Variable {
             .domain_part(domain, part)
             .map(Variable::from)
             .unwrap_or_default()
-    })
+    }))
 }

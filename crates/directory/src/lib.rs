@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use core::cache::CachedDirectory;
 use std::{fmt::Debug, sync::Arc};
@@ -27,7 +10,6 @@ use std::{fmt::Debug, sync::Arc};
 use ahash::AHashMap;
 use backend::{
     imap::{ImapDirectory, ImapError},
-    internal::PrincipalField,
     ldap::LdapDirectory,
     memory::MemoryDirectory,
     smtp::SmtpDirectory,
@@ -85,28 +67,6 @@ pub enum Type {
     Other = 6,
 }
 
-#[derive(Debug)]
-pub enum DirectoryError {
-    Ldap(LdapError),
-    Store(store::Error),
-    Imap(ImapError),
-    Smtp(mail_send::Error),
-    Pool(String),
-    Management(ManagementError),
-    TimedOut,
-    Unsupported,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ManagementError {
-    MissingField(PrincipalField),
-    AlreadyExists {
-        field: PrincipalField,
-        value: String,
-    },
-    NotFound(String),
-}
-
 pub enum DirectoryInner {
     Internal(Store),
     Ldap(LdapDirectory),
@@ -162,43 +122,23 @@ impl Type {
             Self::List => "list",
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Individual => "Individual",
+            Self::Group => "Group",
+            Self::Resource => "Resource",
+            Self::Location => "Location",
+            Self::Superuser => "Superuser",
+            Self::List => "List",
+            Self::Other => "Other",
+        }
+    }
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct Directories {
     pub directories: AHashMap<String, Arc<Directory>>,
-}
-
-pub type Result<T> = std::result::Result<T, DirectoryError>;
-
-impl From<PoolError<LdapError>> for DirectoryError {
-    fn from(error: PoolError<LdapError>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("ldap"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
-}
-
-impl From<PoolError<ImapError>> for DirectoryError {
-    fn from(error: PoolError<ImapError>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("imap"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
-}
-
-impl From<PoolError<mail_send::Error>> for DirectoryError {
-    fn from(error: PoolError<mail_send::Error>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("smtp"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
 }
 
 impl Principal<u32> {
@@ -222,92 +162,66 @@ impl<T: Ord> Principal<T> {
     }
 }
 
-impl From<LdapError> for DirectoryError {
-    fn from(error: LdapError) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "ldap",
-            reason = %error,
-            "LDAP directory error"
-        );
+trait IntoError {
+    fn into_error(self) -> trc::Error;
+}
 
-        DirectoryError::Ldap(error)
+impl IntoError for PoolError<LdapError> {
+    fn into_error(self) -> trc::Error {
+        match self {
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
+        }
     }
 }
 
-impl From<store::Error> for DirectoryError {
-    fn from(error: store::Error) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "store",
-            reason = %error,
-            "Directory error"
-        );
-
-        DirectoryError::Store(error)
+impl IntoError for PoolError<ImapError> {
+    fn into_error(self) -> trc::Error {
+        match self {
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
+        }
     }
 }
 
-impl From<ImapError> for DirectoryError {
-    fn from(error: ImapError) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "imap",
-            reason = %error,
-            "IMAP directory error"
-        );
-
-        DirectoryError::Imap(error)
+impl IntoError for PoolError<mail_send::Error> {
+    fn into_error(self) -> trc::Error {
+        match self {
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
+        }
     }
 }
 
-impl From<mail_send::Error> for DirectoryError {
-    fn from(error: mail_send::Error) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "smtp",
-            reason = %error,
-            "SMTP directory error"
-        );
-
-        DirectoryError::Smtp(error)
+impl IntoError for ImapError {
+    fn into_error(self) -> trc::Error {
+        trc::ImapEvent::Error.into_err().reason(self)
     }
 }
 
-impl DirectoryError {
-    pub fn unsupported(protocol: &str, method: &str) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = protocol,
-            method = method,
-            "Method not supported by directory"
-        );
-        DirectoryError::Unsupported
-    }
-
-    pub fn timeout(protocol: &str) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = protocol,
-            "Directory timed out"
-        );
-        DirectoryError::TimedOut
+impl IntoError for mail_send::Error {
+    fn into_error(self) -> trc::Error {
+        trc::SmtpEvent::Error.into_err().reason(self)
     }
 }
 
-impl PartialEq for DirectoryError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Store(l0), Self::Store(r0)) => l0 == r0,
-            (Self::Pool(l0), Self::Pool(r0)) => l0 == r0,
-            (Self::Management(l0), Self::Management(r0)) => l0 == r0,
-            _ => false,
+impl IntoError for LdapError {
+    fn into_error(self) -> trc::Error {
+        if let LdapError::LdapResult { result } = &self {
+            trc::StoreEvent::LdapError
+                .ctx(trc::Key::Code, result.rc)
+                .reason(self)
+        } else {
+            trc::StoreEvent::LdapError.reason(self)
         }
     }
 }

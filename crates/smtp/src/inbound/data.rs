@@ -1,35 +1,20 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     borrow::Cow,
     process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use common::{
-    config::smtp::auth::VerifyStrategy, listener::SessionStream, scripts::ScriptModification,
+    config::smtp::{auth::VerifyStrategy, session::Stage},
+    listener::SessionStream,
+    scripts::ScriptModification,
 };
 use mail_auth::{
     common::{headers::HeaderWriter, verify::VerifySignature},
@@ -42,11 +27,13 @@ use smtp_proto::{
 };
 use store::write::now;
 use tokio::{io::AsyncWriteExt, process::Command};
+use trc::SmtpEvent;
 use utils::config::Rate;
 
 use crate::{
     core::{Session, SessionAddress, State},
-    queue::{self, Message, QueueEnvelope, Schedule},
+    inbound::milter::Modification,
+    queue::{self, Message, MessageSource, QueueEnvelope, Schedule},
     scripts::ScriptResult,
 };
 
@@ -56,13 +43,16 @@ impl<T: SessionStream> Session<T> {
     pub async fn queue_message(&mut self) -> Cow<'static, [u8]> {
         // Authenticate message
         let raw_message = Arc::new(std::mem::take(&mut self.data.message));
-        let auth_message = if let Some(auth_message) = AuthenticatedMessage::parse(&raw_message) {
+        let auth_message = if let Some(auth_message) = AuthenticatedMessage::parse_with_opts(
+            &raw_message,
+            self.core.core.smtp.mail_auth.dkim.strict,
+        ) {
             auth_message
         } else {
-            tracing::info!(parent: &self.span,
-                    context = "data",
-                    event = "parse-failed",
-                    size = raw_message.len());
+            trc::event!(
+                Smtp(SmtpEvent::MessageParseFailed),
+                SpanId = self.data.session_id,
+            );
 
             return (&b"550 5.7.7 Failed to parse message.\r\n"[..]).into();
         };
@@ -75,16 +65,16 @@ impl<T: SessionStream> Session<T> {
             > self
                 .core
                 .core
-                .eval_if(&dc.max_received_headers, self)
+                .eval_if(&dc.max_received_headers, self, self.data.session_id)
                 .await
                 .unwrap_or(50)
         {
-            tracing::info!(parent: &self.span,
-                context = "data",
-                event = "loop-detected",
-                return_path = self.data.mail_from.as_ref().unwrap().address,
-                from = auth_message.from(),
-                received_headers = auth_message.received_headers_count());
+            trc::event!(
+                Smtp(SmtpEvent::LoopDetected),
+                SpanId = self.data.session_id,
+                Total = auth_message.received_headers_count(),
+            );
+
             return (&b"450 4.4.6 Too many Received headers. Possible loop detected.\r\n"[..])
                 .into();
         }
@@ -93,16 +83,17 @@ impl<T: SessionStream> Session<T> {
         let dkim = self
             .core
             .core
-            .eval_if(&ac.dkim.verify, self)
+            .eval_if(&ac.dkim.verify, self, self.data.session_id)
             .await
             .unwrap_or(VerifyStrategy::Relaxed);
         let dmarc = self
             .core
             .core
-            .eval_if(&ac.dmarc.verify, self)
+            .eval_if(&ac.dmarc.verify, self, self.data.session_id)
             .await
             .unwrap_or(VerifyStrategy::Relaxed);
         let dkim_output = if dkim.verify() || dmarc.verify() {
+            let time = Instant::now();
             let dkim_output = self
                 .core
                 .core
@@ -111,13 +102,19 @@ impl<T: SessionStream> Session<T> {
                 .dns
                 .verify_dkim(&auth_message)
                 .await;
-            let rejected = dkim.is_strict()
-                && !dkim_output
-                    .iter()
-                    .any(|d| matches!(d.result(), DkimResult::Pass));
+            let pass = dkim_output
+                .iter()
+                .any(|d| matches!(d.result(), DkimResult::Pass));
+            let strict = dkim.is_strict();
+            let rejected = strict && !pass;
 
             // Send reports for failed signatures
-            if let Some(rate) = self.core.core.eval_if::<Rate, _>(&rc.dkim.send, self).await {
+            if let Some(rate) = self
+                .core
+                .core
+                .eval_if::<Rate, _>(&rc.dkim.send, self, self.data.session_id)
+                .await
+            {
                 for output in &dkim_output {
                     if let Some(rcpt) = output.failure_report_addr() {
                         self.send_dkim_report(rcpt, &auth_message, &rate, rejected, output)
@@ -126,15 +123,19 @@ impl<T: SessionStream> Session<T> {
                 }
             }
 
-            if rejected {
-                tracing::info!(parent: &self.span,
-                    context = "dkim",
-                    event = "failed",
-                    return_path = self.data.mail_from.as_ref().unwrap().address,
-                    from = auth_message.from(),
-                    result = ?dkim_output.iter().map(|d| d.result().to_string()).collect::<Vec<_>>(),
-                    "No passing DKIM signatures found.");
+            trc::event!(
+                Smtp(if pass {
+                    SmtpEvent::DkimPass
+                } else {
+                    SmtpEvent::DkimFail
+                }),
+                SpanId = self.data.session_id,
+                Strict = strict,
+                Result = dkim_output.iter().map(trc::Event::from).collect::<Vec<_>>(),
+                Elapsed = time.elapsed(),
+            );
 
+            if rejected {
                 // 'Strict' mode violates the advice of Section 6.1 of RFC6376
                 return if dkim_output
                     .iter()
@@ -144,14 +145,8 @@ impl<T: SessionStream> Session<T> {
                 } else {
                     (&b"550 5.7.20 No passing DKIM signatures found.\r\n"[..]).into()
                 };
-            } else {
-                tracing::debug!(parent: &self.span,
-                    context = "dkim",
-                    event = "verify",
-                    return_path = self.data.mail_from.as_ref().unwrap().address,
-                    from = auth_message.from(),
-                    result = ?dkim_output.iter().map(|d| d.result().to_string()).collect::<Vec<_>>());
             }
+
             dkim_output
         } else {
             vec![]
@@ -161,16 +156,17 @@ impl<T: SessionStream> Session<T> {
         let arc = self
             .core
             .core
-            .eval_if(&ac.arc.verify, self)
+            .eval_if(&ac.arc.verify, self, self.data.session_id)
             .await
             .unwrap_or(VerifyStrategy::Relaxed);
         let arc_sealer = self
             .core
             .core
-            .eval_if::<String, _>(&ac.arc.seal, self)
+            .eval_if::<String, _>(&ac.arc.seal, self, self.data.session_id)
             .await
-            .and_then(|name| self.core.core.get_arc_sealer(&name));
+            .and_then(|name| self.core.core.get_arc_sealer(&name, self.data.session_id));
         let arc_output = if arc.verify() || arc_sealer.is_some() {
+            let time = Instant::now();
             let arc_output = self
                 .core
                 .core
@@ -180,30 +176,29 @@ impl<T: SessionStream> Session<T> {
                 .verify_arc(&auth_message)
                 .await;
 
-            if arc.is_strict()
-                && !matches!(arc_output.result(), DkimResult::Pass | DkimResult::None)
-            {
-                tracing::info!(parent: &self.span,
-                    context = "arc",
-                    event = "auth-failed",
-                    return_path = self.data.mail_from.as_ref().unwrap().address,
-                    from = auth_message.from(),
-                    result = %arc_output.result(),
-                    "ARC validation failed.");
+            let strict = arc.is_strict();
+            let pass = matches!(arc_output.result(), DkimResult::Pass | DkimResult::None);
 
+            trc::event!(
+                Smtp(if pass {
+                    SmtpEvent::ArcPass
+                } else {
+                    SmtpEvent::ArcFail
+                }),
+                SpanId = self.data.session_id,
+                Strict = strict,
+                Result = trc::Event::from(arc_output.result()),
+                Elapsed = time.elapsed(),
+            );
+
+            if strict && !pass {
                 return if matches!(arc_output.result(), DkimResult::TempError(_)) {
                     (&b"451 4.7.29 ARC validation failed.\r\n"[..]).into()
                 } else {
                     (&b"550 5.7.29 ARC validation failed.\r\n"[..]).into()
                 };
-            } else {
-                tracing::debug!(parent: &self.span,
-                    context = "arc",
-                    event = "verify",
-                    return_path = self.data.mail_from.as_ref().unwrap().address,
-                    from = auth_message.from(),
-                    result = %arc_output.result());
             }
+
             arc_output.into()
         } else {
             None
@@ -235,8 +230,10 @@ impl<T: SessionStream> Session<T> {
         }
 
         // Verify DMARC
+        let is_report = self.is_report();
         let (dmarc_result, dmarc_policy) = match &self.data.spf_mail_from {
             Some(spf_output) if dmarc.verify() => {
+                let time = Instant::now();
                 let dmarc_output = self
                     .core
                     .core
@@ -255,19 +252,17 @@ impl<T: SessionStream> Session<T> {
                     )
                     .await;
 
-                let rejected = dmarc.is_strict()
-                    && dmarc_output.policy() == dmarc::Policy::Reject
-                    && !(matches!(dmarc_output.spf_result(), DmarcResult::Pass)
-                        || matches!(dmarc_output.dkim_result(), DmarcResult::Pass));
+                let pass = matches!(dmarc_output.spf_result(), DmarcResult::Pass)
+                    || matches!(dmarc_output.dkim_result(), DmarcResult::Pass);
+                let strict = dmarc.is_strict();
+                let rejected = strict && dmarc_output.policy() == dmarc::Policy::Reject && !pass;
                 let is_temp_fail = rejected
                     && matches!(dmarc_output.spf_result(), DmarcResult::TempError(_))
                     || matches!(dmarc_output.dkim_result(), DmarcResult::TempError(_));
 
                 // Add to DMARC output to the Authentication-Results header
                 auth_results = auth_results.with_dmarc_result(&dmarc_output);
-                let dmarc_result = if dmarc_output.spf_result() == &DmarcResult::Pass
-                    || dmarc_output.dkim_result() == &DmarcResult::Pass
-                {
+                let dmarc_result = if pass {
                     DmarcResult::Pass
                 } else if dmarc_output.spf_result() != &DmarcResult::None {
                     dmarc_output.spf_result().clone()
@@ -278,26 +273,22 @@ impl<T: SessionStream> Session<T> {
                 };
                 let dmarc_policy = dmarc_output.policy();
 
-                if !rejected {
-                    tracing::debug!(parent: &self.span,
-                    context = "dmarc",
-                    event = "verify",
-                    return_path = mail_from.address,
-                    from = auth_message.from(),
-                    dkim_result = %dmarc_output.dkim_result(),
-                    spf_result = %dmarc_output.spf_result());
-                } else {
-                    tracing::info!(parent: &self.span,
-                    context = "dmarc",
-                    event = "auth-failed",
-                    return_path = mail_from.address,
-                    from = auth_message.from(),
-                    dkim_result = %dmarc_output.dkim_result(),
-                    spf_result = %dmarc_output.spf_result());
-                }
+                trc::event!(
+                    Smtp(if pass {
+                        SmtpEvent::DmarcPass
+                    } else {
+                        SmtpEvent::DmarcFail
+                    }),
+                    SpanId = self.data.session_id,
+                    Strict = strict,
+                    Domain = dmarc_output.domain().to_string(),
+                    Policy = dmarc_policy.to_string(),
+                    Result = trc::Event::from(&dmarc_result),
+                    Elapsed = time.elapsed(),
+                );
 
                 // Send DMARC report
-                if dmarc_output.requested_reports() {
+                if dmarc_output.requested_reports() && !is_report {
                     self.send_dmarc_report(
                         &auth_message,
                         &auth_results,
@@ -323,40 +314,110 @@ impl<T: SessionStream> Session<T> {
         };
 
         // Analyze reports
-        if self.is_report() {
-            self.core.analyze_report(raw_message.clone());
+        if is_report {
+            self.core
+                .analyze_report(raw_message.clone(), self.data.session_id);
             if !rc.analysis.forward {
                 self.data.messages_sent += 1;
                 return (b"250 2.0.0 Message queued for delivery.\r\n"[..]).into();
             }
         }
 
-        // Run Milter filters
-        let mut edited_message = match self.run_milters(&auth_message).await {
-            Ok(modifications) => {
-                if !modifications.is_empty() {
-                    tracing::debug!(
-                    parent: &self.span,
-                    context = "milter",
-                    event = "accept",
-                    modifications = modifications.iter().fold(String::new(), |mut s, m| {
-                        use std::fmt::Write;
-                        if !s.is_empty() {
-                            s.push_str(", ");
-                        }
-                        let _ = write!(s, "{m}");
-                        s
-                    }),
-                    "Milter filter(s) accepted message.");
+        // Add Received header
+        let message_id = self.core.inner.queue_id_gen.generate().unwrap_or_else(now);
+        let mut headers = Vec::with_capacity(64);
+        if self
+            .core
+            .core
+            .eval_if(&dc.add_received, self, self.data.session_id)
+            .await
+            .unwrap_or(true)
+        {
+            self.write_received(&mut headers, message_id)
+        }
 
-                    self.data
-                        .apply_milter_modifications(modifications, &auth_message)
-                        .map(Arc::new)
-                } else {
-                    None
+        // Add authentication results header
+        if self
+            .core
+            .core
+            .eval_if(&dc.add_auth_results, self, self.data.session_id)
+            .await
+            .unwrap_or(true)
+        {
+            auth_results.write_header(&mut headers);
+        }
+
+        // Add Received-SPF header
+        if let Some(spf_output) = &self.data.spf_mail_from {
+            if self
+                .core
+                .core
+                .eval_if(&dc.add_received_spf, self, self.data.session_id)
+                .await
+                .unwrap_or(true)
+            {
+                ReceivedSpf::new(
+                    spf_output,
+                    self.data.remote_ip,
+                    &self.data.helo_domain,
+                    &mail_from.address_lcase,
+                    &self.hostname,
+                )
+                .write_header(&mut headers);
+            }
+        }
+
+        // ARC Seal
+        if let (Some(arc_sealer), Some(arc_output)) = (arc_sealer, &arc_output) {
+            if !dkim_output.is_empty() && arc_output.can_be_sealed() {
+                match arc_sealer.seal(&auth_message, &auth_results, arc_output) {
+                    Ok(set) => {
+                        set.write_header(&mut headers);
+                    }
+                    Err(err) => {
+                        trc::error!(trc::Event::from(err)
+                            .span_id(self.data.session_id)
+                            .details("Failed to ARC seal message"));
+                    }
                 }
             }
-            Err(response) => return response,
+        }
+
+        // Run Milter filters
+        let mut modifications = Vec::new();
+        match self.run_milters(Stage::Data, (&auth_message).into()).await {
+            Ok(modifications_) => {
+                if !modifications_.is_empty() {
+                    modifications = modifications_;
+                }
+            }
+            Err(response) => {
+                return response.into_bytes();
+            }
+        };
+
+        // Run MTA Hooks
+        match self
+            .run_mta_hooks(Stage::Data, (&auth_message).into(), message_id.into())
+            .await
+        {
+            Ok(modifications_) => {
+                if !modifications_.is_empty() {
+                    modifications.retain(|m| !matches!(m, Modification::ReplaceBody { .. }));
+                    modifications.extend(modifications_);
+                }
+            }
+            Err(response) => {
+                return response.into_bytes();
+            }
+        };
+
+        // Apply modifications
+        let mut edited_message = if !modifications.is_empty() {
+            self.data
+                .apply_milter_modifications(modifications, &auth_message)
+        } else {
+            None
         };
 
         // Pipe message
@@ -364,14 +425,14 @@ impl<T: SessionStream> Session<T> {
             if let Some(command_) = self
                 .core
                 .core
-                .eval_if::<String, _>(&pipe.command, self)
+                .eval_if::<String, _>(&pipe.command, self, self.data.session_id)
                 .await
             {
                 let piped_message = edited_message.as_ref().unwrap_or(&raw_message).clone();
                 let timeout = self
                     .core
                     .core
-                    .eval_if(&pipe.timeout, self)
+                    .eval_if(&pipe.timeout, self, self.data.session_id)
                     .await
                     .unwrap_or_else(|| Duration::from_secs(30));
 
@@ -379,12 +440,13 @@ impl<T: SessionStream> Session<T> {
                 for argument in self
                     .core
                     .core
-                    .eval_if::<Vec<String>, _>(&pipe.arguments, self)
+                    .eval_if::<Vec<String>, _>(&pipe.arguments, self, self.data.session_id)
                     .await
                     .unwrap_or_default()
                 {
                     command.arg(argument);
                 }
+                let time = Instant::now();
                 match command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -406,74 +468,89 @@ impl<T: SessionStream> Session<T> {
                                                 && !output.stdout.is_empty()
                                                 && output.stdout[..] != piped_message[..]
                                             {
-                                                edited_message = Arc::new(output.stdout).into();
+                                                edited_message = output.stdout.into();
                                             }
 
-                                            tracing::debug!(parent: &self.span,
-                                                context = "pipe",
-                                                event = "success",
-                                                command = command_,
-                                                status = output.status.to_string());
+                                            trc::event!(
+                                                Smtp(SmtpEvent::PipeSuccess),
+                                                SpanId = self.data.session_id,
+                                                Path = command_,
+                                                Result = output.status.to_string(),
+                                                Elapsed = time.elapsed(),
+                                            );
                                         }
                                         Ok(Err(err)) => {
-                                            tracing::warn!(parent: &self.span,
-                                                context = "pipe",
-                                                event = "exec-error",
-                                                command = command_,
-                                                reason = %err);
+                                            trc::event!(
+                                                Smtp(SmtpEvent::PipeError),
+                                                SpanId = self.data.session_id,
+                                                Reason = err.to_string(),
+                                                Elapsed = time.elapsed(),
+                                            );
                                         }
                                         Err(_) => {
-                                            tracing::warn!(parent: &self.span,
-                                                context = "pipe",
-                                                event = "timeout",
-                                                command = command_);
+                                            trc::event!(
+                                                Smtp(SmtpEvent::PipeError),
+                                                SpanId = self.data.session_id,
+                                                Reason = "Timeout",
+                                                Elapsed = time.elapsed(),
+                                            );
                                         }
                                     }
                                 }
                                 Ok(Err(err)) => {
-                                    tracing::warn!(parent: &self.span,
-                                        context = "pipe",
-                                        event = "write-error",
-                                        command = command_,
-                                        reason = %err);
+                                    trc::event!(
+                                        Smtp(SmtpEvent::PipeError),
+                                        SpanId = self.data.session_id,
+                                        Reason = err.to_string(),
+                                        Elapsed = time.elapsed(),
+                                    );
                                 }
                                 Err(_) => {
-                                    tracing::warn!(parent: &self.span,
-                                        context = "pipe",
-                                        event = "stdin-timeout",
-                                        command = command_);
+                                    trc::event!(
+                                        Smtp(SmtpEvent::PipeError),
+                                        SpanId = self.data.session_id,
+                                        Reason = "Stdin timeout",
+                                        Elapsed = time.elapsed(),
+                                    );
                                 }
                             }
                         } else {
-                            tracing::warn!(parent: &self.span,
-                                context = "pipe",
-                                event = "stdin-failed",
-                                command = command_);
+                            trc::event!(
+                                Smtp(SmtpEvent::PipeError),
+                                SpanId = self.data.session_id,
+                                Reason = "Stdin not available",
+                                Elapsed = time.elapsed(),
+                            );
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(parent: &self.span,
-                                context = "pipe",
-                                event = "spawn-error",
-                                command = command_,
-                                reason = %err);
+                        trc::event!(
+                            Smtp(SmtpEvent::PipeError),
+                            SpanId = self.data.session_id,
+                            Reason = err.to_string(),
+                        );
                     }
                 }
             }
         }
 
         // Sieve filtering
-        let mut headers = Vec::with_capacity(64);
-        if let Some(script) = self
+        if let Some((script, script_id)) = self
             .core
             .core
-            .eval_if::<String, _>(&dc.script, self)
+            .eval_if::<String, _>(&dc.script, self, self.data.session_id)
             .await
-            .and_then(|name| self.core.core.get_sieve_script(&name))
+            .and_then(|name| {
+                self.core
+                    .core
+                    .get_sieve_script(&name, self.data.session_id)
+                    .map(|s| (s, name))
+            })
         {
             let params = self
                 .build_script_parameters("data")
-                .with_message(edited_message.as_ref().unwrap_or(&raw_message).clone())
+                .with_message(edited_message.as_ref().unwrap_or(&raw_message))
+                .with_auth_headers(&headers)
                 .set_variable(
                     "arc.result",
                     arc_output
@@ -519,21 +596,16 @@ impl<T: SessionStream> Session<T> {
                         .unwrap_or_default(),
                 );
 
-            let modifications = match self.run_script(script.clone(), params).await {
+            let modifications = match self.run_script(script_id, script.clone(), params).await {
                 ScriptResult::Accept { modifications } => modifications,
                 ScriptResult::Replace {
                     message,
                     modifications,
                 } => {
-                    edited_message = Arc::new(message).into();
+                    edited_message = message.into();
                     modifications
                 }
                 ScriptResult::Reject(message) => {
-                    tracing::info!(parent: &self.span,
-                        context = "sieve",
-                        event = "reject",
-                        reason = message);
-
                     return message.into_bytes().into();
                 }
                 ScriptResult::Discard => {
@@ -562,67 +634,21 @@ impl<T: SessionStream> Session<T> {
         // Build message
         let mail_from = self.data.mail_from.clone().unwrap();
         let rcpt_to = std::mem::take(&mut self.data.rcpt_to);
-        let mut message = self.build_message(mail_from, rcpt_to).await;
+        let mut message = self
+            .build_message(mail_from, rcpt_to, message_id, self.data.session_id)
+            .await;
 
-        // Add Received header
+        // Add Return-Path
         if self
             .core
             .core
-            .eval_if(&dc.add_received, self)
+            .eval_if(&dc.add_return_path, self, self.data.session_id)
             .await
             .unwrap_or(true)
         {
-            self.write_received(&mut headers, message.id)
-        }
-
-        // Add authentication results header
-        if self
-            .core
-            .core
-            .eval_if(&dc.add_auth_results, self)
-            .await
-            .unwrap_or(true)
-        {
-            auth_results.write_header(&mut headers);
-        }
-
-        // Add Received-SPF header
-        if let Some(spf_output) = &self.data.spf_mail_from {
-            if self
-                .core
-                .core
-                .eval_if(&dc.add_received_spf, self)
-                .await
-                .unwrap_or(true)
-            {
-                ReceivedSpf::new(
-                    spf_output,
-                    self.data.remote_ip,
-                    &self.data.helo_domain,
-                    &message.return_path,
-                    &self.hostname,
-                )
-                .write_header(&mut headers);
-            }
-        }
-
-        // ARC Seal
-        if let (Some(arc_sealer), Some(arc_output)) = (arc_sealer, &arc_output) {
-            if !dkim_output.is_empty() && arc_output.can_be_sealed() {
-                match arc_sealer.seal(&auth_message, &auth_results, arc_output) {
-                    Ok(set) => {
-                        set.write_header(&mut headers);
-                    }
-                    Err(err) => {
-                        tracing::info!(parent: &self.span,
-                            context = "arc",
-                            event = "seal-failed",
-                            return_path = message.return_path,
-                            from = auth_message.from(),
-                            "Failed to seal message: {}", err);
-                    }
-                }
-            }
+            headers.extend_from_slice(b"Return-Path: <");
+            headers.extend_from_slice(message.return_path.as_bytes());
+            headers.extend_from_slice(b">\r\n");
         }
 
         // Add any missing headers
@@ -630,7 +656,7 @@ impl<T: SessionStream> Session<T> {
             && self
                 .core
                 .core
-                .eval_if(&dc.add_date, self)
+                .eval_if(&dc.add_date, self, self.data.session_id)
                 .await
                 .unwrap_or(true)
         {
@@ -642,7 +668,7 @@ impl<T: SessionStream> Session<T> {
             && self
                 .core
                 .core
-                .eval_if(&dc.add_message_id, self)
+                .eval_if(&dc.add_message_id, self, self.data.session_id)
                 .await
                 .unwrap_or(true)
         {
@@ -651,39 +677,30 @@ impl<T: SessionStream> Session<T> {
             headers.extend_from_slice(b"\r\n");
         }
 
-        // Add Return-Path
-        if self
-            .core
-            .core
-            .eval_if(&dc.add_return_path, self)
-            .await
-            .unwrap_or(true)
-        {
-            headers.extend_from_slice(b"Return-Path: <");
-            headers.extend_from_slice(message.return_path.as_bytes());
-            headers.extend_from_slice(b">\r\n");
-        }
-
         // DKIM sign
-        let raw_message = edited_message.unwrap_or(raw_message);
+        let raw_message = edited_message
+            .as_deref()
+            .unwrap_or_else(|| raw_message.as_slice());
         for signer in self
             .core
             .core
-            .eval_if::<Vec<String>, _>(&ac.dkim.sign, self)
+            .eval_if::<Vec<String>, _>(&ac.dkim.sign, self, self.data.session_id)
             .await
             .unwrap_or_default()
         {
-            if let Some(signer) = self.core.core.get_dkim_signer(&signer) {
-                match signer.sign_chained(&[headers.as_ref(), &raw_message]) {
+            if let Some(signer) = self
+                .core
+                .core
+                .get_dkim_signer(&signer, self.data.session_id)
+            {
+                match signer.sign_chained(&[headers.as_ref(), raw_message]) {
                     Ok(signature) => {
                         signature.write_header(&mut headers);
                     }
                     Err(err) => {
-                        tracing::info!(parent: &self.span,
-                        context = "dkim",
-                        event = "sign-failed",
-                        return_path = message.return_path,
-                        "Failed to sign message: {}", err);
+                        trc::error!(trc::Event::from(err)
+                            .span_id(self.data.session_id)
+                            .details("Failed to DKIM sign message"));
                     }
                 }
             }
@@ -694,9 +711,23 @@ impl<T: SessionStream> Session<T> {
 
         // Verify queue quota
         if self.core.has_quota(&mut message).await {
-            let queue_id = message.id;
+            // Prepare webhook event
+            let queue_id = message.queue_id;
+
+            // Queue message
+            let source = if self.data.authenticated_as.is_empty() {
+                MessageSource::Unauthenticated
+            } else {
+                MessageSource::Authenticated
+            };
             if message
-                .queue(Some(&headers), &raw_message, &self.core, &self.span)
+                .queue(
+                    Some(&headers),
+                    raw_message,
+                    self.data.session_id,
+                    &self.core,
+                    source,
+                )
                 .await
             {
                 self.state = State::Accepted(queue_id);
@@ -706,13 +737,6 @@ impl<T: SessionStream> Session<T> {
                 (b"451 4.3.5 Unable to accept message at this time.\r\n"[..]).into()
             }
         } else {
-            tracing::warn!(
-                parent: &self.span,
-                context = "queue",
-                event = "quota-exceeded",
-                from = message.return_path,
-                "Queue quota exceeded, rejecting message."
-            );
             (b"452 4.3.1 Mail system full, try again later.\r\n"[..]).into()
         }
     }
@@ -721,13 +745,16 @@ impl<T: SessionStream> Session<T> {
         &self,
         mail_from: SessionAddress,
         mut rcpt_to: Vec<SessionAddress>,
+        queue_id: u64,
+        span_id: u64,
     ) -> Message {
         // Build message
         let created = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let mut message = Message {
-            id: self.core.inner.snowflake_id.generate().unwrap_or(created),
+            queue_id,
+            span_id,
             created,
             return_path: mail_from.address,
             return_path_lcase: mail_from.address_lcase,
@@ -774,7 +801,7 @@ impl<T: SessionStream> Session<T> {
                 let (num_intervals, next_notify) = self
                     .core
                     .core
-                    .eval_if::<Vec<Duration>, _>(&config.notify, &envelope)
+                    .eval_if::<Vec<Duration>, _>(&config.notify, &envelope, self.data.session_id)
                     .await
                     .and_then(|v| (v.len(), v.into_iter().next()?).into())
                     .unwrap_or_else(|| (1, Duration::from_secs(86400)));
@@ -786,7 +813,7 @@ impl<T: SessionStream> Session<T> {
                             + self
                                 .core
                                 .core
-                                .eval_if(&config.expire, &envelope)
+                                .eval_if(&config.expire, &envelope, self.data.session_id)
                                 .await
                                 .unwrap_or_else(|| Duration::from_secs(5 * 86400))
                                 .as_secs(),
@@ -800,7 +827,7 @@ impl<T: SessionStream> Session<T> {
                     let expire = self
                         .core
                         .core
-                        .eval_if(&config.expire, &envelope)
+                        .eval_if(&config.expire, &envelope, self.data.session_id)
                         .await
                         .unwrap_or_else(|| Duration::from_secs(5 * 86400));
                     let expire_secs = expire.as_secs();
@@ -860,23 +887,32 @@ impl<T: SessionStream> Session<T> {
                 < self
                     .core
                     .core
-                    .eval_if(&self.core.core.smtp.session.data.max_messages, self)
+                    .eval_if(
+                        &self.core.core.smtp.session.data.max_messages,
+                        self,
+                        self.data.session_id,
+                    )
                     .await
                     .unwrap_or(10)
             {
                 Ok(true)
             } else {
-                tracing::debug!(
-                    parent: &self.span,
-                    context = "data",
-                    event = "too-many-messages",
-                    "Maximum number of messages per session exceeded."
+                trc::event!(
+                    Smtp(SmtpEvent::TooManyMessages),
+                    SpanId = self.data.session_id,
+                    Limit = self.data.messages_sent
                 );
+
                 self.write(b"451 4.4.5 Maximum number of messages per session exceeded.\r\n")
                     .await?;
                 Ok(false)
             }
         } else {
+            trc::event!(
+                Smtp(SmtpEvent::RcptToMissing),
+                SpanId = self.data.session_id,
+            );
+
             self.write(b"503 5.5.1 RCPT is required first.\r\n").await?;
             Ok(false)
         }

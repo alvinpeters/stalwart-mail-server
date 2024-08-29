@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use ahash::AHashMap;
 use mail_auth::IpLookupStrategy;
 use mail_send::Credentials;
@@ -92,6 +98,7 @@ pub struct QueueQuotas {
 
 #[derive(Clone)]
 pub struct QueueQuota {
+    pub id: String,
     pub expr: Expression,
     pub keys: u16,
     pub size: Option<usize>,
@@ -429,7 +436,7 @@ fn parse_queue_quota(config: &mut Config) -> QueueQuotas {
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
     {
-        if let Some(quota) = parse_queue_quota_item(config, ("queue.quota", &quota_id)) {
+        if let Some(quota) = parse_queue_quota_item(config, ("queue.quota", &quota_id), &quota_id) {
             if (quota.keys & THROTTLE_RCPT) != 0
                 || quota
                     .expr
@@ -455,7 +462,7 @@ fn parse_queue_quota(config: &mut Config) -> QueueQuotas {
     capacities
 }
 
-fn parse_queue_quota_item(config: &mut Config, prefix: impl AsKey) -> Option<QueueQuota> {
+fn parse_queue_quota_item(config: &mut Config, prefix: impl AsKey, id: &str) -> Option<QueueQuota> {
     let prefix = prefix.as_key();
 
     // Skip disabled throttles
@@ -494,6 +501,7 @@ fn parse_queue_quota_item(config: &mut Config, prefix: impl AsKey) -> Option<Que
     }
 
     let quota = QueueQuota {
+        id: id.to_string(),
         expr: Expression::try_parse(
             config,
             (prefix.as_str(), "match"),
@@ -528,7 +536,7 @@ fn parse_queue_quota_item(config: &mut Config, prefix: impl AsKey) -> Option<Que
 }
 
 impl ParseValue for RequireOptional {
-    fn parse_value(value: &str) -> utils::config::Result<Self> {
+    fn parse_value(value: &str) -> Result<Self, String> {
         match value {
             "optional" => Ok(RequireOptional::Optional),
             "require" | "required" => Ok(RequireOptional::Require),

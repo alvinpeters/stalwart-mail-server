@@ -1,29 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use directory::QueryBy;
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
@@ -32,6 +14,7 @@ use store::{
     roaring::RoaringBitmap,
     write::{BatchBuilder, F_VALUE},
 };
+use trc::AddContext;
 
 use crate::JMAP;
 
@@ -41,7 +24,7 @@ impl JMAP {
     pub async fn identity_get(
         &self,
         mut request: GetRequest<RequestArguments>,
-    ) -> Result<GetResponse, MethodError> {
+    ) -> trc::Result<GetResponse> {
         let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
@@ -124,10 +107,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn identity_get_or_create(
-        &self,
-        account_id: u32,
-    ) -> Result<RoaringBitmap, MethodError> {
+    pub async fn identity_get_or_create(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
         let mut identity_ids = self
             .get_document_ids(account_id, Collection::Identity)
             .await?
@@ -143,14 +123,7 @@ impl JMAP {
             .directory
             .query(QueryBy::Id(account_id), false)
             .await
-            .map_err(|err| {
-                tracing::error!(
-                    event = "error",
-                    context = "identity_get_or_create",
-                    error = ?err,
-                    "Failed to query directory.");
-                MethodError::ServerPartialFail
-            })?
+            .caused_by(trc::location!())?
             .unwrap_or_default();
         if principal.emails.is_empty() {
             return Ok(identity_ids);
@@ -195,14 +168,7 @@ impl JMAP {
             .data
             .write(batch.build())
             .await
-            .map_err(|err| {
-                tracing::error!(
-                event = "error",
-                context = "identity_get_or_create",
-                error = ?err,
-                "Failed to create identities.");
-                MethodError::ServerPartialFail
-            })?;
+            .caused_by(trc::location!())?;
 
         Ok(identity_ids)
     }

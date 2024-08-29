@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     collections::BTreeSet,
@@ -917,11 +900,12 @@ impl Core {
                                                 );
                                                 (hash, len as u8)
                                             }
-                                            invalid => {
-                                                return Err(format!(
-                                                    "Invalid text bitmap key length {invalid}"
-                                                )
-                                                .into())
+                                            _ => {
+                                                return Err(trc::Error::corrupted_key(
+                                                    key,
+                                                    None,
+                                                    trc::location!(),
+                                                ));
                                             }
                                         };
 
@@ -1125,34 +1109,34 @@ fn spawn_writer(path: PathBuf) -> (std::thread::JoinHandle<()>, SyncSender<Op>) 
 }
 
 pub(super) trait DeserializeBytes {
-    fn range(&self, range: Range<usize>) -> store::Result<&[u8]>;
-    fn deserialize_u8(&self, offset: usize) -> store::Result<u8>;
-    fn deserialize_leb128<U: Leb128_>(&self) -> store::Result<U>;
+    fn range(&self, range: Range<usize>) -> trc::Result<&[u8]>;
+    fn deserialize_u8(&self, offset: usize) -> trc::Result<u8>;
+    fn deserialize_leb128<U: Leb128_>(&self) -> trc::Result<U>;
 }
 
 impl DeserializeBytes for &[u8] {
-    fn range(&self, range: Range<usize>) -> store::Result<&[u8]> {
+    fn range(&self, range: Range<usize>) -> trc::Result<&[u8]> {
         self.get(range.start..std::cmp::min(range.end, self.len()))
-            .ok_or_else(|| store::Error::InternalError("Failed to read range".to_string()))
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))
     }
 
-    fn deserialize_u8(&self, offset: usize) -> store::Result<u8> {
+    fn deserialize_u8(&self, offset: usize) -> trc::Result<u8> {
         self.get(offset)
             .copied()
-            .ok_or_else(|| store::Error::InternalError("Failed to read u8".to_string()))
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))
     }
 
-    fn deserialize_leb128<U: Leb128_>(&self) -> store::Result<U> {
+    fn deserialize_leb128<U: Leb128_>(&self) -> trc::Result<U> {
         self.read_leb128::<U>()
             .map(|(v, _)| v)
-            .ok_or_else(|| store::Error::InternalError("Failed to read leb128".to_string()))
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))
     }
 }
 
 struct RawBytes(Vec<u8>);
 
 impl Deserialize for RawBytes {
-    fn deserialize(bytes: &[u8]) -> store::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(Self(bytes.to_vec()))
     }
 }

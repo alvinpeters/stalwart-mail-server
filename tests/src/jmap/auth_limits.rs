@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -71,6 +54,16 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Reset rate limiters
     server.inner.concurrency_limiter.clear();
+    params.webhook.clear();
+
+    // Incorrect passwords should be rejected with a 401 error
+    assert!(matches!(
+        Client::new()
+            .credentials(Credentials::basic("jdoe@example.com", "abcde"))
+            .accept_invalid_certs(true)
+            .connect("https://127.0.0.1:8899")
+            .await,
+        Err(jmap_client::Error::Problem(err)) if err.status() == Some(401)));
 
     // Wait until the beginning of the 5 seconds bucket
     const LIMIT: u64 = 5;
@@ -78,15 +71,6 @@ pub async fn test(params: &mut JMAPTest) {
     let range_start = now / LIMIT;
     let range_end = (range_start * LIMIT) + LIMIT;
     tokio::time::sleep(Duration::from_secs(range_end - now)).await;
-
-    // Incorrect passwords should be rejected with a 401 error
-    assert!(matches!(
-            Client::new()
-                .credentials(Credentials::basic("jdoe@example.com", "abcde"))
-                .accept_invalid_certs(true)
-                .connect("https://127.0.0.1:8899")
-                .await,
-            Err(jmap_client::Error::Problem(err)) if err.status() == Some(401)));
 
     // Invalid authentication requests should be rate limited
     let mut n_401 = 0;
@@ -280,4 +264,9 @@ pub async fn test(params: &mut JMAPTest) {
     params.client.set_default_account_id(&account_id);
     destroy_all_mailboxes(params).await;
     assert_is_empty(server).await;
+
+    // Check webhook events
+    params
+        .webhook
+        .assert_contains(&["auth.failed", "auth.success", "auth.banned"]);
 }

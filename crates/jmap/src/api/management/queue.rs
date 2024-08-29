@@ -1,31 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
-
-use std::str::FromStr;
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hyper::Method;
-use jmap_proto::error::request::RequestError;
 use mail_auth::{
     dmarc::URI,
     mta_sts::ReportUri,
@@ -46,7 +26,7 @@ use crate::{
     JMAP,
 };
 
-use super::decode_path_element;
+use super::{decode_path_element, FutureTimestamp};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Message {
@@ -121,7 +101,11 @@ pub enum Report {
 }
 
 impl JMAP {
-    pub async fn handle_manage_queue(&self, req: &HttpRequest, path: Vec<&str>) -> HttpResponse {
+    pub async fn handle_manage_queue(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+    ) -> trc::Result<HttpResponse> {
         let params = UrlParams::new(req.uri().query());
 
         match (
@@ -133,8 +117,12 @@ impl JMAP {
                 let text = params.get("text");
                 let from = params.get("from");
                 let to = params.get("to");
-                let before = params.parse::<Timestamp>("before").map(|t| t.into_inner());
-                let after = params.parse::<Timestamp>("after").map(|t| t.into_inner());
+                let before = params
+                    .parse::<FutureTimestamp>("before")
+                    .map(|t| t.into_inner());
+                let after = params
+                    .parse::<FutureTimestamp>("after")
+                    .map(|t| t.into_inner());
                 let page = params.parse::<usize>("page").unwrap_or_default();
                 let limit = params.parse::<usize>("limit").unwrap_or_default();
                 let values = params.has_key("values");
@@ -155,8 +143,7 @@ impl JMAP {
                 let mut offset = page.saturating_sub(1) * limit;
                 let mut total = 0;
                 let mut total_returned = 0;
-                let _ = self
-                    .core
+                self.core
                     .storage
                     .data
                     .iterate(
@@ -210,9 +197,9 @@ impl JMAP {
                             Ok(max_total == 0 || total < max_total)
                         },
                     )
-                    .await;
+                    .await?;
 
-                if values {
+                Ok(if values {
                     JsonResponse::new(json!({
                             "data":{
                                 "items": result_values,
@@ -227,7 +214,7 @@ impl JMAP {
                             },
                     }))
                 }
-                .into_http_response()
+                .into_http_response())
             }
             ("messages", Some(queue_id), &Method::GET) => {
                 if let Some(message) = self
@@ -235,17 +222,17 @@ impl JMAP {
                     .read_message(queue_id.parse().unwrap_or_default())
                     .await
                 {
-                    JsonResponse::new(json!({
+                    Ok(JsonResponse::new(json!({
                             "data": Message::from(&message),
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
             ("messages", Some(queue_id), &Method::PATCH) => {
                 let time = params
-                    .parse::<Timestamp>("at")
+                    .parse::<FutureTimestamp>("at")
                     .map(|t| t.into_inner())
                     .unwrap_or_else(now);
                 let item = params.get("filter");
@@ -282,12 +269,12 @@ impl JMAP {
                         let _ = self.smtp.inner.queue_tx.send(queue::Event::Reload).await;
                     }
 
-                    JsonResponse::new(json!({
+                    Ok(JsonResponse::new(json!({
                             "data": found,
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
             ("messages", Some(queue_id), &Method::DELETE) => {
@@ -362,12 +349,12 @@ impl JMAP {
                         found = true;
                     }
 
-                    JsonResponse::new(json!({
+                    Ok(JsonResponse::new(json!({
                             "data": found,
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
             ("reports", None, &Method::GET) => {
@@ -404,8 +391,7 @@ impl JMAP {
                 let mut offset = page.saturating_sub(1) * limit;
                 let mut total = 0;
                 let mut total_returned = 0;
-                let _ = self
-                    .core
+                self.core
                     .storage
                     .data
                     .iterate(
@@ -439,15 +425,15 @@ impl JMAP {
                             Ok(max_total == 0 || total < max_total)
                         },
                     )
-                    .await;
+                    .await?;
 
-                JsonResponse::new(json!({
+                Ok(JsonResponse::new(json!({
                         "data": {
                             "items": result,
                             "total": total,
                         },
                 }))
-                .into_http_response()
+                .into_http_response())
             }
             ("reports", Some(report_id), &Method::GET) => {
                 let mut result = None;
@@ -455,20 +441,20 @@ impl JMAP {
                     match report_id {
                         QueueClass::DmarcReportHeader(event) => {
                             let mut rua = Vec::new();
-                            if let Ok(Some(report)) = self
+                            if let Some(report) = self
                                 .smtp
-                                .generate_dmarc_aggregate_report(&event, &mut rua, None)
-                                .await
+                                .generate_dmarc_aggregate_report(&event, &mut rua, None, 0)
+                                .await?
                             {
                                 result = Report::dmarc(event, report, rua).into();
                             }
                         }
                         QueueClass::TlsReportHeader(event) => {
                             let mut rua = Vec::new();
-                            if let Ok(Some(report)) = self
+                            if let Some(report) = self
                                 .smtp
-                                .generate_tls_aggregate_report(&[event.clone()], &mut rua, None)
-                                .await
+                                .generate_tls_aggregate_report(&[event.clone()], &mut rua, None, 0)
+                                .await?
                             {
                                 result = Report::tls(event, report, rua).into();
                             }
@@ -478,12 +464,12 @@ impl JMAP {
                 }
 
                 if let Some(result) = result {
-                    JsonResponse::new(json!({
+                    Ok(JsonResponse::new(json!({
                             "data": result,
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
             ("reports", Some(report_id), &Method::DELETE) => {
@@ -498,15 +484,15 @@ impl JMAP {
                         _ => (),
                     }
 
-                    JsonResponse::new(json!({
+                    Ok(JsonResponse::new(json!({
                             "data": true,
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
-            _ => RequestError::not_found().into_http_response(),
+            _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
 }
@@ -516,7 +502,7 @@ impl From<&queue::Message> for Message {
         let now = now();
 
         Message {
-            id: message.id,
+            id: message.queue_id,
             return_path: message.return_path.clone(),
             created: DateTime::from_timestamp(message.created as i64),
             size: message.size,
@@ -629,29 +615,6 @@ fn parse_queued_report_id(id: &str) -> Option<QueueClass> {
         "d" => Some(QueueClass::DmarcReportHeader(event)),
         "t" => Some(QueueClass::TlsReportHeader(event)),
         _ => None,
-    }
-}
-
-struct Timestamp(u64);
-
-impl FromStr for Timestamp {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(dt) = DateTime::parse_rfc3339(s) {
-            let instant = dt.to_timestamp() as u64;
-            if instant >= now() {
-                return Ok(Timestamp(instant));
-            }
-        }
-
-        Err(())
-    }
-}
-
-impl Timestamp {
-    pub fn into_inner(self) -> u64 {
-        self.0
     }
 }
 

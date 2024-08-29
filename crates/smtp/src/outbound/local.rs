@@ -1,29 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use common::{DeliveryEvent, DeliveryResult, IngestMessage};
 use smtp_proto::Response;
 use tokio::sync::{mpsc, oneshot};
+use trc::ServerEvent;
 
 use crate::queue::{
     Error, ErrorDetails, HostResponse, Message, Recipient, Status, RCPT_STATUS_CHANGED,
@@ -34,7 +18,6 @@ impl Message {
         &self,
         recipients: impl Iterator<Item = &mut Recipient>,
         delivery_tx: &mpsc::Sender<DeliveryEvent>,
-        span: &tracing::Span,
     ) -> Status<(), Error> {
         // Prepare recipients list
         let mut total_rcpt = 0;
@@ -65,6 +48,7 @@ impl Message {
                     recipients: recipient_addresses,
                     message_blob: self.blob_hash.clone(),
                     message_size: self.size,
+                    session_id: self.span_id,
                 },
                 result_tx,
             })
@@ -75,22 +59,22 @@ impl Message {
                 match result_rx.await {
                     Ok(delivery_result) => delivery_result,
                     Err(_) => {
-                        tracing::warn!(
-                            parent: span,
-                            context = "deliver_local",
-                            event = "error",
-                            reason = "result channel closed",
+                        trc::event!(
+                            Server(ServerEvent::ThreadError),
+                            CausedBy = trc::location!(),
+                            SpanId = self.span_id,
+                            Reason = "Result channel closed",
                         );
                         return Status::local_error();
                     }
                 }
             }
             Err(_) => {
-                tracing::warn!(
-                    parent: span,
-                    context = "deliver_local",
-                    event = "error",
-                    reason = "tx channel closed",
+                trc::event!(
+                    Server(ServerEvent::ThreadError),
+                    CausedBy = trc::location!(),
+                    SpanId = self.span_id,
+                    Reason = "TX channel closed",
                 );
                 return Status::local_error();
             }
@@ -101,13 +85,6 @@ impl Message {
             rcpt.flags |= RCPT_STATUS_CHANGED;
             match result {
                 DeliveryResult::Success => {
-                    tracing::info!(
-                        parent: span,
-                        context = "deliver_local",
-                        event = "delivered",
-                        rcpt = rcpt.address,
-                    );
-
                     rcpt.status = Status::Completed(HostResponse {
                         hostname: "localhost".to_string(),
                         response: Response {
@@ -119,13 +96,6 @@ impl Message {
                     total_completed += 1;
                 }
                 DeliveryResult::TemporaryFailure { reason } => {
-                    tracing::info!(
-                        parent: span,
-                        context = "deliver_local",
-                        event = "deferred",
-                        rcpt = rcpt.address,
-                        reason = reason.as_ref(),
-                    );
                     rcpt.status = Status::TemporaryFailure(HostResponse {
                         hostname: ErrorDetails {
                             entity: "localhost".to_string(),
@@ -139,13 +109,6 @@ impl Message {
                     });
                 }
                 DeliveryResult::PermanentFailure { code, reason } => {
-                    tracing::info!(
-                        parent: span,
-                        context = "deliver_local",
-                        event = "rejected",
-                        rcpt = rcpt.address,
-                        reason = reason.as_ref(),
-                    );
                     total_completed += 1;
                     rcpt.status = Status::PermanentFailure(HostResponse {
                         hostname: ErrorDetails {

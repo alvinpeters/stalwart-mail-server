@@ -3,7 +3,6 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,7 +22,6 @@ use smtp::{
     scripts::ScriptResult,
 };
 use store::Stores;
-use tokio::runtime::Handle;
 use utils::config::Config;
 
 use crate::smtp::{build_smtp, session::TestSession, TempDir};
@@ -102,18 +100,8 @@ public-suffix = "file://{LIST_PATH}/public-suffix.dat"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn antispam() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::builder()
-                    .parse(
-                        "smtp=debug,imap=debug,jmap=debug,store=debug,utils=debug,directory=debug,common=trace",
-                    )
-                    .unwrap(),
-            )
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Prepare config
     let tests = [
@@ -267,7 +255,6 @@ async fn antispam() {
         .join("resources")
         .join("smtp")
         .join("antispam");
-    let span = tracing::info_span!("sieve_antispam");
     for &test_name in tests.iter().chain(&["combined"]) {
         /*if test_name != "combined" {
             continue;
@@ -414,20 +401,17 @@ async fn antispam() {
             let mut params = session
                 .build_script_parameters("data")
                 .with_expected_variables(expected_variables)
-                .with_message(Arc::new(message.into_bytes()));
+                .with_message(message.as_bytes());
             for (name, value) in variables {
                 params = params.set_variable(name, value);
             }
 
             // Run script
-            let handle = Handle::current();
-            let span = span.clone();
             let core_ = core.clone();
             let script = script.clone();
-            match core
-                .spawn_worker(move || core_.run_script_blocking(script, params, handle, span))
+            match core_
+                .run_script("test".to_string(), script, params, 0)
                 .await
-                .unwrap()
             {
                 ScriptResult::Accept { modifications } => {
                     if modifications.len() != expected_headers.len() {

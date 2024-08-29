@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     borrow::Cow,
@@ -48,6 +31,10 @@ pub const V_QUEUE_NOTIFY_NUM: u32 = 17;
 pub const V_QUEUE_EXPIRES_IN: u32 = 18;
 pub const V_QUEUE_LAST_STATUS: u32 = 19;
 pub const V_QUEUE_LAST_ERROR: u32 = 20;
+pub const V_URL: u32 = 21;
+pub const V_URL_PATH: u32 = 22;
+pub const V_HEADERS: u32 = 23;
+pub const V_METHOD: u32 = 24;
 
 pub const VARIABLES_MAP: &[(&str, u32)] = &[
     ("rcpt", V_RECIPIENT),
@@ -71,6 +58,10 @@ pub const VARIABLES_MAP: &[(&str, u32)] = &[
     ("expires_in", V_QUEUE_EXPIRES_IN),
     ("last_status", V_QUEUE_LAST_STATUS),
     ("last_error", V_QUEUE_LAST_ERROR),
+    ("url", V_URL),
+    ("url_path", V_URL_PATH),
+    ("headers", V_HEADERS),
+    ("method", V_METHOD),
 ];
 
 use regex::Regex;

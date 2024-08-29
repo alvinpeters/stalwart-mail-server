@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod acl;
 pub mod append;
@@ -31,6 +14,7 @@ pub mod fetch;
 pub mod idle;
 pub mod mailbox;
 pub mod managesieve;
+pub mod pop;
 pub mod search;
 pub mod store;
 pub mod thread;
@@ -43,8 +27,11 @@ use std::{
 
 use ::managesieve::core::ManageSieveSessionManager;
 use common::{
-    config::server::{ServerProtocol, Servers},
-    Core,
+    config::{
+        server::{ServerProtocol, Servers},
+        telemetry::Telemetry,
+    },
+    Core, Ipc, IPC_CHANNEL_BUFFER,
 };
 
 use ::store::Stores;
@@ -52,7 +39,8 @@ use ahash::AHashSet;
 use directory::backend::internal::manage::ManageDirectory;
 use imap::core::{ImapSessionManager, Inner, IMAP};
 use imap_proto::ResponseType;
-use jmap::{api::JmapSessionManager, services::IPC_CHANNEL_BUFFER, JMAP};
+use jmap::{api::JmapSessionManager, JMAP};
+use pop3::Pop3SessionManager;
 use smtp::core::{SmtpSessionManager, SMTP};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf},
@@ -64,8 +52,8 @@ use utils::config::Config;
 use crate::{add_test_certs, directory::DirectoryStore, store::TempDir, AssertConfig};
 
 const SERVER: &str = r#"
-[server]
-hostname = "'imap.example.org'"
+[lookup.default]
+hostname = "imap.example.org"
 
 [server.listener.imap]
 bind = ["127.0.0.1:9991"]
@@ -81,6 +69,12 @@ tls.implicit = true
 [server.listener.sieve]
 bind = ["127.0.0.1:4190"]
 protocol = "managesieve"
+max-connections = 81920
+tls.implicit = true
+
+[server.listener.pop3]
+bind = ["127.0.0.1:4110"]
+protocol = "pop3"
 max-connections = 81920
 tls.implicit = true
 
@@ -158,6 +152,11 @@ database = "stalwart"
 user = "postgres"
 password = "mysecretpassword"
 
+[store."psql-replica"]
+type = "sql-read-replica"
+primary = "postgresql"
+replicas = "postgresql"
+
 [store."mysql"]
 type = "mysql"
 host = "localhost"
@@ -220,6 +219,26 @@ throttle = "500ms"
 throttle = "500ms"
 attempts.interval = "500ms"
 
+[jmap.folders.inbox]
+name = "Inbox"
+subscribe = false
+
+[jmap.folders.sent]
+name = "Sent Items"
+subscribe = false
+
+[jmap.folders.trash]
+name = "Deleted Items"
+subscribe = false
+
+[jmap.folders.junk]
+name = "Junk Mail"
+subscribe = false
+
+[jmap.folders.drafts]
+name = "Drafts"
+subscribe = false
+
 [store."auth"]
 type = "sqlite"
 path = "{TMP}/auth.db"
@@ -255,6 +274,14 @@ user-code = "1s"
 token = "1s"
 refresh-token = "3s"
 refresh-token-renew = "2s"
+
+[tracer.console]
+type = "console"
+level = "{LEVEL}"
+multiline = false
+ansi = true
+disabled-events = ["network.*"]
+
 "#;
 
 #[allow(dead_code)]
@@ -271,7 +298,11 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
     let mut config = Config::new(
         add_test_certs(SERVER)
             .replace("{STORE}", store_id)
-            .replace("{TMP}", &temp_dir.path.display().to_string()),
+            .replace("{TMP}", &temp_dir.path.display().to_string())
+            .replace(
+                "{LEVEL}",
+                &std::env::var("LOG").unwrap_or_else(|_| "disable".to_string()),
+            ),
     )
     .unwrap();
     config.resolve_all_macros().await;
@@ -286,6 +317,7 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
     let stores = Stores::parse_all(&mut config).await;
 
     // Parse core
+    let tracers = Telemetry::parse(&mut config, &stores);
     let core = Core::parse(&mut config, stores, Default::default()).await;
     let store = core.storage.data.clone();
     let shared_core = core.into_shared();
@@ -293,9 +325,21 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
     // Parse acceptors
     servers.parse_tcp_acceptors(&mut config, shared_core.clone());
 
-    // Init servers
+    // Enable tracing
+    tracers.enable(true);
+
+    // Setup IPC channels
     let (delivery_tx, delivery_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
-    let smtp = SMTP::init(&mut config, shared_core.clone(), delivery_tx).await;
+    let ipc = Ipc { delivery_tx };
+
+    // Init servers
+    let smtp = SMTP::init(
+        &mut config,
+        shared_core.clone(),
+        ipc,
+        servers.span_id_gen.clone(),
+    )
+    .await;
     let jmap = JMAP::init(
         &mut config,
         delivery_rx,
@@ -327,6 +371,12 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
                 acceptor,
                 shutdown_rx,
             ),
+            ServerProtocol::Pop3 => server.spawn(
+                Pop3SessionManager::new(imap.clone()),
+                shared_core.clone(),
+                acceptor,
+                shutdown_rx,
+            ),
             ServerProtocol::ManageSieve => server.spawn(
                 ManageSieveSessionManager::new(imap.clone()),
                 shared_core.clone(),
@@ -335,6 +385,7 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
             ),
         };
     });
+
     // Create tables and test accounts
     let lookup = DirectoryStore {
         store: shared_core
@@ -357,6 +408,9 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
         .await;
     lookup
         .create_test_user_with_email("foobar@example.com", "secret", "Bill Foobar")
+        .await;
+    lookup
+        .create_test_user_with_email("popper@example.com", "secret", "Karl Popper")
         .await;
     lookup
         .create_test_group_with_email("support@example.com", "Support Group")
@@ -382,21 +436,6 @@ async fn init_imap_tests(store_id: &str, delete_if_exists: bool) -> IMAPTest {
 
 #[tokio::test]
 pub async fn imap_tests() {
-    if let Ok(level) = std::env::var("LOG") {
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::FmtSubscriber::builder()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::builder()
-                        .parse(
-                            format!("smtp={level},imap={level},jmap={level},store={level},utils={level},directory={level}"),
-                        )
-                        .unwrap(),
-                )
-                .finish(),
-        )
-        .unwrap();
-    }
-
     // Prepare settings
     let start_time = Instant::now();
     let delete = true;
@@ -452,6 +491,9 @@ pub async fn imap_tests() {
 
     // Run ManageSieve tests
     managesieve::test().await;
+
+    // Run POP3 tests
+    pop::test().await;
 
     // Print elapsed time
     let elapsed = start_time.elapsed();

@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod lookup;
 pub mod manage;
@@ -73,9 +56,12 @@ impl Serialize for &Principal<u32> {
 }
 
 impl Deserialize for Principal<u32> {
-    fn deserialize(bytes: &[u8]) -> store::Result<Self> {
-        deserialize(bytes)
-            .ok_or_else(|| store::Error::InternalError("Failed to deserialize principal".into()))
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        deserialize(bytes).ok_or_else(|| {
+            trc::StoreEvent::DataCorruption
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Value, bytes)
+        })
     }
 }
 
@@ -89,14 +75,18 @@ impl Serialize for PrincipalIdType {
 }
 
 impl Deserialize for PrincipalIdType {
-    fn deserialize(bytes: &[u8]) -> store::Result<Self> {
-        let mut bytes = bytes.iter();
+    fn deserialize(bytes_: &[u8]) -> trc::Result<Self> {
+        let mut bytes = bytes_.iter();
         Ok(PrincipalIdType {
             account_id: bytes.next_leb128().ok_or_else(|| {
-                store::Error::InternalError("Failed to deserialize principal account id".into())
+                trc::StoreEvent::DataCorruption
+                    .caused_by(trc::location!())
+                    .ctx(trc::Key::Value, bytes_)
             })?,
             typ: Type::from_u8(*bytes.next().ok_or_else(|| {
-                store::Error::InternalError("Failed to deserialize principal id type".into())
+                trc::StoreEvent::DataCorruption
+                    .caused_by(trc::location!())
+                    .ctx(trc::Key::Value, bytes_)
             })?),
         })
     }
@@ -206,15 +196,21 @@ impl PrincipalUpdate {
 
 impl Display for PrincipalField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl PrincipalField {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            PrincipalField::Name => write!(f, "name"),
-            PrincipalField::Type => write!(f, "type"),
-            PrincipalField::Quota => write!(f, "quota"),
-            PrincipalField::Description => write!(f, "description"),
-            PrincipalField::Secrets => write!(f, "secrets"),
-            PrincipalField::Emails => write!(f, "emails"),
-            PrincipalField::MemberOf => write!(f, "memberOf"),
-            PrincipalField::Members => write!(f, "members"),
+            PrincipalField::Name => "name",
+            PrincipalField::Type => "type",
+            PrincipalField::Quota => "quota",
+            PrincipalField::Description => "description",
+            PrincipalField::Secrets => "secrets",
+            PrincipalField::Emails => "emails",
+            PrincipalField::MemberOf => "memberOf",
+            PrincipalField::Members => "members",
         }
     }
 }
@@ -275,5 +271,33 @@ impl FromStr for Type {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Type::parse(s).ok_or(())
+    }
+}
+
+pub trait SpecialSecrets {
+    fn is_disabled(&self) -> bool;
+    fn is_otp_auth(&self) -> bool;
+    fn is_app_password(&self) -> bool;
+    fn is_password(&self) -> bool;
+}
+
+impl<T> SpecialSecrets for T
+where
+    T: AsRef<str>,
+{
+    fn is_disabled(&self) -> bool {
+        self.as_ref() == "$disabled$"
+    }
+
+    fn is_otp_auth(&self) -> bool {
+        self.as_ref().starts_with("otpauth://")
+    }
+
+    fn is_app_password(&self) -> bool {
+        self.as_ref().starts_with("$app$")
+    }
+
+    fn is_password(&self) -> bool {
+        !self.is_disabled() && !self.is_otp_auth() && !self.is_app_password()
     }
 }

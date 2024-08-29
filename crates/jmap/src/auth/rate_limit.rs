@@ -1,30 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{net::IpAddr, sync::Arc};
 
 use common::listener::limiter::{ConcurrencyLimiter, InFlight};
-use jmap_proto::error::request::{RequestError, RequestLimitError};
+use trc::AddContext;
 
 use crate::JMAP;
 
@@ -57,10 +40,7 @@ impl JMAP {
             })
     }
 
-    pub async fn is_account_allowed(
-        &self,
-        access_token: &AccessToken,
-    ) -> Result<InFlight, RequestError> {
+    pub async fn is_account_allowed(&self, access_token: &AccessToken) -> trc::Result<InFlight> {
         let limiter = self.get_concurrency_limiter(access_token.primary_id());
         let is_rate_allowed = if let Some(rate) = &self.core.jmap.rate_authenticated {
             self.core
@@ -72,7 +52,7 @@ impl JMAP {
                     false,
                 )
                 .await
-                .map_err(|_| RequestError::internal_server_error())?
+                .caused_by(trc::location!())?
                 .is_none()
         } else {
             true
@@ -84,16 +64,16 @@ impl JMAP {
             } else if access_token.is_super_user() {
                 Ok(InFlight::default())
             } else {
-                Err(RequestError::limit(RequestLimitError::ConcurrentRequest))
+                Err(trc::LimitEvent::ConcurrentRequest.into_err())
             }
         } else if access_token.is_super_user() {
             Ok(InFlight::default())
         } else {
-            Err(RequestError::too_many_requests())
+            Err(trc::LimitEvent::TooManyRequests.into_err())
         }
     }
 
-    pub async fn is_anonymous_allowed(&self, addr: &IpAddr) -> Result<(), RequestError> {
+    pub async fn is_anonymous_allowed(&self, addr: &IpAddr) -> trc::Result<()> {
         if let Some(rate) = &self.core.jmap.rate_anonymous {
             if self
                 .core
@@ -101,16 +81,16 @@ impl JMAP {
                 .lookup
                 .is_rate_allowed(format!("jreq:{}", addr).as_bytes(), rate, false)
                 .await
-                .map_err(|_| RequestError::internal_server_error())?
+                .caused_by(trc::location!())?
                 .is_some()
             {
-                return Err(RequestError::too_many_requests());
+                return Err(trc::LimitEvent::TooManyRequests.into_err());
             }
         }
         Ok(())
     }
 
-    pub fn is_upload_allowed(&self, access_token: &AccessToken) -> Result<InFlight, RequestError> {
+    pub fn is_upload_allowed(&self, access_token: &AccessToken) -> trc::Result<InFlight> {
         if let Some(in_flight_request) = self
             .get_concurrency_limiter(access_token.primary_id())
             .concurrent_uploads
@@ -120,11 +100,11 @@ impl JMAP {
         } else if access_token.is_super_user() {
             Ok(InFlight::default())
         } else {
-            Err(RequestError::limit(RequestLimitError::ConcurrentUpload))
+            Err(trc::LimitEvent::ConcurrentUpload.into_err())
         }
     }
 
-    pub async fn is_auth_allowed_soft(&self, addr: &IpAddr) -> Result<(), RequestError> {
+    pub async fn is_auth_allowed_soft(&self, addr: &IpAddr) -> trc::Result<()> {
         if let Some(rate) = &self.core.jmap.rate_authenticate_req {
             if self
                 .core
@@ -132,16 +112,16 @@ impl JMAP {
                 .lookup
                 .is_rate_allowed(format!("jauth:{}", addr).as_bytes(), rate, true)
                 .await
-                .map_err(|_| RequestError::internal_server_error())?
+                .caused_by(trc::location!())?
                 .is_some()
             {
-                return Err(RequestError::too_many_auth_attempts());
+                return Err(trc::AuthEvent::TooManyAttempts.into_err());
             }
         }
         Ok(())
     }
 
-    pub async fn is_auth_allowed_hard(&self, addr: &IpAddr) -> Result<(), RequestError> {
+    pub async fn is_auth_allowed_hard(&self, addr: &IpAddr) -> trc::Result<()> {
         if let Some(rate) = &self.core.jmap.rate_authenticate_req {
             if self
                 .core
@@ -149,10 +129,10 @@ impl JMAP {
                 .lookup
                 .is_rate_allowed(format!("jauth:{}", addr).as_bytes(), rate, false)
                 .await
-                .map_err(|_| RequestError::internal_server_error())?
+                .caused_by(trc::location!())?
                 .is_some()
             {
-                return Err(RequestError::too_many_auth_attempts());
+                return Err(trc::AuthEvent::TooManyAttempts.into_err());
             }
         }
         Ok(())

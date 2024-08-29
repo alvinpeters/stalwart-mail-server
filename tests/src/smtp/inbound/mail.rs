@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     sync::Arc,
@@ -73,6 +56,9 @@ requiretls = [{if = "remote_ip = '10.0.0.2'", then = true},
 mt-priority = [{if = "remote_ip = '10.0.0.2'", then = 'nsep'},
                {else = false}]
 
+[session.mail]
+is-allowed = "sender_domain != 'blocked.com'"
+
 [session.data.limits]
 size = [{if = "remote_ip = '10.0.0.2'", then = 2048},
         {else = 1024}]
@@ -87,6 +73,9 @@ enable = true
 
 #[tokio::test]
 async fn mail() {
+    // Enable logging
+    crate::enable_logging();
+
     let tmp_dir = TempDir::new("smtp_mail_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
     let stores = Stores::parse_all(&mut config).await;
@@ -129,9 +118,16 @@ async fn mail() {
         .unwrap();
     session.response().assert_code("503 5.5.1");
 
-    // Both IPREV and SPF should pass
+    // Test sender not allowed
     session.ingest(b"EHLO mx1.foobar.org\r\n").await.unwrap();
     session.response().assert_code("250");
+    session
+        .ingest(b"MAIL FROM:<bill@blocked.com>\r\n")
+        .await
+        .unwrap();
+    session.response().assert_code("550 5.7.1");
+
+    // Both IPREV and SPF should pass
     session
         .ingest(b"MAIL FROM:<bill@foobar.org>\r\n")
         .await
@@ -320,7 +316,7 @@ async fn mail() {
     assert_eq!(session.data.future_release, 10);
     session.rset().await;
 
-    // Test FUTURERELEASE extension with invalud HOLDUNTIL value
+    // Test FUTURERELEASE extension with invalid HOLDUNTIL value
     session
         .ingest(format!("MAIL FROM:<jane@foobar.org> HOLDUNTIL={}\r\n", now + 99999).as_bytes())
         .await

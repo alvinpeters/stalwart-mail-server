@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::path::PathBuf;
 
@@ -29,14 +12,13 @@ use store::{
     rand::{distributions::Alphanumeric, thread_rng, Rng},
     Stores,
 };
-use tracing_appender::non_blocking::WorkerGuard;
 use utils::{
     config::{Config, ConfigKey},
     failed, UnwrapFailure,
 };
 
 use crate::{
-    config::{server::Servers, tracers::Tracers},
+    config::{server::Servers, telemetry::Telemetry},
     Core, SharedCore,
 };
 
@@ -49,7 +31,6 @@ pub struct BootManager {
     pub config: Config,
     pub core: SharedCore,
     pub servers: Servers,
-    pub guards: Option<Vec<WorkerGuard>>,
 }
 
 const HELP: &str = r#"Stalwart Mail Server
@@ -180,16 +161,11 @@ impl BootManager {
                 .failed("Failed to read configuration");
         }
 
-        // Enable tracing
-        let guards = Tracers::parse(&mut config).enable(&mut config);
+        // Parse telemetry
+        let telemetry = Telemetry::parse(&mut config, &stores);
 
         match import_export {
             ImportExport::None => {
-                tracing::info!(
-                    "Starting Stalwart Mail Server v{}...",
-                    env!("CARGO_PKG_VERSION")
-                );
-
                 // Add hostname lookup if missing
                 let mut insert_keys = Vec::new();
                 if config
@@ -245,11 +221,10 @@ impl BootManager {
                 {
                     match manager.fetch_config_resource("spam-filter").await {
                         Ok(external_config) => {
-                            tracing::info!(
-                                context = "config",
-                                event = "import",
-                                version = external_config.version,
-                                "Imported spam filter rules"
+                            trc::event!(
+                                Config(trc::ConfigEvent::ImportExternal),
+                                Version = external_config.version,
+                                Id = "spam-filter"
                             );
                             insert_keys.extend(external_config.keys);
                         }
@@ -292,10 +267,9 @@ impl BootManager {
                         Ok(None) => match manager.fetch_resource("webadmin").await {
                             Ok(bytes) => match blob_store.put_blob(WEBADMIN_KEY, &bytes).await {
                                 Ok(_) => {
-                                    tracing::info!(
-                                        context = "webadmin",
-                                        event = "download",
-                                        "Downloaded webadmin bundle"
+                                    trc::event!(
+                                        Resource(trc::ResourceEvent::DownloadExternal),
+                                        Id = "webadmin"
                                     );
                                 }
                                 Err(err) => {
@@ -332,22 +306,37 @@ impl BootManager {
                 // Parse lookup stores
                 stores.parse_lookups(&mut config).await;
 
-                // Parse settings and build shared core
-                let core = Core::parse(&mut config, stores, manager)
-                    .await
-                    .into_shared();
+                // Parse settings
+                let core = Core::parse(&mut config, stores, manager).await;
+
+                // Enable telemetry
+                #[cfg(feature = "enterprise")]
+                telemetry.enable(core.is_enterprise_edition());
+                #[cfg(not(feature = "enterprise"))]
+                telemetry.enable(false);
+
+                trc::event!(
+                    Server(trc::ServerEvent::Startup),
+                    Version = env!("CARGO_PKG_VERSION"),
+                );
+
+                // Build shared core
+                let core = core.into_shared();
 
                 // Parse TCP acceptors
                 servers.parse_tcp_acceptors(&mut config, core.clone());
 
                 BootManager {
                     core,
-                    guards,
                     config,
                     servers,
                 }
             }
             ImportExport::Export(path) => {
+                // Enable telemetry
+                telemetry.enable(false);
+
+                // Parse settings and backup
                 Core::parse(&mut config, stores, manager)
                     .await
                     .backup(path)
@@ -355,6 +344,10 @@ impl BootManager {
                 std::process::exit(0);
             }
             ImportExport::Import(path) => {
+                // Enable telemetry
+                telemetry.enable(false);
+
+                // Parse settings and restore
                 Core::parse(&mut config, stores, manager)
                     .await
                     .restore(path)
@@ -425,6 +418,15 @@ bind = "[::]:993"
 protocol = "imap"
 tls.implicit = true
 
+[server.listener.pop3]
+bind = "[::]:110"
+protocol = "pop3"
+
+[server.listener.pop3s]
+bind = "[::]:995"
+protocol = "pop3"
+tls.implicit = true
+
 [server.listener.sieve]
 bind = "[::]:4190"
 protocol = "managesieve"
@@ -489,6 +491,15 @@ protocol = "imap"
 [server.listener.imaptls]
 bind = "[::]:993"
 protocol = "imap"
+tls.implicit = true
+
+[server.listener.pop3]
+bind = "[::]:110"
+protocol = "pop3"
+
+[server.listener.pop3s]
+bind = "[::]:995"
+protocol = "pop3"
 tls.implicit = true
 
 [server.listener.sieve]

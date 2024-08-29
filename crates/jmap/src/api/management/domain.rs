@@ -1,35 +1,16 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::backend::internal::manage::ManageDirectory;
+use directory::backend::internal::manage::{self, ManageDirectory};
 
 use hyper::Method;
-use jmap_proto::error::request::RequestError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::Digest;
-use store::ahash::AHashMap;
-use utils::url_params::UrlParams;
+use utils::{config::Config, url_params::UrlParams};
 use x509_parser::parse_x509_certificate;
 
 use crate::{
@@ -52,7 +33,11 @@ struct DnsRecord {
 }
 
 impl JMAP {
-    pub async fn handle_manage_domain(&self, req: &HttpRequest, path: Vec<&str>) -> HttpResponse {
+    pub async fn handle_manage_domain(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+    ) -> trc::Result<HttpResponse> {
         match (path.get(1), req.method()) {
             (None, &Method::GET) => {
                 // List domains
@@ -61,86 +46,82 @@ impl JMAP {
                 let page: usize = params.parse("page").unwrap_or(0);
                 let limit: usize = params.parse("limit").unwrap_or(0);
 
-                match self.core.storage.data.list_domains(filter).await {
-                    Ok(domains) => {
-                        let (total, domains) = if limit > 0 {
-                            let offset = page.saturating_sub(1) * limit;
-                            (
-                                domains.len(),
-                                domains.into_iter().skip(offset).take(limit).collect(),
-                            )
-                        } else {
-                            (domains.len(), domains)
-                        };
+                let domains = self.core.storage.data.list_domains(filter).await?;
+                let (total, domains) = if limit > 0 {
+                    let offset = page.saturating_sub(1) * limit;
+                    (
+                        domains.len(),
+                        domains.into_iter().skip(offset).take(limit).collect(),
+                    )
+                } else {
+                    (domains.len(), domains)
+                };
 
-                        JsonResponse::new(json!({
-                                "data": {
-                                    "items": domains,
-                                    "total": total,
-                                },
-                        }))
-                        .into_http_response()
-                    }
-                    Err(err) => err.into_http_response(),
-                }
+                Ok(JsonResponse::new(json!({
+                        "data": {
+                            "items": domains,
+                            "total": total,
+                        },
+                }))
+                .into_http_response())
             }
             (Some(domain), &Method::GET) => {
                 // Obtain DNS records
                 let domain = decode_path_element(domain);
-                match self.build_dns_records(domain.as_ref()).await {
-                    Ok(records) => JsonResponse::new(json!({
-                        "data": records,
-                    }))
-                    .into_http_response(),
-                    Err(err) => err.into_http_response(),
-                }
+                Ok(JsonResponse::new(json!({
+                    "data": self.build_dns_records(domain.as_ref()).await?,
+                }))
+                .into_http_response())
             }
             (Some(domain), &Method::POST) => {
                 // Create domain
                 let domain = decode_path_element(domain);
-                match self.core.storage.data.create_domain(domain.as_ref()).await {
-                    Ok(_) => {
-                        // Set default domain name if missing
-                        if matches!(
-                            self.core.storage.config.get("lookup.default.domain").await,
-                            Ok(None)
-                        ) {
-                            if let Err(err) = self
-                                .core
-                                .storage
-                                .config
-                                .set([("lookup.default.domain", domain.as_ref())])
-                                .await
-                            {
-                                tracing::error!("Failed to set default domain name: {}", err);
-                            }
-                        }
-
-                        JsonResponse::new(json!({
-                            "data": (),
-                        }))
-                        .into_http_response()
-                    }
-                    Err(err) => err.into_http_response(),
+                self.core
+                    .storage
+                    .data
+                    .create_domain(domain.as_ref())
+                    .await?;
+                // Set default domain name if missing
+                if self
+                    .core
+                    .storage
+                    .config
+                    .get("lookup.default.domain")
+                    .await?
+                    .is_none()
+                {
+                    self.core
+                        .storage
+                        .config
+                        .set([("lookup.default.domain", domain.as_ref())])
+                        .await?;
                 }
+
+                Ok(JsonResponse::new(json!({
+                    "data": (),
+                }))
+                .into_http_response())
             }
             (Some(domain), &Method::DELETE) => {
                 // Delete domain
                 let domain = decode_path_element(domain);
-                match self.core.storage.data.delete_domain(domain.as_ref()).await {
-                    Ok(_) => JsonResponse::new(json!({
-                        "data": (),
-                    }))
-                    .into_http_response(),
-                    Err(err) => err.into_http_response(),
-                }
+                self.core
+                    .storage
+                    .data
+                    .delete_domain(domain.as_ref())
+                    .await?;
+
+                Ok(JsonResponse::new(json!({
+                    "data": (),
+                }))
+                .into_http_response())
             }
 
-            _ => RequestError::not_found().into_http_response(),
+            _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
 
-    async fn build_dns_records(&self, domain_name: &str) -> store::Result<Vec<DnsRecord>> {
+    async fn build_dns_records(&self, domain_name: &str) -> trc::Result<Vec<DnsRecord>> {
         // Obtain server name
         let server_name = self
             .core
@@ -152,8 +133,9 @@ impl JMAP {
         let mut records = Vec::new();
 
         // Obtain DKIM keys
-        let mut keys = AHashMap::new();
+        let mut keys = Config::default();
         let mut signature_ids = Vec::new();
+        let mut has_macros = false;
         for (key, value) in self.core.storage.config.list("signature.", true).await? {
             match key.strip_suffix(".domain") {
                 Some(key_id) if value == domain_name => {
@@ -161,7 +143,10 @@ impl JMAP {
                 }
                 _ => (),
             }
-            keys.insert(key, value);
+            if !has_macros && value.contains("%%{") {
+                has_macros = true;
+            }
+            keys.keys.insert(key, value);
         }
 
         // Add MX and CNAME records
@@ -182,12 +167,16 @@ impl JMAP {
         }
 
         // Process DKIM keys
+        if has_macros {
+            keys.resolve_macros(&["env", "file", "cfg"]).await;
+            keys.log_errors();
+        }
         for signature_id in signature_ids {
             if let (Some(algo), Some(pk), Some(selector)) = (
-                keys.get(&format!("{signature_id}.algorithm"))
+                keys.value(&format!("{signature_id}.algorithm"))
                     .and_then(|algo| algo.parse::<Algorithm>().ok()),
-                keys.get(&format!("{signature_id}.private-key")),
-                keys.get(&format!("{signature_id}.selector")),
+                keys.value(&format!("{signature_id}.private-key")),
+                keys.value(&format!("{signature_id}.selector")),
             ) {
                 match obtain_dkim_public_key(algo, pk) {
                     Ok(public) => {
@@ -203,7 +192,7 @@ impl JMAP {
                         });
                     }
                     Err(err) => {
-                        tracing::debug!("Failed to obtain DKIM public key: {}", err);
+                        trc::error!(err);
                     }
                 }
             }
@@ -255,6 +244,11 @@ impl JMAP {
                 }
                 ("http", _) if is_tls => {
                     has_https = true;
+                    records.push(DnsRecord {
+                        typ: "SRV".to_string(),
+                        name: format!("_jmap._tcp.{domain_name}.",),
+                        content: format!("0 1 {port} {server_name}."),
+                    });
                 }
                 _ => (),
             }
@@ -288,16 +282,27 @@ impl JMAP {
             }
         }
 
-        // Add DMARC records
+        // Add DMARC record
         records.push(DnsRecord {
             typ: "TXT".to_string(),
             name: format!("_dmarc.{domain_name}."),
             content: format!("v=DMARC1; p=reject; rua=mailto:postmaster@{domain_name}; ruf=mailto:postmaster@{domain_name}",),
         });
 
+        // Add TLS reporting record
+        records.push(DnsRecord {
+            typ: "TXT".to_string(),
+            name: format!("_smtp._tls.{domain_name}."),
+            content: format!("v=TLSRPTv1; rua=mailto:postmaster@{domain_name}",),
+        });
+
         // Add TLSA records
         for (name, key) in self.core.tls.certificates.load().iter() {
-            if !name.ends_with(domain_name) {
+            if !name.ends_with(domain_name)
+                || name.starts_with("mta-sts.")
+                || name.starts_with("autoconfig.")
+                || name.starts_with("autodiscover.")
+            {
                 continue;
             }
 
@@ -305,7 +310,10 @@ impl JMAP {
                 let parsed_cert = match parse_x509_certificate(cert) {
                     Ok((_, parsed_cert)) => parsed_cert,
                     Err(err) => {
-                        tracing::debug!("Failed to parse certificate: {}", err);
+                        trc::error!(manage::error(
+                            "Failed to parse certificate",
+                            err.to_string().into()
+                        ));
                         continue;
                     }
                 };

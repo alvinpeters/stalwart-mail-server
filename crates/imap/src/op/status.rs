@@ -1,29 +1,16 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
-use crate::core::{Mailbox, Session, SessionData};
+use crate::{
+    core::{Mailbox, Session, SessionData},
+    op::ImapContext,
+    spawn_op,
+};
 use common::listener::SessionStream;
 use imap_proto::{
     parser::PushUnique,
@@ -41,64 +28,65 @@ use store::{
     IndexKeyPrefix, IterateParams, ValueKey,
 };
 use store::{Deserialize, U32_LEN};
+use trc::AddContext;
 
 use super::ToModSeq;
 
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_status(&mut self, request: Request<Command>) -> crate::OpResult {
-        match request.parse_status(self.version) {
-            Ok(arguments) => {
-                let version = self.version;
-                let data = self.state.session_data();
-                tokio::spawn(async move {
-                    // Refresh mailboxes
-                    if let Err(err) = data.synchronize_mailboxes(false).await {
-                        data.write_bytes(err.with_tag(arguments.tag).into_bytes())
-                            .await;
-                        return;
-                    }
+    pub async fn handle_status(&mut self, request: Request<Command>) -> trc::Result<()> {
+        let op_start = Instant::now();
+        let arguments = request.parse_status(self.version)?;
+        let version = self.version;
+        let data = self.state.session_data();
 
-                    // Fetch status
-                    match data.status(arguments.mailbox_name, &arguments.items).await {
-                        Ok(status) => {
-                            let mut buf = Vec::with_capacity(32);
-                            status.serialize(&mut buf, version.is_rev2());
-                            data.write_bytes(
-                                StatusResponse::completed(Command::Status)
-                                    .with_tag(arguments.tag)
-                                    .serialize(buf),
-                            )
-                            .await;
-                        }
-                        Err(mut response) => {
-                            response.tag = arguments.tag.into();
-                            data.write_bytes(response.into_bytes()).await;
-                        }
-                    }
-                });
-                Ok(())
-            }
-            Err(response) => self.write_bytes(response.into_bytes()).await,
-        }
+        spawn_op!(data, {
+            // Refresh mailboxes
+            data.synchronize_mailboxes(false)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?;
+
+            // Fetch status
+            let status = data
+                .status(arguments.mailbox_name, &arguments.items)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?;
+
+            trc::event!(
+                Imap(trc::ImapEvent::Status),
+                SpanId = data.session_id,
+                MailboxName = status.mailbox_name.clone(),
+                Details = arguments
+                    .items
+                    .iter()
+                    .map(|c| trc::Value::from(format!("{c:?}")))
+                    .collect::<Vec<_>>(),
+                Elapsed = op_start.elapsed()
+            );
+
+            let mut buf = Vec::with_capacity(32);
+            status.serialize(&mut buf, version.is_rev2());
+            data.write_bytes(
+                StatusResponse::completed(Command::Status)
+                    .with_tag(arguments.tag)
+                    .serialize(buf),
+            )
+            .await
+        })
     }
 }
 
 impl<T: SessionStream> SessionData<T> {
-    pub async fn status(
-        &self,
-        mailbox_name: String,
-        items: &[Status],
-    ) -> super::Result<StatusItem> {
+    pub async fn status(&self, mailbox_name: String, items: &[Status]) -> trc::Result<StatusItem> {
         // Get mailbox id
         let mailbox = if let Some(mailbox) = self.get_mailbox_by_name(&mailbox_name) {
             mailbox
         } else {
             // Some IMAP clients will try to get the status of a mailbox with the NoSelect flag
-            return if mailbox_name == self.jmap.core.imap.name_shared
+            return if mailbox_name == self.jmap.core.jmap.shared_folder
                 || mailbox_name
                     .split_once('/')
                     .map_or(false, |(base_name, path)| {
-                        base_name == self.jmap.core.imap.name_shared && !path.contains('/')
+                        base_name == self.jmap.core.jmap.shared_folder && !path.contains('/')
                     })
             {
                 Ok(StatusItem {
@@ -125,8 +113,10 @@ impl<T: SessionStream> SessionData<T> {
                         .collect(),
                 })
             } else {
-                Err(StatusResponse::no("Mailbox does not exist.")
-                    .with_code(ResponseCode::NonExistent))
+                Err(trc::ImapEvent::Error
+                    .into_err()
+                    .details("Mailbox does not exist.")
+                    .code(ResponseCode::NonExistent))
             };
         };
 
@@ -224,12 +214,14 @@ impl<T: SessionStream> SessionData<T> {
                     Property::MailboxIds,
                     mailbox.mailbox_id,
                 )
-                .await?
+                .await
+                .caused_by(trc::location!())?
                 .map(Arc::new);
             let message_ids = self
                 .jmap
                 .get_document_ids(mailbox.account_id, Collection::Email)
-                .await?;
+                .await
+                .caused_by(trc::location!())?;
 
             for item in items_update {
                 let result = match item {
@@ -247,16 +239,7 @@ impl<T: SessionStream> SessionData<T> {
                                 class: ValueClass::Property(Property::EmailIds.into()),
                             })
                             .await
-                            .map_err(|err| {
-                                tracing::debug!(event = "error",
-                                context = "store",
-                                account_id = mailbox.account_id,
-                                collection = ?Collection::Mailbox,
-                                mailbox_id = mailbox.mailbox_id,
-                                reason = ?err,
-                                "Failed to obtain uid next");
-                                StatusResponse::no("Mailbox unavailable.")
-                            })?
+                            .caused_by(trc::location!())?
                             + 1) as u64
                     }
                     Status::UidValidity => self
@@ -270,13 +253,13 @@ impl<T: SessionStream> SessionData<T> {
                         .await?
                         .and_then(|obj| obj.get(&Property::Cid).as_uint())
                         .ok_or_else(|| {
-                            tracing::debug!(event = "error",
-                                            context = "store",
-                                            account_id = mailbox.account_id,
-                                            collection = ?Collection::Mailbox,
-                                            mailbox_id = mailbox.mailbox_id,
-                                            "Failed to obtain uid validity");
-                            StatusResponse::no("Mailbox unavailable.")
+                            trc::StoreEvent::UnexpectedError
+                                .into_err()
+                                .details("Mailbox unavailable")
+                                .ctx(trc::Key::Reason, "Failed to obtain uid validity")
+                                .caused_by(trc::location!())
+                                .account_id(mailbox.account_id)
+                                .document_id(mailbox.mailbox_id)
                         })?,
                     Status::Unseen => {
                         if let (Some(message_ids), Some(mailbox_message_ids)) =
@@ -290,7 +273,8 @@ impl<T: SessionStream> SessionData<T> {
                                     Property::Keywords,
                                     Keyword::Seen,
                                 )
-                                .await?
+                                .await
+                                .caused_by(trc::location!())?
                             {
                                 seen ^= message_ids;
                                 seen &= mailbox_message_ids.as_ref();
@@ -312,7 +296,8 @@ impl<T: SessionStream> SessionData<T> {
                                     Property::Keywords,
                                     Keyword::Deleted,
                                 )
-                                .await?,
+                                .await
+                                .caused_by(trc::location!())?,
                         ) {
                             deleted &= mailbox_message_ids.as_ref();
                             deleted.len()
@@ -323,7 +308,8 @@ impl<T: SessionStream> SessionData<T> {
                     Status::Size => {
                         if let Some(mailbox_message_ids) = &mailbox_message_ids {
                             self.calculate_mailbox_size(mailbox.account_id, mailbox_message_ids)
-                                .await? as u64
+                                .await
+                                .caused_by(trc::location!())? as u64
                         } else {
                             0
                         }
@@ -386,7 +372,7 @@ impl<T: SessionStream> SessionData<T> {
         &self,
         account_id: u32,
         message_ids: &Arc<RoaringBitmap>,
-    ) -> super::Result<u32> {
+    ) -> trc::Result<u32> {
         let mut total_size = 0u32;
         self.jmap
             .core
@@ -413,9 +399,7 @@ impl<T: SessionStream> SessionData<T> {
 
                     if message_ids.contains(document_id) {
                         key.get(IndexKeyPrefix::len()..id_pos)
-                            .ok_or_else(|| {
-                                store::Error::InternalError("Invalid key length".to_string())
-                            })
+                            .ok_or_else(|| trc::Error::corrupted_key(key, None, trc::location!()))
                             .and_then(u32::deserialize)
                             .map(|size| {
                                 total_size += size;
@@ -425,14 +409,7 @@ impl<T: SessionStream> SessionData<T> {
                 },
             )
             .await
-            .map_err(|err| {
-                tracing::warn!(parent: &self.span,
-                               event = "error", 
-                               reason = ?err,
-                               "Failed to calculate mailbox size");
-                StatusResponse::database_failure()
-            })?;
-
-        Ok(total_size)
+            .caused_by(trc::location!())
+            .map(|_| total_size)
     }
 }

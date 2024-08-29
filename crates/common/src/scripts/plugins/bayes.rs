@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use nlp::{
     bayes::{
@@ -30,7 +13,7 @@ use nlp::{
 };
 use sieve::{runtime::Variable, FunctionMap};
 use store::{write::key::KeySerializer, LookupStore, U64_LEN};
-use tokio::runtime::Handle;
+use trc::AddContext;
 
 use super::PluginContext;
 
@@ -50,39 +33,32 @@ pub fn register_is_balanced(plugin_id: u32, fnc_map: &mut FunctionMap) {
     fnc_map.set_external_function("bayes_is_balanced", plugin_id, 3);
 }
 
-pub fn exec_train(ctx: PluginContext<'_>) -> Variable {
-    train(ctx, true)
+pub async fn exec_train(ctx: PluginContext<'_>) -> trc::Result<Variable> {
+    train(ctx, true).await
 }
 
-pub fn exec_untrain(ctx: PluginContext<'_>) -> Variable {
-    train(ctx, false)
+pub async fn exec_untrain(ctx: PluginContext<'_>) -> trc::Result<Variable> {
+    train(ctx, false).await
 }
 
-fn train(ctx: PluginContext<'_>, is_train: bool) -> Variable {
-    let span: &tracing::Span = ctx.span;
+async fn train(ctx: PluginContext<'_>, is_train: bool) -> trc::Result<Variable> {
     let store = match &ctx.arguments[0] {
         Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
         _ => Some(&ctx.core.storage.lookup),
-    };
+    }
+    .ok_or_else(|| {
+        trc::SieveEvent::RuntimeError
+            .ctx(trc::Key::Id, ctx.arguments[0].to_string().into_owned())
+            .details("Unknown store")
+    })?;
 
-    let store = if let Some(store) = store {
-        store
-    } else {
-        tracing::warn!(
-            parent: span,
-            context = "sieve:bayes_train",
-            event = "failed",
-            reason = "Unknown store id",
-            lookup_store = ctx.arguments[0].to_string().as_ref(),
-        );
-        return false.into();
-    };
     let text = ctx.arguments[1].to_string();
     let is_spam = ctx.arguments[2].to_bool();
     if text.is_empty() {
-        return false.into();
+        trc::bail!(trc::SpamEvent::TrainError
+            .into_err()
+            .reason("Empty message"));
     }
-    let handle = ctx.handle;
 
     // Train the model
     let mut model = BayesModel::default();
@@ -94,37 +70,35 @@ fn train(ctx: PluginContext<'_>, is_train: bool) -> Variable {
         is_spam,
     );
     if model.weights.is_empty() {
-        return false.into();
+        trc::bail!(trc::SpamEvent::TrainError
+            .into_err()
+            .reason("No weights found"));
     }
 
-    tracing::debug!(
-        parent: span,
-        context = "sieve:bayes_train",
-        event = "train",
-        is_spam = is_spam,
-        num_tokens = model.weights.len(),
+    trc::event!(
+        Spam(trc::SpamEvent::Train),
+        SpanId = ctx.session_id,
+        Details = is_spam,
+        Total = model.weights.len(),
     );
 
     // Update weight and invalidate cache
-    let bayes_cache = &ctx.core.sieve.bayes_cache;
+    let bayes_cache = &ctx.cache.bayes_cache;
     if is_train {
         for (hash, weights) in model.weights {
-            if handle
-                .block_on(
-                    store.counter_incr(
-                        KeySerializer::new(U64_LEN)
-                            .write(hash.h1)
-                            .write(hash.h2)
-                            .finalize(),
-                        weights.into(),
-                        None,
-                        false,
-                    ),
+            store
+                .counter_incr(
+                    KeySerializer::new(U64_LEN)
+                        .write(hash.h1)
+                        .write(hash.h2)
+                        .finalize(),
+                    weights.into(),
+                    None,
+                    false,
                 )
-                .is_err()
-            {
-                return false.into();
-            }
+                .await
+                .caused_by(trc::location!())?;
+
             bayes_cache.invalidate(&hash);
         }
 
@@ -134,53 +108,43 @@ fn train(ctx: PluginContext<'_>, is_train: bool) -> Variable {
         } else {
             Weights { spam: 0, ham: 1 }
         };
-        if handle
-            .block_on(
-                store.counter_incr(
-                    KeySerializer::new(U64_LEN)
-                        .write(0u64)
-                        .write(0u64)
-                        .finalize(),
-                    weights.into(),
-                    None,
-                    false,
-                ),
+        store
+            .counter_incr(
+                KeySerializer::new(U64_LEN)
+                    .write(0u64)
+                    .write(0u64)
+                    .finalize(),
+                weights.into(),
+                None,
+                false,
             )
-            .is_err()
-        {
-            return false.into();
-        }
+            .await
+            .caused_by(trc::location!())?;
     } else {
         //TODO: Implement untrain
-        return false.into();
+        return Ok(false.into());
     }
 
     bayes_cache.invalidate(&TokenHash::default());
 
-    true.into()
+    Ok(true.into())
 }
 
-pub fn exec_classify(ctx: PluginContext<'_>) -> Variable {
-    let span = ctx.span;
+pub async fn exec_classify(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let store = match &ctx.arguments[0] {
         Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
         _ => Some(&ctx.core.storage.lookup),
-    };
-    let store = if let Some(store) = store {
-        store
-    } else {
-        tracing::warn!(
-            parent: span,
-            context = "sieve:bayes_classify",
-            event = "failed",
-            reason = "Unknown store id",
-            lookup_id = ctx.arguments[0].to_string().as_ref(),
-        );
-        return Variable::default();
-    };
+    }
+    .ok_or_else(|| {
+        trc::SieveEvent::RuntimeError
+            .ctx(trc::Key::Id, ctx.arguments[0].to_string().into_owned())
+            .details("Unknown store")
+    })?;
     let text = ctx.arguments[1].to_string();
     if text.is_empty() {
-        return Variable::default();
+        trc::bail!(trc::SpamEvent::ClassifyError
+            .into_err()
+            .reason("Empty message"));
     }
 
     // Create classifier from defaults
@@ -200,58 +164,56 @@ pub fn exec_classify(ctx: PluginContext<'_>) -> Variable {
         }
     }
 
-    let handle = ctx.handle;
-
     // Obtain training counts
-    let bayes_cache = &ctx.core.sieve.bayes_cache;
-    let (spam_learns, ham_learns) =
-        if let Some(weights) = bayes_cache.get_or_update(TokenHash::default(), handle, store) {
-            (weights.spam, weights.ham)
-        } else {
-            tracing::warn!(
-                parent: span,
-                context = "sieve:classify",
-                event = "failed",
-                reason = "Failed to obtain training counts",
-            );
-            return Variable::default();
-        };
+    let bayes_cache = &ctx.cache.bayes_cache;
+    let (spam_learns, ham_learns) = bayes_cache
+        .get_or_update(TokenHash::default(), store)
+        .await
+        .map(|w| (w.spam, w.ham))?;
 
     // Make sure we have enough training data
     if spam_learns < classifier.min_learns || ham_learns < classifier.min_learns {
-        tracing::debug!(
-            parent: span,
-            context = "sieve:bayes_classify",
-            event = "skip-classify",
-            reason = "Not enough training data",
-            min_learns = classifier.min_learns,
-            spam_learns = %spam_learns,
-            ham_learns = %ham_learns);
-        return Variable::default();
+        trc::event!(
+            Spam(trc::SpamEvent::NotEnoughTrainingData),
+            SpanId = ctx.session_id,
+            Details = vec![
+                trc::Value::from(spam_learns),
+                trc::Value::from(ham_learns),
+                trc::Value::from(classifier.min_learns)
+            ],
+        );
+        return Ok(Variable::default());
     }
 
     // Classify the text
-    classifier
-        .classify(
-            OsbTokenizer::<_, TokenHash>::new(
-                BayesTokenizer::new(text.as_ref(), &ctx.core.smtp.resolvers.psl),
-                5,
-            )
-            .filter_map(|t| {
-                OsbToken {
-                    inner: bayes_cache.get_or_update(t.inner, handle, store)?,
-                    idx: t.idx,
-                }
-                .into()
-            }),
-            ham_learns,
-            spam_learns,
-        )
-        .map(Variable::from)
-        .unwrap_or_default()
+    let mut tokens = Vec::new();
+    for token in OsbTokenizer::<_, TokenHash>::new(
+        BayesTokenizer::new(text.as_ref(), &ctx.core.smtp.resolvers.psl),
+        5,
+    ) {
+        let weights = bayes_cache.get_or_update(token.inner, store).await?;
+        tokens.push(OsbToken {
+            inner: weights,
+            idx: token.idx,
+        });
+    }
+    let result = classifier.classify(tokens.into_iter(), ham_learns, spam_learns);
+
+    trc::event!(
+        Spam(trc::SpamEvent::Classify),
+        SpanId = ctx.session_id,
+        Details = vec![
+            trc::Value::from(spam_learns),
+            trc::Value::from(ham_learns),
+            trc::Value::from(classifier.min_learns)
+        ],
+        Result = result.unwrap_or_default()
+    );
+
+    Ok(result.map(Variable::from).unwrap_or_default())
 }
 
-pub fn exec_is_balanced(ctx: PluginContext<'_>) -> Variable {
+pub async fn exec_is_balanced(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let min_balance = match &ctx.arguments[2] {
         Variable::Float(n) => *n,
         Variable::Integer(n) => *n as f64,
@@ -259,43 +221,27 @@ pub fn exec_is_balanced(ctx: PluginContext<'_>) -> Variable {
     };
 
     if min_balance == 0.0 {
-        return true.into();
+        return Ok(true.into());
     }
 
-    let span = ctx.span;
     let store = match &ctx.arguments[0] {
         Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
         _ => Some(&ctx.core.storage.lookup),
-    };
-    let store = if let Some(store) = store {
-        store
-    } else {
-        tracing::warn!(
-            parent: span,
-            context = "sieve:bayes_is_balanced",
-            event = "failed",
-            reason = "Unknown store id",
-            lookup_id = ctx.arguments[0].to_string().as_ref(),
-        );
-        return Variable::default();
-    };
+    }
+    .ok_or_else(|| {
+        trc::SieveEvent::RuntimeError
+            .ctx(trc::Key::Id, ctx.arguments[0].to_string().into_owned())
+            .details("Unknown store")
+    })?;
+
     let learn_spam = ctx.arguments[1].to_bool();
 
     // Obtain training counts
-    let handle = ctx.handle;
-    let bayes_cache = &ctx.core.sieve.bayes_cache;
-    let (spam_learns, ham_learns) =
-        if let Some(weights) = bayes_cache.get_or_update(TokenHash::default(), handle, store) {
-            (weights.spam as f64, weights.ham as f64)
-        } else {
-            tracing::warn!(
-                parent: span,
-                context = "sieve:bayes_is_balanced",
-                event = "failed",
-                reason = "Failed to obtain training counts",
-            );
-            return Variable::default();
-        };
+    let bayes_cache = &ctx.cache.bayes_cache;
+    let (spam_learns, ham_learns) = bayes_cache
+        .get_or_update(TokenHash::default(), store)
+        .await
+        .map(|w| (w.spam as f64, w.ham as f64))?;
 
     let result = if spam_learns > 0.0 || ham_learns > 0.0 {
         if learn_spam {
@@ -307,57 +253,52 @@ pub fn exec_is_balanced(ctx: PluginContext<'_>) -> Variable {
         true
     };
 
-    tracing::debug!(
-        parent: span,
-        context = "sieve:bayes_is_balanced",
-        event = "result",
-        is_balanced = %result,
-        learn_spam = %learn_spam,
-        min_balance = %min_balance,
-        spam_learns = %spam_learns,
-        ham_learns = %ham_learns);
+    trc::event!(
+        Spam(trc::SpamEvent::TrainBalance),
+        SpanId = ctx.session_id,
+        Details = vec![
+            trc::Value::from(learn_spam),
+            trc::Value::from(min_balance),
+            trc::Value::from(spam_learns),
+            trc::Value::from(ham_learns),
+        ],
+        Result = result
+    );
 
-    result.into()
+    Ok(result.into())
 }
 
 trait LookupOrInsert {
-    fn get_or_update(
-        &self,
-        hash: TokenHash,
-        handle: &Handle,
-        get_token: &LookupStore,
-    ) -> Option<Weights>;
+    async fn get_or_update(&self, hash: TokenHash, get_token: &LookupStore)
+        -> trc::Result<Weights>;
 }
 
 impl LookupOrInsert for BayesTokenCache {
-    fn get_or_update(
+    async fn get_or_update(
         &self,
         hash: TokenHash,
-        handle: &Handle,
         get_token: &LookupStore,
-    ) -> Option<Weights> {
+    ) -> trc::Result<Weights> {
         if let Some(weights) = self.get(&hash) {
-            weights.unwrap_or_default().into()
-        } else if let Ok(num) = handle.block_on(
-            get_token.counter_get(
-                KeySerializer::new(U64_LEN)
-                    .write(hash.h1)
-                    .write(hash.h2)
-                    .finalize(),
-            ),
-        ) {
-            if num != 0 {
+            Ok(weights.unwrap_or_default())
+        } else {
+            let num = get_token
+                .counter_get(
+                    KeySerializer::new(U64_LEN)
+                        .write(hash.h1)
+                        .write(hash.h2)
+                        .finalize(),
+                )
+                .await
+                .caused_by(trc::location!())?;
+            Ok(if num != 0 {
                 let weights = Weights::from(num);
                 self.insert_positive(hash, weights);
                 weights
             } else {
                 self.insert_negative(hash);
                 Weights::default()
-            }
-            .into()
-        } else {
-            // Something went wrong
-            None
+            })
         }
     }
 }

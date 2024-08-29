@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::sync::Arc;
 
@@ -54,6 +37,14 @@ impl BlobHash {
 
     pub fn as_slice(&self) -> &[u8] {
         self.0.as_ref()
+    }
+
+    pub fn to_hex(&self) -> String {
+        let mut hex = String::with_capacity(BLOB_HASH_LEN * 2);
+        for byte in self.0.iter() {
+            hex.push_str(&format!("{:02x}", byte));
+        }
+        hex
     }
 }
 
@@ -108,7 +99,10 @@ impl<T> UnwrapFailure<T> for Option<T> {
         match self {
             Some(result) => result,
             None => {
-                tracing::error!("{message}");
+                trc::event!(
+                    Server(trc::ServerEvent::StartupError),
+                    Details = message.to_string()
+                );
                 eprintln!("{message}");
                 std::process::exit(1);
             }
@@ -121,7 +115,11 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
         match self {
             Ok(result) => result,
             Err(err) => {
-                tracing::error!("{message}: {err}");
+                trc::event!(
+                    Server(trc::ServerEvent::StartupError),
+                    Details = message.to_string(),
+                    Reason = err.to_string()
+                );
 
                 #[cfg(feature = "test_mode")]
                 panic!("{message}: {err}");
@@ -137,36 +135,44 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
 }
 
 pub fn failed(message: &str) -> ! {
-    tracing::error!("{message}");
+    trc::event!(
+        Server(trc::ServerEvent::StartupError),
+        Details = message.to_string(),
+    );
     eprintln!("{message}");
     std::process::exit(1);
 }
 
-pub async fn wait_for_shutdown(message: &str) {
+pub async fn wait_for_shutdown() {
     #[cfg(not(target_env = "msvc"))]
-    {
+    let signal = {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut h_term = signal(SignalKind::terminate()).failed("start signal handler");
         let mut h_int = signal(SignalKind::interrupt()).failed("start signal handler");
 
         tokio::select! {
-            _ = h_term.recv() => tracing::debug!("Received SIGTERM."),
-            _ = h_int.recv() => tracing::debug!("Received SIGINT."),
-        };
-    }
+            _ = h_term.recv() => "SIGTERM",
+            _ = h_int.recv() => "SIGINT",
+        }
+    };
 
     #[cfg(target_env = "msvc")]
-    {
+    let signal = {
         match tokio::signal::ctrl_c().await {
-            Ok(()) => {}
+            Ok(()) => "SIGINT",
             Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
+                trc::event!(
+                    Server(trc::ServerEvent::ThreadError),
+                    Details = "Unable to listen for shutdown signal",
+                    Reason = err.to_string(),
+                );
+                "Error"
             }
         }
-    }
+    };
 
-    tracing::info!(message);
+    trc::event!(Server(trc::ServerEvent::Shutdown), CausedBy = signal);
 }
 
 pub fn rustls_client_config(allow_invalid_certs: bool) -> ClientConfig {

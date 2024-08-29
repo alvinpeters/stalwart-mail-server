@@ -1,29 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use base64::{engine::general_purpose, Engine};
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{collection::Collection, property::Property, type_state::DataType, value::Value},
@@ -43,7 +25,7 @@ impl JMAP {
         &self,
         mut request: GetRequest<RequestArguments>,
         access_token: &AccessToken,
-    ) -> Result<GetResponse, MethodError> {
+    ) -> trc::Result<GetResponse> {
         let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
@@ -101,7 +83,7 @@ impl JMAP {
                         result.append(Property::Id, Value::Id(id));
                     }
                     Property::Url | Property::Keys | Property::Value => {
-                        return Err(MethodError::Forbidden(
+                        return Err(trc::JmapEvent::Forbidden.into_err().details(
                             "The 'url' and 'keys' properties are not readable".to_string(),
                         ));
                     }
@@ -116,7 +98,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn fetch_push_subscriptions(&self, account_id: u32) -> store::Result<state::Event> {
+    pub async fn fetch_push_subscriptions(&self, account_id: u32) -> trc::Result<state::Event> {
         let mut subscriptions = Vec::new();
         let document_ids = self
             .core
@@ -144,10 +126,10 @@ impl JMAP {
                 })
                 .await?
                 .ok_or_else(|| {
-                    store::Error::InternalError(format!(
-                        "Could not find push subscription {}",
-                        document_id
-                    ))
+                    trc::StoreEvent::NotFound
+                        .into_err()
+                        .caused_by(trc::location!())
+                        .document_id(document_id)
                 })?;
 
             let expires = subscription
@@ -155,10 +137,9 @@ impl JMAP {
                 .get(&Property::Expires)
                 .and_then(|p| p.as_date())
                 .ok_or_else(|| {
-                    store::Error::InternalError(format!(
-                        "Missing expires property for push subscription {}",
-                        document_id
-                    ))
+                    trc::StoreEvent::UnexpectedError
+                        .caused_by(trc::location!())
+                        .document_id(document_id)
                 })?
                 .timestamp() as u64;
             if expires > current_time {
@@ -192,20 +173,18 @@ impl JMAP {
                     .remove(&Property::Value)
                     .and_then(|p| p.try_unwrap_string())
                     .ok_or_else(|| {
-                        store::Error::InternalError(format!(
-                            "Missing verificationCode property for push subscription {}",
-                            document_id
-                        ))
+                        trc::StoreEvent::UnexpectedError
+                            .caused_by(trc::location!())
+                            .document_id(document_id)
                     })?;
                 let url = subscription
                     .properties
                     .remove(&Property::Url)
                     .and_then(|p| p.try_unwrap_string())
                     .ok_or_else(|| {
-                        store::Error::InternalError(format!(
-                            "Missing Url property for push subscription {}",
-                            document_id
-                        ))
+                        trc::StoreEvent::UnexpectedError
+                            .caused_by(trc::location!())
+                            .document_id(document_id)
                     })?;
 
                 if subscription

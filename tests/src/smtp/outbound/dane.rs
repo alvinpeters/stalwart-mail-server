@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     collections::BTreeSet,
@@ -99,13 +82,9 @@ return-path = false
 #[tokio::test]
 #[serial_test::serial]
 async fn dane_verify() {
-    /*let disable = 1;
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
+
 
     // Start test server
     let mut remote = TestServer::new("smtp_dane_remote", REMOTE, true).await;
@@ -366,15 +345,12 @@ async fn dane_test() {
             .unwrap()
             .unwrap();
 
-        assert_eq!(
-            tlsa.verify(&tracing::info_span!("test_span"), &host, Some(&certs)),
-            Ok(())
-        );
+        assert_eq!(tlsa.verify(0, &host, Some(&certs)), Ok(()));
 
         // Failed DANE verification
         certs.remove(0);
         assert_eq!(
-            tlsa.verify(&tracing::info_span!("test_span"), &host, Some(&certs)),
+            tlsa.verify(0, &host, Some(&certs)),
             Err(Status::PermanentFailure(Error::DaneError(ErrorDetails {
                 entity: host.to_string(),
                 details: "No matching certificates found in TLSA records".to_string()

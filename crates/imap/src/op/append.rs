@@ -1,27 +1,10 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use imap_proto::{
     protocol::{append::Arguments, select::HighestModSeq},
@@ -29,60 +12,48 @@ use imap_proto::{
     Command, ResponseCode, StatusResponse,
 };
 
-use crate::core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData};
+use crate::{
+    core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData},
+    spawn_op,
+};
 use common::listener::SessionStream;
-use jmap::email::ingest::IngestEmail;
+use jmap::email::ingest::{IngestEmail, IngestSource};
 use jmap_proto::types::{acl::Acl, keyword::Keyword, state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
 
-use super::ToModSeq;
+use super::{ImapContext, ToModSeq};
 
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_append(&mut self, request: Request<Command>) -> crate::OpResult {
-        match request.parse_append(self.version) {
-            Ok(arguments) => {
-                let (data, selected_mailbox) = self.state.session_mailbox_state();
+    pub async fn handle_append(&mut self, request: Request<Command>) -> trc::Result<()> {
+        let op_start = Instant::now();
+        let arguments = request.parse_append(self.version)?;
+        let (data, selected_mailbox) = self.state.session_mailbox_state();
 
-                // Refresh mailboxes
-                if let Err(err) = data.synchronize_mailboxes(false).await {
-                    return self
-                        .write_bytes(err.with_tag(arguments.tag).into_bytes())
-                        .await;
-                }
+        // Refresh mailboxes
+        data.synchronize_mailboxes(false)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
 
-                // Obtain mailbox
-                let mailbox =
-                    if let Some(mailbox) = data.get_mailbox_by_name(&arguments.mailbox_name) {
-                        mailbox
-                    } else {
-                        return self
-                            .write_bytes(
-                                StatusResponse::no("Mailbox does not exist.")
-                                    .with_tag(arguments.tag)
-                                    .with_code(ResponseCode::TryCreate)
-                                    .into_bytes(),
-                            )
-                            .await;
-                    };
-                let is_qresync = self.is_qresync;
+        // Obtain mailbox
+        let mailbox = if let Some(mailbox) = data.get_mailbox_by_name(&arguments.mailbox_name) {
+            mailbox
+        } else {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details("Mailbox does not exist.")
+                .code(ResponseCode::TryCreate)
+                .id(arguments.tag));
+        };
+        let is_qresync = self.is_qresync;
 
-                tokio::spawn(async move {
-                    data.write_bytes(
-                        match data
-                            .append_messages(arguments, selected_mailbox, mailbox, is_qresync)
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(response) => response,
-                        }
-                        .into_bytes(),
-                    )
-                    .await;
-                });
-                Ok(())
-            }
-            Err(response) => self.write_bytes(response.into_bytes()).await,
-        }
+        spawn_op!(data, {
+            let response = data
+                .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
+                .await?
+                .into_bytes();
+
+            data.write_bytes(response).await
+        })
     }
 }
 
@@ -93,27 +64,30 @@ impl<T: SessionStream> SessionData<T> {
         selected_mailbox: Option<Arc<SelectedMailbox>>,
         mailbox: MailboxId,
         is_qresync: bool,
-    ) -> crate::op::Result<StatusResponse> {
+        op_start: Instant,
+    ) -> trc::Result<StatusResponse> {
         // Verify ACLs
         let account_id = mailbox.account_id;
         let mailbox_id = mailbox.mailbox_id;
         if !self
             .check_mailbox_acl(account_id, mailbox_id, Acl::AddItems)
             .await
-            .map_err(|r| r.with_tag(&arguments.tag))?
+            .imap_ctx(&arguments.tag, trc::location!())?
         {
-            return Ok(StatusResponse::no(
-                "You do not have the required permissions to append messages to this mailbox.",
-            )
-            .with_tag(arguments.tag)
-            .with_code(ResponseCode::NoPerm));
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details(
+                    "You do not have the required permissions to append messages to this mailbox.",
+                )
+                .code(ResponseCode::NoPerm)
+                .id(arguments.tag));
         }
 
         // Obtain quota
         let account_quota = self
             .get_access_token()
             .await
-            .map_err(|r| r.with_tag(&arguments.tag))?
+            .imap_ctx(&arguments.tag, trc::location!())?
             .quota as i64;
 
         // Append messages
@@ -131,8 +105,9 @@ impl<T: SessionStream> SessionData<T> {
                     mailbox_ids: vec![mailbox_id],
                     keywords: message.flags.into_iter().map(Keyword::from).collect(),
                     received_at: message.received_at.map(|d| d as u64),
-                    skip_duplicates: false,
+                    source: IngestSource::Imap,
                     encrypt: self.jmap.core.jmap.encrypt && self.jmap.core.jmap.encrypt_append,
+                    session_id: self.session_id,
                 })
                 .await
             {
@@ -144,19 +119,15 @@ impl<T: SessionStream> SessionData<T> {
                     last_change_id = Some(email.change_id);
                 }
                 Err(err) => {
-                    match err {
-                        jmap::IngestError::Temporary => {
-                            response = StatusResponse::database_failure();
+                    return Err(
+                        if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) {
+                            err.details("Disk quota exceeded.")
+                                .code(ResponseCode::OverQuota)
+                        } else {
+                            err
                         }
-                        jmap::IngestError::OverQuota => {
-                            response = StatusResponse::no("Disk quota exceeded.")
-                                .with_code(ResponseCode::OverQuota);
-                        }
-                        jmap::IngestError::Permanent { reason, .. } => {
-                            response = StatusResponse::no(reason);
-                        }
-                    }
-                    break;
+                        .id(arguments.tag),
+                    );
                 }
             }
         }
@@ -173,6 +144,19 @@ impl<T: SessionStream> SessionData<T> {
                 .await;
         }
 
+        trc::event!(
+            Imap(trc::ImapEvent::Append),
+            SpanId = self.session_id,
+            MailboxName = arguments.mailbox_name.clone(),
+            AccountId = account_id,
+            MailboxId = mailbox_id,
+            DocumentId = created_ids
+                .iter()
+                .map(|r| trc::Value::from(r.id))
+                .collect::<Vec<_>>(),
+            Elapsed = op_start.elapsed()
+        );
+
         if !created_ids.is_empty() {
             let uids = created_ids.iter().map(|id| id.uid).collect();
             let uid_validity = match selected_mailbox {
@@ -182,7 +166,7 @@ impl<T: SessionStream> SessionData<T> {
                         self.write_bytes(
                             HighestModSeq::new(last_change_id.to_modseq()).into_bytes(),
                         )
-                        .await;
+                        .await?;
                     }
 
                     selected_mailbox.append_messages(created_ids, last_change_id)
@@ -190,7 +174,7 @@ impl<T: SessionStream> SessionData<T> {
                 _ => self
                     .get_uid_validity(&mailbox)
                     .await
-                    .map_err(|r| r.with_tag(&arguments.tag))?,
+                    .imap_ctx(&arguments.tag, trc::location!())?,
             };
 
             response = response.with_code(ResponseCode::AppendUid { uid_validity, uids });

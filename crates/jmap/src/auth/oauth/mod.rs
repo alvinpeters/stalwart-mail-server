@@ -1,35 +1,15 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::collections::HashMap;
 
-use hyper::{header::CONTENT_TYPE, StatusCode};
+use hyper::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{
-    http::{fetch_body, ToHttpResponse},
-    HtmlResponse, HttpRequest, HttpResponse,
-};
+use crate::api::{http::fetch_body, HttpRequest};
 
 pub mod auth;
 pub mod token;
@@ -222,13 +202,17 @@ pub struct FormData {
 }
 
 impl FormData {
-    pub async fn from_request(req: &mut HttpRequest, max_len: usize) -> Result<Self, HttpResponse> {
+    pub async fn from_request(
+        req: &mut HttpRequest,
+        max_len: usize,
+        session_id: u64,
+    ) -> trc::Result<Self> {
         match (
             req.headers()
                 .get(CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|val| val.parse::<mime::Mime>().ok()),
-            fetch_body(req, max_len).await,
+            fetch_body(req, max_len, session_id).await,
         ) {
             (Some(content_type), Some(body)) => {
                 let mut fields = HashMap::new();
@@ -246,11 +230,9 @@ impl FormData {
                 }
                 Ok(FormData { fields })
             }
-            _ => Err(HtmlResponse::with_status(
-                StatusCode::BAD_REQUEST,
-                "Invalid post request".to_string(),
-            )
-            .into_http_response()),
+            _ => Err(trc::ResourceEvent::BadParameters
+                .into_err()
+                .details("Invalid post request")),
         }
     }
 

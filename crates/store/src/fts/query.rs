@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     fmt::Display,
@@ -70,7 +53,7 @@ impl Store {
         account_id: u32,
         collection: impl Into<u8>,
         filters: Vec<FtsFilter<T>>,
-    ) -> crate::Result<RoaringBitmap> {
+    ) -> trc::Result<RoaringBitmap> {
         let collection = collection.into();
 
         // Tokenize text
@@ -288,7 +271,7 @@ impl Store {
         token_count: &AHashMap<BitmapHash, u32>,
         token_cache: &mut AHashMap<BitmapHash, AHashMap<u32, SerializedPostings<Vec<u8>>>>,
         is_intersect: bool,
-    ) -> crate::Result<Option<RoaringBitmap>> {
+    ) -> trc::Result<Option<RoaringBitmap>> {
         let mut result_bm = RoaringBitmap::new();
         let mut position_candidates = AHashMap::new();
         let num_tokens = tokens.len();

@@ -1,34 +1,14 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{collections::HashMap, sync::Arc};
 
 use common::listener::{stream::NullIo, ServerInstance};
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::set::{self, SetRequest, SetResponse},
     object::{
         email_submission::SetArguments,
@@ -73,7 +53,7 @@ impl JMAP {
         mut request: SetRequest<SetArguments>,
         instance: &Arc<ServerInstance>,
         next_call: &mut Option<Call<RequestMethod>>,
-    ) -> Result<SetResponse, MethodError> {
+    ) -> trc::Result<SetResponse> {
         let account_id = request.account_id.document_id();
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
         let will_destroy = request.unwrap_destroy();
@@ -312,7 +292,7 @@ impl JMAP {
         response: &SetResponse,
         instance: &Arc<ServerInstance>,
         object: Object<SetValue>,
-    ) -> Result<Result<Object<Value>, SetError>, MethodError> {
+    ) -> trc::Result<Result<Object<Value>, SetError>> {
         let mut submission = Object::with_capacity(object.properties.len());
         let mut email_id = u32::MAX;
         let mut identity_id = u32::MAX;

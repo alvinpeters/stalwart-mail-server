@@ -4,7 +4,6 @@ name: Build
 
 on:
   workflow_dispatch:
-  pull_request:
   push:
     tags: ["v*.*.*"]
 
@@ -24,6 +23,7 @@ jobs:
             use_cross: true
           - target: armv7-unknown-linux-gnueabihf
             host_os: ubuntu-20.04
+            env: "JEMALLOC_SYS_WITH_LG_PAGE=16"
             use_cross: true
           #- target: arm-unknown-linux-gnueabihf
           #  host_os: ubuntu-20.04
@@ -131,7 +131,7 @@ jobs:
           mkdir -p "${root}/target/${target}/release" && cd "$_"
 
           if [ "${USE_FOUNDATIONDB:-0}" = 1 ]; then
-            build -p mail-server --no-default-features --features "foundationdb elastic s3 redis"
+            build -p mail-server --no-default-features --features "foundationdb elastic s3 redis enterprise"
             artifact stalwart-mail stalwart-mail-foundationdb
           fi
 

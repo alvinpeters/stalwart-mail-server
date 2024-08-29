@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use jmap_proto::types::collection::Collection;
 use store::{
@@ -29,93 +12,85 @@ use store::{
     },
     Deserialize, IterateParams, Serialize, Store, ValueKey, U32_LEN,
 };
+use trc::AddContext;
 
-use crate::{DirectoryError, ManagementError, Principal, QueryBy, Type};
+use crate::{Principal, QueryBy, Type};
 
 use super::{
     lookup::DirectoryStore, PrincipalAction, PrincipalField, PrincipalIdType, PrincipalUpdate,
-    PrincipalValue,
+    PrincipalValue, SpecialSecrets,
 };
 
 #[allow(async_fn_in_trait)]
 pub trait ManageDirectory: Sized {
-    async fn get_account_id(&self, name: &str) -> crate::Result<Option<u32>>;
-    async fn get_or_create_account_id(&self, name: &str) -> crate::Result<u32>;
-    async fn get_account_name(&self, account_id: u32) -> crate::Result<Option<String>>;
-    async fn get_member_of(&self, account_id: u32) -> crate::Result<Vec<u32>>;
-    async fn get_members(&self, account_id: u32) -> crate::Result<Vec<u32>>;
+    async fn get_account_id(&self, name: &str) -> trc::Result<Option<u32>>;
+    async fn get_or_create_account_id(&self, name: &str) -> trc::Result<u32>;
+    async fn get_account_name(&self, account_id: u32) -> trc::Result<Option<String>>;
+    async fn get_member_of(&self, account_id: u32) -> trc::Result<Vec<u32>>;
+    async fn get_members(&self, account_id: u32) -> trc::Result<Vec<u32>>;
     async fn create_account(
         &self,
         principal: Principal<String>,
         members: Vec<String>,
-    ) -> crate::Result<u32>;
+    ) -> trc::Result<u32>;
     async fn update_account(
         &self,
         by: QueryBy<'_>,
         changes: Vec<PrincipalUpdate>,
-    ) -> crate::Result<()>;
-    async fn delete_account(&self, by: QueryBy<'_>) -> crate::Result<()>;
+    ) -> trc::Result<()>;
+    async fn delete_account(&self, by: QueryBy<'_>) -> trc::Result<()>;
     async fn list_accounts(
         &self,
         filter: Option<&str>,
         typ: Option<Type>,
-    ) -> crate::Result<Vec<String>>;
-    async fn map_group_ids(&self, principal: Principal<u32>) -> crate::Result<Principal<String>>;
+    ) -> trc::Result<Vec<String>>;
+    async fn map_group_ids(&self, principal: Principal<u32>) -> trc::Result<Principal<String>>;
     async fn map_principal(
         &self,
         principal: Principal<String>,
         create_if_missing: bool,
-    ) -> crate::Result<Principal<u32>>;
+    ) -> trc::Result<Principal<u32>>;
     async fn map_group_names(
         &self,
         members: Vec<String>,
         create_if_missing: bool,
-    ) -> crate::Result<Vec<u32>>;
-    async fn create_domain(&self, domain: &str) -> crate::Result<()>;
-    async fn delete_domain(&self, domain: &str) -> crate::Result<()>;
-    async fn list_domains(&self, filter: Option<&str>) -> crate::Result<Vec<String>>;
+    ) -> trc::Result<Vec<u32>>;
+    async fn create_domain(&self, domain: &str) -> trc::Result<()>;
+    async fn delete_domain(&self, domain: &str) -> trc::Result<()>;
+    async fn list_domains(&self, filter: Option<&str>) -> trc::Result<Vec<String>>;
 }
 
 impl ManageDirectory for Store {
-    async fn get_account_name(&self, account_id: u32) -> crate::Result<Option<String>> {
+    async fn get_account_name(&self, account_id: u32) -> trc::Result<Option<String>> {
         self.get_value::<Principal<u32>>(ValueKey::from(ValueClass::Directory(
             DirectoryClass::Principal(account_id),
         )))
         .await
-        .map_err(Into::into)
-        .map(|v| {
-            if let Some(v) = v {
-                Some(v.name)
-            } else {
-                tracing::debug!(
-                    context = "directory",
-                    event = "not_found",
-                    account = account_id,
-                    "Principal not found for account id"
-                );
-
-                None
-            }
-        })
+        .map(|v| if let Some(v) = v { Some(v.name) } else { None })
+        .caused_by(trc::location!())
     }
 
-    async fn get_account_id(&self, name: &str) -> crate::Result<Option<u32>> {
+    async fn get_account_id(&self, name: &str) -> trc::Result<Option<u32>> {
         self.get_value::<PrincipalIdType>(ValueKey::from(ValueClass::Directory(
             DirectoryClass::NameToId(name.as_bytes().to_vec()),
         )))
         .await
         .map(|v| v.map(|v| v.account_id))
-        .map_err(Into::into)
+        .caused_by(trc::location!())
     }
 
     // Used by all directories except internal
-    async fn get_or_create_account_id(&self, name: &str) -> crate::Result<u32> {
+    async fn get_or_create_account_id(&self, name: &str) -> trc::Result<u32> {
         let mut try_count = 0;
         let name = name.to_lowercase();
 
         loop {
             // Try to obtain ID
-            if let Some(account_id) = self.get_account_id(&name).await? {
+            if let Some(account_id) = self
+                .get_account_id(&name)
+                .await
+                .caused_by(trc::location!())?
+            {
                 return Ok(account_id);
             }
 
@@ -146,16 +121,13 @@ impl ManageDirectory for Store {
                 Ok(account_id) => {
                     return Ok(account_id);
                 }
-                Err(store::Error::AssertValueFailed) if try_count < 3 => {
-                    try_count += 1;
-                    continue;
-                }
                 Err(err) => {
-                    tracing::error!(event = "error",
-                                            context = "store",
-                                            error = ?err,
-                                            "Failed to generate account id");
-                    return Err(err.into());
+                    if err.is_assertion_failure() && try_count < 3 {
+                        try_count += 1;
+                        continue;
+                    } else {
+                        return Err(err.caused_by(trc::location!()));
+                    }
                 }
             }
         }
@@ -165,41 +137,46 @@ impl ManageDirectory for Store {
         &self,
         principal: Principal<String>,
         members: Vec<String>,
-    ) -> crate::Result<u32> {
+    ) -> trc::Result<u32> {
         // Make sure the principal has a name
         if principal.name.is_empty() {
-            return Err(DirectoryError::Management(ManagementError::MissingField(
-                PrincipalField::Name,
-            )));
+            return Err(err_missing(PrincipalField::Name));
         }
 
         // Map group names
-        let mut principal = self.map_principal(principal, false).await?;
-        let members = self.map_group_names(members, false).await?;
+        let mut principal = self
+            .map_principal(principal, false)
+            .await
+            .caused_by(trc::location!())?;
+        let members = self
+            .map_group_names(members, false)
+            .await
+            .caused_by(trc::location!())?;
 
         // Make sure new name is not taken
         principal.name = principal.name.to_lowercase();
-        if self.get_account_id(&principal.name).await?.is_some() {
-            return Err(DirectoryError::Management(ManagementError::AlreadyExists {
-                field: PrincipalField::Name,
-                value: principal.name,
-            }));
+        if self
+            .get_account_id(&principal.name)
+            .await
+            .caused_by(trc::location!())?
+            .is_some()
+        {
+            return Err(err_exists(PrincipalField::Name, principal.name));
         }
 
         // Make sure the e-mail is not taken and validate domain
         for email in principal.emails.iter_mut() {
             *email = email.to_lowercase();
-            if self.rcpt(email).await? {
-                return Err(DirectoryError::Management(ManagementError::AlreadyExists {
-                    field: PrincipalField::Emails,
-                    value: email.to_string(),
-                }));
+            if self.rcpt(email).await.caused_by(trc::location!())? {
+                return Err(err_exists(PrincipalField::Emails, email.to_string()));
             }
             if let Some(domain) = email.split('@').nth(1) {
-                if !self.is_local_domain(domain).await? {
-                    return Err(DirectoryError::Management(ManagementError::NotFound(
-                        domain.to_string(),
-                    )));
+                if !self
+                    .is_local_domain(domain)
+                    .await
+                    .caused_by(trc::location!())?
+                {
+                    return Err(not_found(domain.to_string()));
                 }
             }
         }
@@ -271,14 +248,15 @@ impl ManageDirectory for Store {
         self.write(batch.build())
             .await
             .and_then(|r| r.last_document_id())
-            .map_err(Into::into)
     }
 
-    async fn delete_account(&self, by: QueryBy<'_>) -> crate::Result<()> {
+    async fn delete_account(&self, by: QueryBy<'_>) -> trc::Result<()> {
         let account_id = match by {
-            QueryBy::Name(name) => self.get_account_id(name).await?.ok_or_else(|| {
-                DirectoryError::Management(ManagementError::NotFound(name.to_string()))
-            })?,
+            QueryBy::Name(name) => self
+                .get_account_id(name)
+                .await
+                .caused_by(trc::location!())?
+                .ok_or_else(|| not_found(name.to_string()))?,
             QueryBy::Id(account_id) => account_id,
             QueryBy::Credentials(_) => unreachable!(),
         };
@@ -287,19 +265,24 @@ impl ManageDirectory for Store {
             .get_value::<Principal<u32>>(ValueKey::from(ValueClass::Directory(
                 DirectoryClass::Principal(account_id),
             )))
-            .await?
-            .ok_or_else(|| {
-                DirectoryError::Management(ManagementError::NotFound(account_id.to_string()))
-            })?;
+            .await
+            .caused_by(trc::location!())?
+            .ok_or_else(|| not_found(account_id.to_string()))?;
 
         // Unlink all account's blobs
-        self.blob_hash_unlink_account(account_id).await?;
+        self.blob_hash_unlink_account(account_id)
+            .await
+            .caused_by(trc::location!())?;
 
         // Revoke ACLs
-        self.acl_revoke_all(account_id).await?;
+        self.acl_revoke_all(account_id)
+            .await
+            .caused_by(trc::location!())?;
 
         // Delete account data
-        self.purge_account(account_id).await?;
+        self.purge_account(account_id)
+            .await
+            .caused_by(trc::location!())?;
 
         // Delete account
         let mut batch = BatchBuilder::new();
@@ -315,7 +298,11 @@ impl ManageDirectory for Store {
             batch.clear(DirectoryClass::EmailToId(email.into_bytes()));
         }
 
-        for member_id in self.get_member_of(account_id).await? {
+        for member_id in self
+            .get_member_of(account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
             batch.clear(DirectoryClass::MemberOf {
                 principal_id: MaybeDynamicId::Static(account_id),
                 member_of: MaybeDynamicId::Static(member_id),
@@ -326,7 +313,11 @@ impl ManageDirectory for Store {
             });
         }
 
-        for member_id in self.get_members(account_id).await? {
+        for member_id in self
+            .get_members(account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
             batch.clear(DirectoryClass::MemberOf {
                 principal_id: MaybeDynamicId::Static(member_id),
                 member_of: MaybeDynamicId::Static(account_id),
@@ -337,7 +328,9 @@ impl ManageDirectory for Store {
             });
         }
 
-        self.write(batch.build()).await?;
+        self.write(batch.build())
+            .await
+            .caused_by(trc::location!())?;
 
         Ok(())
     }
@@ -346,11 +339,13 @@ impl ManageDirectory for Store {
         &self,
         by: QueryBy<'_>,
         changes: Vec<PrincipalUpdate>,
-    ) -> crate::Result<()> {
+    ) -> trc::Result<()> {
         let account_id = match by {
-            QueryBy::Name(name) => self.get_account_id(name).await?.ok_or_else(|| {
-                DirectoryError::Management(ManagementError::NotFound(name.to_string()))
-            })?,
+            QueryBy::Name(name) => self
+                .get_account_id(name)
+                .await
+                .caused_by(trc::location!())?
+                .ok_or_else(|| not_found(name.to_string()))?,
             QueryBy::Id(account_id) => account_id,
             QueryBy::Credentials(_) => unreachable!(),
         };
@@ -360,14 +355,19 @@ impl ManageDirectory for Store {
             .get_value::<HashedValue<Principal<u32>>>(ValueKey::from(ValueClass::Directory(
                 DirectoryClass::Principal(account_id),
             )))
-            .await?
-            .ok_or_else(|| {
-                DirectoryError::Management(ManagementError::NotFound(account_id.to_string()))
-            })?;
+            .await
+            .caused_by(trc::location!())?
+            .ok_or_else(|| not_found(account_id.to_string()))?;
 
         // Obtain members and memberOf
-        let mut member_of = self.get_member_of(account_id).await?;
-        let mut members = self.get_members(account_id).await?;
+        let mut member_of = self
+            .get_member_of(account_id)
+            .await
+            .caused_by(trc::location!())?;
+        let mut members = self
+            .get_members(account_id)
+            .await
+            .caused_by(trc::location!())?;
 
         // Apply changes
         let mut batch = BatchBuilder::new();
@@ -392,20 +392,20 @@ impl ManageDirectory for Store {
                     // Make sure new name is not taken
                     let new_name = new_name.to_lowercase();
                     if principal.inner.name != new_name {
-                        if self.get_account_id(&new_name).await?.is_some() {
-                            return Err(DirectoryError::Management(
-                                ManagementError::AlreadyExists {
-                                    field: PrincipalField::Name,
-                                    value: new_name,
-                                },
-                            ));
+                        if self
+                            .get_account_id(&new_name)
+                            .await
+                            .caused_by(trc::location!())?
+                            .is_some()
+                        {
+                            return Err(err_exists(PrincipalField::Name, new_name));
                         }
 
                         batch.clear(ValueClass::Directory(DirectoryClass::NameToId(
                             principal.inner.name.as_bytes().to_vec(),
                         )));
 
-                        principal.inner.name = new_name.clone();
+                        principal.inner.name.clone_from(&new_name);
 
                         batch.set(
                             ValueClass::Directory(DirectoryClass::NameToId(new_name.into_bytes())),
@@ -422,7 +422,7 @@ impl ManageDirectory for Store {
                             continue;
                         }
                     }
-                    return Err(DirectoryError::Unsupported);
+                    return Err(trc::ManageEvent::NotSupported.caused_by(trc::location!()));
                 }
                 (
                     PrincipalAction::Set,
@@ -430,6 +430,36 @@ impl ManageDirectory for Store {
                     PrincipalValue::StringList(secrets),
                 ) => {
                     principal.inner.secrets = secrets;
+                }
+                (
+                    PrincipalAction::AddItem,
+                    PrincipalField::Secrets,
+                    PrincipalValue::String(secret),
+                ) => {
+                    if !principal.inner.secrets.contains(&secret) {
+                        if secret.is_otp_auth() && !principal.inner.secrets.is_empty() {
+                            // Add OTP Auth URLs to the beginning of the list
+                            principal.inner.secrets.insert(0, secret);
+                        } else {
+                            principal.inner.secrets.push(secret);
+                        }
+                    }
+                }
+                (
+                    PrincipalAction::RemoveItem,
+                    PrincipalField::Secrets,
+                    PrincipalValue::String(secret),
+                ) => {
+                    if secret.is_app_password() || secret.is_otp_auth() {
+                        principal
+                            .inner
+                            .secrets
+                            .retain(|v| *v != secret && !v.starts_with(&secret));
+                    } else if !secret.is_empty() {
+                        principal.inner.secrets.retain(|v| *v != secret);
+                    } else {
+                        principal.inner.secrets.retain(|v| !v.is_password());
+                    }
                 }
                 (
                     PrincipalAction::Set,
@@ -459,19 +489,16 @@ impl ManageDirectory for Store {
                         .collect::<Vec<_>>();
                     for email in &emails {
                         if !principal.inner.emails.contains(email) {
-                            if self.rcpt(email).await? {
-                                return Err(DirectoryError::Management(
-                                    ManagementError::AlreadyExists {
-                                        field: PrincipalField::Emails,
-                                        value: email.to_string(),
-                                    },
-                                ));
+                            if self.rcpt(email).await.caused_by(trc::location!())? {
+                                return Err(err_exists(PrincipalField::Emails, email.to_string()));
                             }
                             if let Some(domain) = email.split('@').nth(1) {
-                                if !self.is_local_domain(domain).await? {
-                                    return Err(DirectoryError::Management(
-                                        ManagementError::NotFound(domain.to_string()),
-                                    ));
+                                if !self
+                                    .is_local_domain(domain)
+                                    .await
+                                    .caused_by(trc::location!())?
+                                {
+                                    return Err(not_found(domain.to_string()));
                                 }
                             }
                             batch.set(
@@ -500,19 +527,16 @@ impl ManageDirectory for Store {
                 ) => {
                     let email = email.to_lowercase();
                     if !principal.inner.emails.contains(&email) {
-                        if self.rcpt(&email).await? {
-                            return Err(DirectoryError::Management(
-                                ManagementError::AlreadyExists {
-                                    field: PrincipalField::Emails,
-                                    value: email,
-                                },
-                            ));
+                        if self.rcpt(&email).await.caused_by(trc::location!())? {
+                            return Err(err_exists(PrincipalField::Emails, email));
                         }
                         if let Some(domain) = email.split('@').nth(1) {
-                            if !self.is_local_domain(domain).await? {
-                                return Err(DirectoryError::Management(ManagementError::NotFound(
-                                    domain.to_string(),
-                                )));
+                            if !self
+                                .is_local_domain(domain)
+                                .await
+                                .caused_by(trc::location!())?
+                            {
+                                return Err(not_found(domain.to_string()));
                             }
                         }
                         batch.set(
@@ -546,9 +570,11 @@ impl ManageDirectory for Store {
                 ) => {
                     let mut new_member_of = Vec::new();
                     for member in members {
-                        let member_id = self.get_account_id(&member).await?.ok_or_else(|| {
-                            DirectoryError::Management(ManagementError::NotFound(member))
-                        })?;
+                        let member_id = self
+                            .get_account_id(&member)
+                            .await
+                            .caused_by(trc::location!())?
+                            .ok_or_else(|| not_found(member))?;
                         if !member_of.contains(&member_id) {
                             batch.set(
                                 ValueClass::Directory(DirectoryClass::MemberOf {
@@ -589,9 +615,11 @@ impl ManageDirectory for Store {
                     PrincipalField::MemberOf,
                     PrincipalValue::String(member),
                 ) => {
-                    let member_id = self.get_account_id(&member).await?.ok_or_else(|| {
-                        DirectoryError::Management(ManagementError::NotFound(member))
-                    })?;
+                    let member_id = self
+                        .get_account_id(&member)
+                        .await
+                        .caused_by(trc::location!())?
+                        .ok_or_else(|| not_found(member))?;
                     if !member_of.contains(&member_id) {
                         batch.set(
                             ValueClass::Directory(DirectoryClass::MemberOf {
@@ -615,7 +643,11 @@ impl ManageDirectory for Store {
                     PrincipalField::MemberOf,
                     PrincipalValue::String(member),
                 ) => {
-                    if let Some(member_id) = self.get_account_id(&member).await? {
+                    if let Some(member_id) = self
+                        .get_account_id(&member)
+                        .await
+                        .caused_by(trc::location!())?
+                    {
                         if let Some(pos) = member_of.iter().position(|v| *v == member_id) {
                             batch.clear(ValueClass::Directory(DirectoryClass::MemberOf {
                                 principal_id: MaybeDynamicId::Static(account_id),
@@ -637,9 +669,11 @@ impl ManageDirectory for Store {
                 ) => {
                     let mut new_members = Vec::new();
                     for member in members_ {
-                        let member_id = self.get_account_id(&member).await?.ok_or_else(|| {
-                            DirectoryError::Management(ManagementError::NotFound(member))
-                        })?;
+                        let member_id = self
+                            .get_account_id(&member)
+                            .await
+                            .caused_by(trc::location!())?
+                            .ok_or_else(|| not_found(member))?;
                         if !members.contains(&member_id) {
                             batch.set(
                                 ValueClass::Directory(DirectoryClass::MemberOf {
@@ -680,9 +714,11 @@ impl ManageDirectory for Store {
                     PrincipalField::Members,
                     PrincipalValue::String(member),
                 ) => {
-                    let member_id = self.get_account_id(&member).await?.ok_or_else(|| {
-                        DirectoryError::Management(ManagementError::NotFound(member))
-                    })?;
+                    let member_id = self
+                        .get_account_id(&member)
+                        .await
+                        .caused_by(trc::location!())?
+                        .ok_or_else(|| not_found(member))?;
                     if !members.contains(&member_id) {
                         batch.set(
                             ValueClass::Directory(DirectoryClass::MemberOf {
@@ -706,7 +742,11 @@ impl ManageDirectory for Store {
                     PrincipalField::Members,
                     PrincipalValue::String(member),
                 ) => {
-                    if let Some(member_id) = self.get_account_id(&member).await? {
+                    if let Some(member_id) = self
+                        .get_account_id(&member)
+                        .await
+                        .caused_by(trc::location!())?
+                    {
                         if let Some(pos) = members.iter().position(|v| *v == member_id) {
                             batch.clear(ValueClass::Directory(DirectoryClass::MemberOf {
                                 principal_id: MaybeDynamicId::Static(member_id),
@@ -722,7 +762,7 @@ impl ManageDirectory for Store {
                 }
 
                 _ => {
-                    return Err(DirectoryError::Unsupported);
+                    return Err(trc::StoreEvent::NotSupported.caused_by(trc::location!()));
                 }
             }
         }
@@ -736,45 +776,37 @@ impl ManageDirectory for Store {
             );
         }
 
-        self.write(batch.build()).await?;
+        self.write(batch.build())
+            .await
+            .caused_by(trc::location!())?;
 
         Ok(())
     }
 
-    async fn create_domain(&self, domain: &str) -> crate::Result<()> {
+    async fn create_domain(&self, domain: &str) -> trc::Result<()> {
         if !domain.contains('.') {
-            return Err(DirectoryError::Management(ManagementError::MissingField(
-                PrincipalField::Name,
-            )));
+            return Err(err_missing(PrincipalField::Name));
         }
         let mut batch = BatchBuilder::new();
         batch.set(
             ValueClass::Directory(DirectoryClass::Domain(domain.to_lowercase().into_bytes())),
             vec![],
         );
-        self.write(batch.build())
-            .await
-            .map_err(Into::into)
-            .map(|_| ())
+        self.write(batch.build()).await.map(|_| ())
     }
 
-    async fn delete_domain(&self, domain: &str) -> crate::Result<()> {
+    async fn delete_domain(&self, domain: &str) -> trc::Result<()> {
         if !domain.contains('.') {
-            return Err(DirectoryError::Management(ManagementError::MissingField(
-                PrincipalField::Name,
-            )));
+            return Err(err_missing(PrincipalField::Name));
         }
         let mut batch = BatchBuilder::new();
         batch.clear(ValueClass::Directory(DirectoryClass::Domain(
             domain.to_lowercase().into_bytes(),
         )));
-        self.write(batch.build())
-            .await
-            .map_err(Into::into)
-            .map(|_| ())
+        self.write(batch.build()).await.map(|_| ())
     }
 
-    async fn map_group_ids(&self, principal: Principal<u32>) -> crate::Result<Principal<String>> {
+    async fn map_group_ids(&self, principal: Principal<u32>) -> trc::Result<Principal<String>> {
         let mut mapped = Principal {
             id: principal.id,
             typ: principal.typ,
@@ -787,7 +819,11 @@ impl ManageDirectory for Store {
         };
 
         for account_id in principal.member_of {
-            if let Some(name) = self.get_account_name(account_id).await? {
+            if let Some(name) = self
+                .get_account_name(account_id)
+                .await
+                .caused_by(trc::location!())?
+            {
                 mapped.member_of.push(name);
             }
         }
@@ -799,7 +835,7 @@ impl ManageDirectory for Store {
         &self,
         principal: Principal<String>,
         create_if_missing: bool,
-    ) -> crate::Result<Principal<u32>> {
+    ) -> trc::Result<Principal<u32>> {
         Ok(Principal {
             id: principal.id,
             typ: principal.typ,
@@ -809,7 +845,8 @@ impl ManageDirectory for Store {
             emails: principal.emails,
             member_of: self
                 .map_group_names(principal.member_of, create_if_missing)
-                .await?,
+                .await
+                .caused_by(trc::location!())?,
             description: principal.description,
         })
     }
@@ -818,16 +855,19 @@ impl ManageDirectory for Store {
         &self,
         members: Vec<String>,
         create_if_missing: bool,
-    ) -> crate::Result<Vec<u32>> {
+    ) -> trc::Result<Vec<u32>> {
         let mut member_ids = Vec::with_capacity(members.len());
 
         for member in members {
             let account_id = if create_if_missing {
-                self.get_or_create_account_id(&member).await?
+                self.get_or_create_account_id(&member)
+                    .await
+                    .caused_by(trc::location!())?
             } else {
                 self.get_account_id(&member)
-                    .await?
-                    .ok_or_else(|| DirectoryError::Management(ManagementError::NotFound(member)))?
+                    .await
+                    .caused_by(trc::location!())?
+                    .ok_or_else(|| not_found(member))?
             };
             member_ids.push(account_id);
         }
@@ -839,7 +879,7 @@ impl ManageDirectory for Store {
         &self,
         filter: Option<&str>,
         typ: Option<Type>,
-    ) -> crate::Result<Vec<String>> {
+    ) -> trc::Result<Vec<String>> {
         let from_key = ValueKey::from(ValueClass::Directory(DirectoryClass::NameToId(vec![])));
         let to_key = ValueKey::from(ValueClass::Directory(DirectoryClass::NameToId(vec![
             u8::MAX;
@@ -850,7 +890,7 @@ impl ManageDirectory for Store {
         self.iterate(
             IterateParams::new(from_key, to_key).ascending(),
             |key, value| {
-                let pt = PrincipalIdType::deserialize(value)?;
+                let pt = PrincipalIdType::deserialize(value).caused_by(trc::location!())?;
 
                 if typ.map_or(true, |t| pt.typ == t) {
                     results.push((
@@ -862,7 +902,8 @@ impl ManageDirectory for Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         if let Some(filter) = filter {
             let mut filtered = Vec::new();
@@ -876,12 +917,9 @@ impl ManageDirectory for Store {
                     .get_value::<Principal<u32>>(ValueKey::from(ValueClass::Directory(
                         DirectoryClass::Principal(account_id),
                     )))
-                    .await?
-                    .ok_or_else(|| {
-                        DirectoryError::Management(ManagementError::NotFound(
-                            account_id.to_string(),
-                        ))
-                    })?;
+                    .await
+                    .caused_by(trc::location!())?
+                    .ok_or_else(|| not_found(account_id.to_string()))?;
                 if filters.iter().all(|f| {
                     principal.name.to_lowercase().contains(f)
                         || principal
@@ -903,7 +941,7 @@ impl ManageDirectory for Store {
         }
     }
 
-    async fn list_domains(&self, filter: Option<&str>) -> crate::Result<Vec<String>> {
+    async fn list_domains(&self, filter: Option<&str>) -> trc::Result<Vec<String>> {
         let from_key = ValueKey::from(ValueClass::Directory(DirectoryClass::Domain(vec![])));
         let to_key = ValueKey::from(ValueClass::Directory(DirectoryClass::Domain(vec![
             u8::MAX;
@@ -921,12 +959,13 @@ impl ManageDirectory for Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         Ok(results)
     }
 
-    async fn get_member_of(&self, account_id: u32) -> crate::Result<Vec<u32>> {
+    async fn get_member_of(&self, account_id: u32) -> trc::Result<Vec<u32>> {
         let from_key = ValueKey::from(ValueClass::Directory(DirectoryClass::MemberOf {
             principal_id: account_id,
             member_of: 0,
@@ -943,11 +982,12 @@ impl ManageDirectory for Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
         Ok(results)
     }
 
-    async fn get_members(&self, account_id: u32) -> crate::Result<Vec<u32>> {
+    async fn get_members(&self, account_id: u32) -> trc::Result<Vec<u32>> {
         let from_key = ValueKey::from(ValueClass::Directory(DirectoryClass::Members {
             principal_id: account_id,
             has_member: 0,
@@ -964,15 +1004,16 @@ impl ManageDirectory for Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
         Ok(results)
     }
 }
 
 impl SerializeWithId for Principal<u32> {
-    fn serialize_with_id(&self, ids: &AssignedIds) -> store::Result<Vec<u8>> {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>> {
         let mut principal = self.clone();
-        principal.id = ids.last_document_id()?;
+        principal.id = ids.last_document_id().caused_by(trc::location!())?;
         Ok(principal.serialize())
     }
 }
@@ -987,7 +1028,7 @@ impl From<Principal<u32>> for MaybeDynamicValue {
 struct DynamicPrincipalIdType(Type);
 
 impl SerializeWithId for DynamicPrincipalIdType {
-    fn serialize_with_id(&self, ids: &AssignedIds) -> store::Result<Vec<u8>> {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>> {
         ids.last_document_id()
             .map(|account_id| PrincipalIdType::new(account_id, self.0).serialize())
     }
@@ -1011,5 +1052,39 @@ impl From<Principal<String>> for Principal<u32> {
             member_of: Vec::with_capacity(0),
             description: principal.description,
         }
+    }
+}
+
+pub fn err_missing(field: impl Into<trc::Value>) -> trc::Error {
+    trc::ManageEvent::MissingParameter.ctx(trc::Key::Key, field)
+}
+
+pub fn err_exists(field: impl Into<trc::Value>, value: impl Into<trc::Value>) -> trc::Error {
+    trc::ManageEvent::AlreadyExists
+        .ctx(trc::Key::Key, field)
+        .ctx(trc::Key::Value, value)
+}
+
+pub fn not_found(value: impl Into<trc::Value>) -> trc::Error {
+    trc::ManageEvent::NotFound.ctx(trc::Key::Key, value)
+}
+
+pub fn unsupported(details: impl Into<trc::Value>) -> trc::Error {
+    trc::ManageEvent::NotSupported.ctx(trc::Key::Details, details)
+}
+
+pub fn enterprise() -> trc::Error {
+    trc::ManageEvent::NotSupported.ctx(trc::Key::Details, "Enterprise feature")
+}
+
+pub fn error(details: impl Into<trc::Value>, reason: Option<impl Into<trc::Value>>) -> trc::Error {
+    trc::ManageEvent::Error
+        .ctx(trc::Key::Details, details)
+        .ctx_opt(trc::Key::Reason, reason)
+}
+
+impl From<PrincipalField> for trc::Value {
+    fn from(value: PrincipalField) -> Self {
+        trc::Value::Static(value.as_str())
     }
 }

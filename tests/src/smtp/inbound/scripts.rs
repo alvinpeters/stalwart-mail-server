@@ -1,34 +1,21 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use core::panic;
 use std::{fmt::Write, fs, path::PathBuf};
 
-use crate::smtp::{
-    build_smtp,
-    inbound::{sign::SIGNATURES, TestMessage, TestQueueEvent},
-    session::{TestSession, VerifyResponse},
-    TempDir, TestSMTP,
+use crate::{
+    enable_logging,
+    smtp::{
+        build_smtp,
+        inbound::{sign::SIGNATURES, TestMessage, TestQueueEvent},
+        session::{TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
 use common::Core;
 
@@ -37,7 +24,6 @@ use smtp::{
     scripts::ScriptResult,
 };
 use store::Stores;
-use tokio::runtime::Handle;
 use utils::config::Config;
 
 const CONFIG: &str = r#"
@@ -46,6 +32,7 @@ data = "sql"
 lookup = "sql"
 blob = "sql"
 fts = "sql"
+directory = "local"
 
 [store."sql"]
 type = "sqlite"
@@ -102,17 +89,24 @@ message-id = true
 date = true
 return-path = false
 
+[directory."local"]
+type = "memory"
+
+[[directory."local".principals]]
+name = "john"
+description = "John Doe"
+secret = "secret"
+email = ["john@localdomain.org", "jdoe@localdomain.org", "john.doe@localdomain.org"]
+email-list = ["info@localdomain.org"]
+member-of = ["sales"]
+
+
 "#;
 
 #[tokio::test]
 async fn sieve_scripts() {
-    /*let disable = 1;
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    enable_logging();
 
     // Add test scripts
     let mut config = CONFIG.to_string() + SIGNATURES;
@@ -162,6 +156,7 @@ async fn sieve_scripts() {
     let stores = Stores::parse_all(&mut config).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
     let mut qr = inner.init_test_queue(&core);
+    config.assert_no_errors();
 
     // Build session
     let core = build_smtp(core, inner);
@@ -171,7 +166,6 @@ async fn sieve_scripts() {
     assert!(!session.init_conn().await);
 
     // Run tests
-    let span = tracing::info_span!("sieve_scripts");
     for (name, script) in &core.core.sieve.scripts {
         if name.starts_with("stage_") || name.ends_with("_include") {
             continue;
@@ -180,16 +174,10 @@ async fn sieve_scripts() {
         let params = session
             .build_script_parameters("data")
             .set_variable("from", "john.doe@example.org")
-            .with_envelope(&core.core, &session)
+            .with_envelope(&core.core, &session, 0)
             .await;
-        let handle = Handle::current();
-        let span = span.clone();
         let core_ = core.clone();
-        match core
-            .spawn_worker(move || core_.run_script_blocking(script, params, handle, span))
-            .await
-            .unwrap()
-        {
+        match core_.run_script(name.to_string(), script, params, 0).await {
             ScriptResult::Accept { .. } => (),
             ScriptResult::Reject(message) => panic!("{}", message),
             err => {
@@ -275,7 +263,7 @@ async fn sieve_scripts() {
     qr.read_event().await.assert_reload();
     let messages = qr.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
-    let mut messages = messages.into_iter().rev();
+    let mut messages = messages.into_iter();
     let notification = messages.next().unwrap();
     assert_eq!(notification.return_path, "");
     assert_eq!(notification.recipients.len(), 2);
@@ -322,7 +310,7 @@ async fn sieve_scripts() {
     qr.read_event().await.assert_reload();
     let messages = qr.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
-    let mut messages = messages.into_iter().rev();
+    let mut messages = messages.into_iter();
 
     messages
         .next()
@@ -370,6 +358,7 @@ async fn sieve_scripts() {
         .assert_contains("To: Suzie Q <suzie@shopping.example.net>")
         .assert_contains("Subject: Is dinner ready?")
         .assert_contains("Message-ID: <20030712040037.46341.5F8J@football.example.com>")
+        .assert_contains("Received: ")
         .assert_not_contains("From: Joe SixPack <joe@football.example.com>");
     qr.assert_no_events();
 
@@ -397,7 +386,9 @@ async fn sieve_scripts() {
         .assert_contains("To: Suzie Q <suzie@shopping.example.net>")
         .assert_contains("Subject: Is dinner ready?")
         .assert_contains("Message-ID: <20030712040037.46341.5F8J@football.example.com>")
-        .assert_contains("From: Joe SixPack <joe@football.example.com>");
+        .assert_contains("From: Joe SixPack <joe@football.example.com>")
+        .assert_contains("Received: ")
+        .assert_contains("Authentication-Results: ");
     qr.assert_no_events();
 
     // Test pipes

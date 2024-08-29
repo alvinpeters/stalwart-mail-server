@@ -1,39 +1,18 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{borrow::Cow, collections::HashMap, slice::IterMut};
 
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::set::{RequestArguments, SetRequest, SetResponse},
     response::references::EvalObjectReferences,
     types::{
         acl::Acl,
         collection::Collection,
-        id::Id,
         keyword::Keyword,
         property::Property,
         state::{State, StateChange},
@@ -52,22 +31,20 @@ use mail_builder::{
 use mail_parser::MessageParser;
 use store::{
     ahash::AHashSet,
+    roaring::RoaringBitmap,
     write::{
-        assert::HashedValue, log::ChangeLogBuilder, BatchBuilder, Bincode, DeserializeFrom,
-        FtsQueueClass, SerializeInto, ToBitmaps, ValueClass, F_BITMAP, F_CLEAR, F_VALUE,
+        assert::HashedValue, log::ChangeLogBuilder, BatchBuilder, DeserializeFrom, SerializeInto,
+        ToBitmaps, ValueClass, F_BITMAP, F_CLEAR, F_VALUE,
     },
     Serialize,
 };
+use trc::AddContext;
 
-use crate::{
-    auth::AccessToken, mailbox::UidMailbox, services::housekeeper::Event, IngestError, JMAP,
-};
+use crate::{api::http::HttpSessionData, auth::AccessToken, mailbox::UidMailbox, JMAP};
 
 use super::{
     headers::{BuildHeader, ValueToHeader},
-    index::EmailIndexBuilder,
-    ingest::IngestEmail,
-    metadata::MessageMetadata,
+    ingest::{IngestEmail, IngestSource},
 };
 
 impl JMAP {
@@ -75,7 +52,8 @@ impl JMAP {
         &self,
         mut request: SetRequest<RequestArguments>,
         access_token: &AccessToken,
-    ) -> Result<SetResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> trc::Result<SetResponse> {
         // Prepare response
         let account_id = request.account_id.document_id();
         let mut response = self
@@ -741,22 +719,23 @@ impl JMAP {
                     mailbox_ids: mailboxes,
                     keywords,
                     received_at,
-                    skip_duplicates: false,
+                    source: IngestSource::Jmap,
                     encrypt: self.core.jmap.encrypt && self.core.jmap.encrypt_append,
+                    session_id: session.session_id,
                 })
                 .await
             {
                 Ok(message) => {
                     response.created.insert(id, message.into());
                 }
-                Err(IngestError::OverQuota) => {
+                Err(err) if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) => {
                     response.not_created.append(
                         id,
                         SetError::new(SetErrorType::OverQuota)
                             .with_description("You have exceeded your disk quota."),
                     );
                 }
-                Err(_) => return Err(MethodError::ServerPartialFail),
+                Err(err) => return Err(err),
             }
         }
 
@@ -965,14 +944,7 @@ impl JMAP {
                         uid_mailbox.uid = self
                             .assign_imap_uid(account_id, uid_mailbox.mailbox_id)
                             .await
-                            .map_err(|err| {
-                                tracing::error!(
-                                    event = "error",
-                                    context = "email_copy",
-                                    error = ?err,
-                                    "Failed to assign IMAP UID.");
-                                MethodError::ServerPartialFail
-                            })?;
+                            .caused_by(trc::location!())?;
                     }
                 }
 
@@ -992,7 +964,7 @@ impl JMAP {
                         // Add to updated list
                         response.updated.append(id, None);
                     }
-                    Err(store::Error::AssertValueFailed) => {
+                    Err(err) if err.is_assertion_failure() => {
                         response.not_updated.append(
                             id,
                             SetError::forbidden().with_description(
@@ -1001,12 +973,7 @@ impl JMAP {
                         );
                     }
                     Err(err) => {
-                        tracing::error!(
-                            event = "error",
-                            context = "email_set",
-                            error = ?err,
-                            "Failed to write message changes to database.");
-                        return Err(MethodError::ServerPartialFail);
+                        return Err(err.caused_by(trc::location!()));
                     }
                 }
             }
@@ -1025,21 +992,15 @@ impl JMAP {
             } else {
                 None
             };
+            let mut destroy_ids = RoaringBitmap::new();
             for destroy_id in will_destroy {
                 let document_id = destroy_id.document_id();
 
                 if email_ids.contains(document_id) {
                     if !matches!(&can_destroy_message_ids, Some(ids) if !ids.contains(document_id))
                     {
-                        match self.email_delete(account_id, document_id).await? {
-                            Ok(change) => {
-                                changes.merge(change);
-                                response.destroyed.push(destroy_id);
-                            }
-                            Err(err) => {
-                                response.not_destroyed.append(destroy_id, err);
-                            }
-                        }
+                        destroy_ids.insert(document_id);
+                        response.destroyed.push(destroy_id);
                     } else {
                         response.not_destroyed.append(
                             destroy_id,
@@ -1051,6 +1012,32 @@ impl JMAP {
                     response
                         .not_destroyed
                         .append(destroy_id, SetError::not_found());
+                }
+            }
+
+            if !destroy_ids.is_empty() {
+                // Batch delete (tombstone) messages
+                let (change, not_destroyed) =
+                    self.emails_tombstone(account_id, destroy_ids).await?;
+
+                // Merge changes
+                changes.merge(change);
+
+                // Mark messages that were not found as not destroyed (this should not occur in practice)
+                if !not_destroyed.is_empty() {
+                    let mut destroyed = Vec::with_capacity(response.destroyed.len());
+
+                    for destroy_id in response.destroyed {
+                        if not_destroyed.contains(destroy_id.document_id()) {
+                            response
+                                .not_destroyed
+                                .append(destroy_id, SetError::not_found());
+                        } else {
+                            destroyed.push(destroy_id);
+                        }
+                    }
+
+                    response.destroyed = destroyed;
                 }
             }
         }
@@ -1075,198 +1062,7 @@ impl JMAP {
 
         Ok(response)
     }
-
-    pub async fn email_delete(
-        &self,
-        account_id: u32,
-        document_id: u32,
-    ) -> Result<Result<ChangeLogBuilder, SetError>, MethodError> {
-        // Create batch
-        let mut batch = BatchBuilder::new();
-        let mut changes = ChangeLogBuilder::with_change_id(0);
-
-        // Delete document
-        batch
-            .with_account_id(account_id)
-            .with_collection(Collection::Email)
-            .delete_document(document_id)
-            .set(
-                ValueClass::FtsQueue(FtsQueueClass::Delete {
-                    seq: self.generate_snowflake_id()?,
-                }),
-                0u64.serialize(),
-            );
-
-        // Remove last changeId
-        batch.value(Property::Cid, (), F_VALUE | F_CLEAR);
-
-        // Remove mailboxes
-        let mailboxes = if let Some(mailboxes) = self
-            .get_property::<HashedValue<Vec<UidMailbox>>>(
-                account_id,
-                Collection::Email,
-                document_id,
-                Property::MailboxIds,
-            )
-            .await?
-        {
-            mailboxes
-        } else {
-            tracing::debug!(
-                event = "error",
-                context = "email_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Failed to fetch mailboxIds.",
-            );
-            return Ok(Err(SetError::not_found()));
-        };
-        for mailbox_id in &mailboxes.inner {
-            debug_assert!(mailbox_id.uid != 0);
-            changes.log_child_update(Collection::Mailbox, mailbox_id.mailbox_id);
-        }
-        batch.assert_value(Property::MailboxIds, &mailboxes).value(
-            Property::MailboxIds,
-            mailboxes.inner,
-            F_VALUE | F_BITMAP | F_CLEAR,
-        );
-
-        // Remove keywords
-        if let Some(keywords) = self
-            .get_property::<HashedValue<Vec<Keyword>>>(
-                account_id,
-                Collection::Email,
-                document_id,
-                Property::Keywords,
-            )
-            .await?
-        {
-            batch.assert_value(Property::Keywords, &keywords).value(
-                Property::Keywords,
-                keywords.inner,
-                F_VALUE | F_BITMAP | F_CLEAR,
-            );
-        } else {
-            tracing::debug!(
-                event = "error",
-                context = "email_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Failed to fetch keywords.",
-            );
-            return Ok(Err(SetError::not_found()));
-        };
-
-        // Remove threadIds
-        let mut delete_thread_id = None;
-        if let Some(thread_id) = self
-            .get_property::<u32>(
-                account_id,
-                Collection::Email,
-                document_id,
-                Property::ThreadId,
-            )
-            .await?
-        {
-            // Obtain all documentIds in thread
-            if let Some(thread_tags) = self
-                .get_tag(account_id, Collection::Email, Property::ThreadId, thread_id)
-                .await?
-            {
-                if thread_tags.len() > 1 {
-                    // Thread has other document ids, remove this one
-                    changes.log_child_update(Collection::Thread, thread_id);
-                } else {
-                    // Thread is empty, delete it
-                    delete_thread_id = thread_id.into();
-                    changes.log_delete(Collection::Thread, thread_id);
-                }
-
-                // Remove threadId value and tag
-                batch.assert_value(Property::ThreadId, thread_id).value(
-                    Property::ThreadId,
-                    thread_id,
-                    F_VALUE | F_BITMAP | F_CLEAR,
-                );
-
-                // Log message deletion
-                changes.log_delete(Collection::Email, Id::from_parts(thread_id, document_id));
-            } else {
-                tracing::debug!(
-                    event = "error",
-                    context = "email_delete",
-                    account_id = account_id,
-                    thread_id = thread_id,
-                    document_id = document_id,
-                    "Failed to fetch thread tags.",
-                );
-                return Ok(Err(SetError::not_found()));
-            }
-        } else {
-            tracing::debug!(
-                event = "error",
-                context = "email_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Failed to fetch threadId.",
-            );
-            return Ok(Err(SetError::not_found()));
-        }
-
-        // Remove message metadata
-        if let Some(metadata) = self
-            .get_property::<Bincode<MessageMetadata>>(
-                account_id,
-                Collection::Email,
-                document_id,
-                Property::BodyStructure,
-            )
-            .await?
-        {
-            batch.custom(EmailIndexBuilder::clear(metadata.inner));
-        } else {
-            tracing::debug!(
-                event = "error",
-                context = "email_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Failed to fetch message metadata.",
-            );
-            return Ok(Err(SetError::not_found()));
-        };
-
-        // Delete threadId
-        if let Some(thread_id) = delete_thread_id {
-            batch
-                .with_collection(Collection::Thread)
-                .delete_document(thread_id);
-        }
-
-        // Commit batch
-        match self.core.storage.data.write(batch.build()).await {
-            Ok(_) => (),
-            Err(store::Error::AssertValueFailed) => {
-                return Ok(Err(SetError::forbidden().with_description(
-                    "Another process modified this message, please try again.",
-                )));
-            }
-            Err(err) => {
-                tracing::error!(
-                    event = "error",
-                    context = "email_delete",
-                    error = ?err,
-                    "Failed to commit batch.");
-                return Err(MethodError::ServerPartialFail);
-            }
-        }
-
-        // Request FTS index
-        let _ = self.inner.housekeeper_tx.send(Event::IndexStart).await;
-
-        Ok(Ok(changes))
-    }
 }
-
 pub struct TagManager<
     T: PartialEq + Clone + ToBitmaps + SerializeInto + Serialize + DeserializeFrom + Sync + Send,
 > {

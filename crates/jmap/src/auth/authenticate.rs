@@ -1,58 +1,38 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{net::IpAddr, sync::Arc, time::Instant};
 
-use common::{listener::limiter::InFlight, AuthResult};
+use common::listener::limiter::InFlight;
 use directory::{Principal, QueryBy};
 use hyper::header;
-use jmap_proto::error::request::RequestError;
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
 use utils::map::ttl_dashmap::TtlMap;
 
-use crate::JMAP;
+use crate::{
+    api::{http::HttpSessionData, HttpRequest},
+    JMAP,
+};
 
 use super::AccessToken;
 
 impl JMAP {
     pub async fn authenticate_headers(
         &self,
-        req: &hyper::Request<hyper::body::Incoming>,
-        remote_ip: IpAddr,
-    ) -> Result<Option<(InFlight, Arc<AccessToken>)>, RequestError> {
-        if let Some((mechanism, token)) = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.split_once(' ').map(|(l, t)| (l, t.trim().to_string())))
-        {
-            let session = if let Some(account_id) = self.inner.sessions.get_with_ttl(&token) {
-                self.get_cached_access_token(account_id).await
+        req: &HttpRequest,
+        session: &HttpSessionData,
+    ) -> trc::Result<(InFlight, Arc<AccessToken>)> {
+        if let Some((mechanism, token)) = req.authorization() {
+            let access_token = if let Some(account_id) = self.inner.sessions.get_with_ttl(token) {
+                self.get_cached_access_token(account_id).await?
             } else {
-                if mechanism.eq_ignore_ascii_case("basic") {
+                let access_token = if mechanism.eq_ignore_ascii_case("basic") {
                     // Enforce rate limit for authentication requests
-                    self.is_auth_allowed_soft(&remote_ip).await?;
+                    self.is_auth_allowed_soft(&session.remote_ip).await?;
 
                     // Decode the base64 encoded credentials
                     if let Some((account, secret)) = base64_decode(token.as_bytes())
@@ -63,60 +43,57 @@ impl JMAP {
                             })
                         })
                     {
-                        if let AuthResult::Success(access_token) =
-                            self.authenticate_plain(&account, &secret, remote_ip).await
-                        {
-                            Some(access_token)
-                        } else {
-                            None
-                        }
+                        self.authenticate_plain(
+                            &account,
+                            &secret,
+                            session.remote_ip,
+                            session.session_id,
+                        )
+                        .await?
                     } else {
-                        tracing::debug!(
-                            context = "authenticate_headers",
-                            token = token,
-                            "Failed to decode Basic auth request.",
-                        );
-                        None
+                        return Err(trc::AuthEvent::Error
+                            .into_err()
+                            .details("Failed to decode Basic auth request.")
+                            .id(token.to_string())
+                            .caused_by(trc::location!()));
                     }
                 } else if mechanism.eq_ignore_ascii_case("bearer") {
                     // Enforce anonymous rate limit for bearer auth requests
-                    self.is_anonymous_allowed(&remote_ip).await?;
+                    self.is_anonymous_allowed(&session.remote_ip).await?;
 
-                    match self.validate_access_token("access_token", &token).await {
-                        Ok((account_id, _, _)) => self.get_access_token(account_id).await,
-                        Err(err) => {
-                            tracing::debug!(
-                                context = "authenticate_headers",
-                                err = err,
-                                "Failed to validate access token."
-                            );
-                            None
-                        }
-                    }
+                    let (account_id, _, _) =
+                        self.validate_access_token("access_token", token).await?;
+
+                    self.get_access_token(account_id).await?
                 } else {
                     // Enforce anonymous rate limit
-                    self.is_anonymous_allowed(&remote_ip).await?;
-                    None
-                }
-                .map(|access_token| {
-                    let access_token = Arc::new(access_token);
-                    self.cache_session(token, &access_token);
-                    self.cache_access_token(access_token.clone());
-                    access_token
-                })
+                    self.is_anonymous_allowed(&session.remote_ip).await?;
+                    return Err(trc::AuthEvent::Error
+                        .into_err()
+                        .reason("Unsupported authentication mechanism.")
+                        .details(token.to_string())
+                        .caused_by(trc::location!()));
+                };
+
+                // Cache session
+                let access_token = Arc::new(access_token);
+                self.cache_session(token.to_string(), &access_token);
+                self.cache_access_token(access_token.clone());
+                access_token
             };
 
-            if let Some(session) = session {
-                // Enforce authenticated rate limit
-                Ok(Some((self.is_account_allowed(&session).await?, session)))
-            } else {
-                Ok(None)
-            }
+            // Enforce authenticated rate limit
+            self.is_account_allowed(&access_token)
+                .await
+                .map(|in_flight| (in_flight, access_token))
         } else {
             // Enforce anonymous rate limit
-            self.is_anonymous_allowed(&remote_ip).await?;
+            self.is_anonymous_allowed(&session.remote_ip).await?;
 
-            Ok(None)
+            Err(trc::AuthEvent::Failed
+                .into_err()
+                .details("Missing Authorization header.")
+                .caused_by(trc::location!()))
         }
     }
 
@@ -136,9 +113,9 @@ impl JMAP {
         );
     }
 
-    pub async fn get_cached_access_token(&self, primary_id: u32) -> Option<Arc<AccessToken>> {
+    pub async fn get_cached_access_token(&self, primary_id: u32) -> trc::Result<Arc<AccessToken>> {
         if let Some(access_token) = self.inner.access_tokens.get_with_ttl(&primary_id) {
-            access_token.into()
+            Ok(access_token)
         } else {
             // Refresh ACL token
             self.get_access_token(primary_id).await.map(|access_token| {
@@ -154,11 +131,13 @@ impl JMAP {
         username: &str,
         secret: &str,
         remote_ip: IpAddr,
-    ) -> AuthResult<AccessToken> {
+        session_id: u64,
+    ) -> trc::Result<AccessToken> {
         match self
             .core
             .authenticate(
                 &self.core.storage.directory,
+                session_id,
                 &Credentials::Plain {
                     username: username.to_string(),
                     secret: secret.to_string(),
@@ -168,32 +147,64 @@ impl JMAP {
             )
             .await
         {
-            Ok(AuthResult::Success(principal)) => AuthResult::Success(AccessToken::new(principal)),
-            Ok(AuthResult::Failure) => {
-                let _ = self.is_auth_allowed_hard(&remote_ip).await;
-                AuthResult::Failure
+            Ok(principal) => Ok(AccessToken::new(principal)),
+            Err(err) => {
+                if !err.matches(trc::EventType::Auth(trc::AuthEvent::MissingTotp)) {
+                    let _ = self.is_auth_allowed_hard(&remote_ip).await;
+                }
+                Err(err)
             }
-            Ok(AuthResult::Banned) => AuthResult::Banned,
-            Err(_) => AuthResult::Failure,
         }
     }
 
-    pub async fn get_access_token(&self, account_id: u32) -> Option<AccessToken> {
-        match self
+    pub async fn get_access_token(&self, account_id: u32) -> trc::Result<AccessToken> {
+        let err = match self
             .core
             .storage
             .directory
             .query(QueryBy::Id(account_id), true)
             .await
         {
-            Ok(Some(principal)) => self.update_access_token(AccessToken::new(principal)).await,
-            _ => match &self.core.jmap.fallback_admin {
-                Some((_, secret)) if account_id == u32::MAX => {
-                    self.update_access_token(AccessToken::new(Principal::fallback_admin(secret)))
-                        .await
-                }
-                _ => None,
-            },
+            Ok(Some(principal)) => {
+                return self.update_access_token(AccessToken::new(principal)).await
+            }
+            Ok(None) => Err(trc::AuthEvent::Error
+                .into_err()
+                .details("Account not found.")
+                .caused_by(trc::location!())),
+            Err(err) => Err(err),
+        };
+
+        match &self.core.jmap.fallback_admin {
+            Some((_, secret)) if account_id == u32::MAX => {
+                self.update_access_token(AccessToken::new(Principal::fallback_admin(secret)))
+                    .await
+            }
+            _ => err,
         }
+    }
+}
+
+pub trait HttpHeaders {
+    fn authorization(&self) -> Option<(&str, &str)>;
+    fn authorization_basic(&self) -> Option<&str>;
+}
+
+impl HttpHeaders for HttpRequest {
+    fn authorization(&self) -> Option<(&str, &str)> {
+        self.headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.split_once(' ').map(|(l, t)| (l, t.trim())))
+    }
+
+    fn authorization_basic(&self) -> Option<&str> {
+        self.authorization().and_then(|(l, t)| {
+            if l.eq_ignore_ascii_case("basic") {
+                Some(t)
+            } else {
+                None
+            }
+        })
     }
 }

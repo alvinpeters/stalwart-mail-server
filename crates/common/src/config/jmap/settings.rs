@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::{str::FromStr, time::Duration};
 
 use jmap_proto::request::capability::BaseCapabilities;
@@ -10,8 +16,10 @@ use utils::config::{cron::SimpleCron, utils::ParseValue, Config, Rate};
 pub struct JmapConfig {
     pub default_language: Language,
     pub query_max_results: usize,
-    pub changes_max_results: usize,
     pub snippet_max_results: usize,
+
+    pub changes_max_results: usize,
+    pub changes_max_history: Option<Duration>,
 
     pub request_max_size: usize,
     pub request_max_calls: usize,
@@ -32,6 +40,7 @@ pub struct JmapConfig {
     pub mail_attachments_max_size: usize,
     pub mail_parse_max_items: usize,
     pub mail_max_size: usize,
+    pub mail_autoexpunge_after: Option<Duration>,
 
     pub sieve_max_script_name: usize,
     pub sieve_max_scripts: usize,
@@ -62,9 +71,11 @@ pub struct JmapConfig {
     pub oauth_expiry_refresh_token_renew: u64,
     pub oauth_max_auth_attempts: u32,
     pub fallback_admin: Option<(String, String)>,
-    pub fallback_admin_master: bool,
+    pub master_user: Option<(String, String)>,
 
     pub spam_header: Option<(HeaderName<'static>, String)>,
+    pub default_folders: Vec<DefaultFolder>,
+    pub shared_folder: String,
 
     pub http_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     pub http_use_forwarded: bool,
@@ -76,6 +87,28 @@ pub struct JmapConfig {
 
     pub capabilities: BaseCapabilities,
     pub session_purge_frequency: SimpleCron,
+    pub account_purge_frequency: SimpleCron,
+}
+
+#[derive(Clone, Debug)]
+pub struct DefaultFolder {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub special_use: SpecialUse,
+    pub subscribe: bool,
+    pub create: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SpecialUse {
+    Inbox,
+    Trash,
+    Junk,
+    Drafts,
+    Archive,
+    Sent,
+    Shared,
+    None,
 }
 
 impl JmapConfig {
@@ -110,6 +143,72 @@ impl JmapConfig {
             .map_err(|e| config.new_parse_error("server.http.headers", e))
             .unwrap_or_default();
 
+        // Parse default folders
+        let mut default_folders = Vec::new();
+        let mut shared_folder = "Shared Folders".to_string();
+        for key in config
+            .sub_keys("jmap.folders", ".name")
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+        {
+            match SpecialUse::parse_value(&key) {
+                Ok(SpecialUse::Shared) => {
+                    if let Some(value) = config.value(&key) {
+                        shared_folder = value.to_string();
+                    }
+                }
+                Ok(special_use) => {
+                    let subscribe = config
+                        .property_or_default(("jmap.folders", key.as_str(), "subscribe"), "true")
+                        .unwrap_or(true);
+                    let create = config
+                        .property_or_default(("jmap.folders", key.as_str(), "create"), "true")
+                        .unwrap_or(true)
+                        | [SpecialUse::Inbox, SpecialUse::Trash, SpecialUse::Junk]
+                            .contains(&special_use);
+                    if let Some(name) = config
+                        .value(("jmap.folders", key.as_str(), "name"))
+                        .map(|name| name.trim())
+                        .filter(|name| !name.is_empty())
+                    {
+                        default_folders.push(DefaultFolder {
+                            name: name.to_string(),
+                            aliases: config
+                                .value(("jmap.folders", key.as_str(), "aliases"))
+                                .unwrap_or_default()
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            special_use,
+                            subscribe,
+                            create,
+                        });
+                    }
+                }
+                Err(err) => {
+                    config.new_parse_error(key, err);
+                }
+            }
+        }
+        for (special_use, name) in [
+            (SpecialUse::Inbox, "Inbox"),
+            (SpecialUse::Trash, "Deleted Items"),
+            (SpecialUse::Junk, "Junk Mail"),
+            (SpecialUse::Drafts, "Drafts"),
+            (SpecialUse::Sent, "Sent Items"),
+        ] {
+            if !default_folders.iter().any(|f| f.special_use == special_use) {
+                default_folders.push(DefaultFolder {
+                    name: name.to_string(),
+                    aliases: Vec::new(),
+                    special_use,
+                    subscribe: true,
+                    create: true,
+                });
+            }
+        }
+
         // Add permissive CORS headers
         if config
             .property::<bool>("server.http.permissive-cors")
@@ -133,6 +232,16 @@ impl JmapConfig {
             ));
         }
 
+        // Add HTTP Strict Transport Security
+        if config.property::<bool>("server.http.hsts").unwrap_or(false) {
+            http_headers.push((
+                hyper::header::STRICT_TRANSPORT_SECURITY,
+                hyper::header::HeaderValue::from_static(
+                    "max-age=31536000; includeSubDomains; preload",
+                ),
+            ));
+        }
+
         let mut jmap = JmapConfig {
             default_language: Language::from_iso_639(
                 config
@@ -146,6 +255,9 @@ impl JmapConfig {
             changes_max_results: config
                 .property("jmap.protocol.changes.max-results")
                 .unwrap_or(5000),
+            changes_max_history: config
+                .property_or_default::<Option<Duration>>("jmap.protocol.changes.max-history", "30d")
+                .unwrap_or_default(),
             snippet_max_results: config
                 .property("jmap.protocol.search-snippet.max-results")
                 .unwrap_or(100),
@@ -189,6 +301,9 @@ impl JmapConfig {
                 .unwrap_or(50000000),
             mail_max_size: config.property("jmap.email.max-size").unwrap_or(75000000),
             mail_parse_max_items: config.property("jmap.email.parse.max-items").unwrap_or(10),
+            mail_autoexpunge_after: config
+                .property_or_default::<Option<Duration>>("jmap.email.auto-expunge", "30d")
+                .unwrap_or_default(),
             sieve_max_script_name: config
                 .property("sieve.untrusted.limits.name-length")
                 .unwrap_or(512),
@@ -301,6 +416,9 @@ impl JmapConfig {
             session_purge_frequency: config
                 .property_or_default::<SimpleCron>("jmap.session.purge.frequency", "15 * *")
                 .unwrap_or_else(|| SimpleCron::parse_value("15 * *").unwrap()),
+            account_purge_frequency: config
+                .property_or_default::<SimpleCron>("jmap.account.purge.frequency", "0 0 *")
+                .unwrap_or_else(|| SimpleCron::parse_value("0 0 *").unwrap()),
             fallback_admin: config
                 .value("authentication.fallback-admin.user")
                 .and_then(|u| {
@@ -308,13 +426,33 @@ impl JmapConfig {
                         .value("authentication.fallback-admin.secret")
                         .map(|p| (u.to_string(), p.to_string()))
                 }),
-            fallback_admin_master: config
-                .property_or_default("authentication.fallback-admin.enable-master", "false")
-                .unwrap_or(false),
+            master_user: config.value("authentication.master.user").and_then(|u| {
+                config
+                    .value("authentication.master.secret")
+                    .map(|p| (u.to_string(), p.to_string()))
+            }),
+            default_folders,
+            shared_folder,
         };
 
         // Add capabilities
-        jmap.add_capabilites(config);
+        jmap.add_capabilities(config);
         jmap
+    }
+}
+
+impl ParseValue for SpecialUse {
+    fn parse_value(value: &str) -> Result<Self, String> {
+        match value {
+            "inbox" => Ok(SpecialUse::Inbox),
+            "trash" => Ok(SpecialUse::Trash),
+            "junk" => Ok(SpecialUse::Junk),
+            "drafts" => Ok(SpecialUse::Drafts),
+            "archive" => Ok(SpecialUse::Archive),
+            "sent" => Ok(SpecialUse::Sent),
+            "shared" => Ok(SpecialUse::Shared),
+            //"none" => Ok(SpecialUse::None),
+            other => Err(format!("Unknown folder role {other:?}")),
+        }
     }
 }

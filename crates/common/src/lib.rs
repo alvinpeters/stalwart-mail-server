@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 
@@ -34,36 +17,40 @@ use config::{
         SmtpConfig,
     },
     storage::Storage,
-    tracers::{OtelTracer, Tracer, Tracers},
+    telemetry::Metrics,
 };
-use directory::{core::secret::verify_secret_hash, Directory, Principal, QueryBy};
+use directory::{core::secret::verify_secret_hash, Directory, Principal, QueryBy, Type};
 use expr::if_block::IfBlock;
-use listener::{blocked::BlockedIps, tls::TlsManager};
+use jmap_proto::types::collection::Collection;
+use listener::{
+    blocked::{AllowedIps, BlockedIps},
+    tls::TlsManager,
+};
 use mail_send::Credentials;
-use opentelemetry::KeyValue;
-use opentelemetry_sdk::{
-    trace::{self, Sampler},
-    Resource,
-};
-use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
+
 use sieve::Sieve;
-use store::LookupStore;
-use tokio::sync::oneshot;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{
-    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+use store::{
+    write::{DirectoryClass, QueueClass, ValueClass},
+    BitmapKey, IterateParams, LookupStore, ValueKey,
 };
-use utils::{config::Config, BlobHash};
+use tokio::sync::{mpsc, oneshot};
+use trc::AddContext;
+use utils::BlobHash;
 
 pub mod addresses;
 pub mod config;
+#[cfg(feature = "enterprise")]
+pub mod enterprise;
 pub mod expr;
 pub mod listener;
 pub mod manager;
 pub mod scripts;
+pub mod telemetry;
 
-pub static USER_AGENT: &str = concat!("StalwartMail/", env!("CARGO_PKG_VERSION"),);
+pub static USER_AGENT: &str = concat!("Stalwart/", env!("CARGO_PKG_VERSION"),);
 pub static DAEMON_NAME: &str = concat!("Stalwart Mail Server v", env!("CARGO_PKG_VERSION"),);
+
+pub const IPC_CHANNEL_BUFFER: usize = 1024;
 
 pub type SharedCore = Arc<ArcSwap<Core>>;
 
@@ -76,18 +63,18 @@ pub struct Core {
     pub smtp: SmtpConfig,
     pub jmap: JmapConfig,
     pub imap: ImapConfig,
+    pub metrics: Metrics,
+    #[cfg(feature = "enterprise")]
+    pub enterprise: Option<enterprise::Enterprise>,
 }
 
 #[derive(Clone)]
 pub struct Network {
+    pub node_id: u64,
     pub blocked_ips: BlockedIps,
-    pub url: IfBlock,
-}
-
-pub enum AuthResult<T> {
-    Success(T),
-    Failure,
-    Banned,
+    pub allowed_ips: AllowedIps,
+    pub http_response_url: IfBlock,
+    pub http_allowed_endpoint: IfBlock,
 }
 
 #[derive(Debug)]
@@ -99,12 +86,17 @@ pub enum DeliveryEvent {
     Stop,
 }
 
+pub struct Ipc {
+    pub delivery_tx: mpsc::Sender<DeliveryEvent>,
+}
+
 #[derive(Debug)]
 pub struct IngestMessage {
     pub sender_address: String,
     pub recipients: Vec<String>,
     pub message_blob: BlobHash,
     pub message_size: usize,
+    pub session_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -135,88 +127,82 @@ impl Core {
         self.storage.directories.get(name)
     }
 
-    pub fn get_directory_or_default(&self, name: &str) -> &Arc<Directory> {
+    pub fn get_directory_or_default(&self, name: &str, session_id: u64) -> &Arc<Directory> {
         self.storage.directories.get(name).unwrap_or_else(|| {
-            tracing::debug!(
-                context = "get_directory",
-                event = "error",
-                directory = name,
-                "Directory not found, using default."
+            trc::event!(
+                Eval(trc::EvalEvent::DirectoryNotFound),
+                Id = name.to_string(),
+                SpanId = session_id,
             );
 
             &self.storage.directory
         })
     }
 
-    pub fn get_lookup_store(&self, name: &str) -> &LookupStore {
+    pub fn get_lookup_store(&self, name: &str, session_id: u64) -> &LookupStore {
         self.storage.lookups.get(name).unwrap_or_else(|| {
-            tracing::debug!(
-                context = "get_lookup_store",
-                event = "error",
-                directory = name,
-                "Store not found, using default."
+            trc::event!(
+                Eval(trc::EvalEvent::StoreNotFound),
+                Id = name.to_string(),
+                SpanId = session_id,
             );
 
             &self.storage.lookup
         })
     }
 
-    pub fn get_arc_sealer(&self, name: &str) -> Option<&ArcSealer> {
+    pub fn get_arc_sealer(&self, name: &str, session_id: u64) -> Option<&ArcSealer> {
         self.smtp
             .mail_auth
             .sealers
             .get(name)
             .map(|s| s.as_ref())
             .or_else(|| {
-                tracing::warn!(
-                    context = "get_arc_sealer",
-                    event = "error",
-                    name = name,
-                    "Arc sealer not found."
+                trc::event!(
+                    Arc(trc::ArcEvent::SealerNotFound),
+                    Id = name.to_string(),
+                    SpanId = session_id,
                 );
 
                 None
             })
     }
 
-    pub fn get_dkim_signer(&self, name: &str) -> Option<&DkimSigner> {
+    pub fn get_dkim_signer(&self, name: &str, session_id: u64) -> Option<&DkimSigner> {
         self.smtp
             .mail_auth
             .signers
             .get(name)
             .map(|s| s.as_ref())
             .or_else(|| {
-                tracing::warn!(
-                    context = "get_dkim_signer",
-                    event = "error",
-                    name = name,
-                    "DKIM signer not found."
+                trc::event!(
+                    Dkim(trc::DkimEvent::SignerNotFound),
+                    Id = name.to_string(),
+                    SpanId = session_id,
                 );
 
                 None
             })
     }
 
-    pub fn get_sieve_script(&self, name: &str) -> Option<&Arc<Sieve>> {
+    pub fn get_sieve_script(&self, name: &str, session_id: u64) -> Option<&Arc<Sieve>> {
         self.sieve.scripts.get(name).or_else(|| {
-            tracing::warn!(
-                context = "get_sieve_script",
-                event = "error",
-                name = name,
-                "Sieve script not found."
+            trc::event!(
+                Sieve(trc::SieveEvent::ScriptNotFound),
+                Id = name.to_string(),
+                SpanId = session_id,
             );
 
             None
         })
     }
 
-    pub fn get_relay_host(&self, name: &str) -> Option<&RelayHost> {
+    pub fn get_relay_host(&self, name: &str, session_id: u64) -> Option<&RelayHost> {
         self.smtp.queue.relay_hosts.get(name).or_else(|| {
-            tracing::warn!(
-                context = "get_relay_host",
-                event = "error",
-                name = name,
-                "Remote host not found."
+            trc::event!(
+                Smtp(trc::SmtpEvent::RemoteIdNotFound),
+                Id = name.to_string(),
+                SpanId = session_id,
             );
 
             None
@@ -226,187 +212,168 @@ impl Core {
     pub async fn authenticate(
         &self,
         directory: &Directory,
+        session_id: u64,
         credentials: &Credentials<String>,
         remote_ip: IpAddr,
         return_member_of: bool,
-    ) -> directory::Result<AuthResult<Principal<u32>>> {
+    ) -> trc::Result<Principal<u32>> {
         // First try to authenticate the user against the default directory
         let result = match directory
             .query(QueryBy::Credentials(credentials), return_member_of)
             .await
         {
-            Ok(Some(principal)) => return Ok(AuthResult::Success(principal)),
+            Ok(Some(principal)) => {
+                trc::event!(
+                    Auth(trc::AuthEvent::Success),
+                    AccountName = credentials.login().to_string(),
+                    AccountId = principal.id,
+                    SpanId = session_id,
+                    Type = principal.typ.as_str(),
+                );
+
+                return Ok(principal);
+            }
             Ok(None) => Ok(()),
-            Err(err) => Err(err),
+            Err(err) => {
+                if err.matches(trc::EventType::Auth(trc::AuthEvent::MissingTotp)) {
+                    return Err(err);
+                } else {
+                    Err(err)
+                }
+            }
         };
 
-        // Then check if the credentials match the fallback admin
-        if let (Some((fallback_admin, fallback_pass)), Credentials::Plain { username, secret }) =
-            (&self.jmap.fallback_admin, credentials)
-        {
-            // Check master user
-            let (user_account, admin_account) =
-                match (self.jmap.fallback_admin_master, username.rsplit_once('%')) {
-                    (true, Some((user_account, admin_account))) => {
-                        (Some(user_account), admin_account)
-                    }
-                    _ => (None, username.as_str()),
-                };
+        // Then check if the credentials match the fallback admin or master user
+        match (
+            &self.jmap.fallback_admin,
+            &self.jmap.master_user,
+            credentials,
+        ) {
+            (Some((fallback_admin, fallback_pass)), _, Credentials::Plain { username, secret })
+                if username == fallback_admin =>
+            {
+                if verify_secret_hash(fallback_pass, secret).await? {
+                    trc::event!(
+                        Auth(trc::AuthEvent::Success),
+                        AccountName = username.clone(),
+                        SpanId = session_id,
+                        Type = Type::Superuser.as_str(),
+                    );
 
-            if admin_account == fallback_admin && verify_secret_hash(fallback_pass, secret).await {
-                return Ok(if let Some(user_account) = user_account {
+                    return Ok(Principal::fallback_admin(fallback_pass));
+                }
+            }
+            (_, Some((master_user, master_pass)), Credentials::Plain { username, secret })
+                if username.ends_with(master_user) =>
+            {
+                if verify_secret_hash(master_pass, secret).await? {
+                    let username = username.strip_suffix(master_user).unwrap();
+                    let username = username.strip_suffix('%').unwrap_or(username);
+
                     if let Some(principal) = directory
-                        .query(QueryBy::Name(user_account), return_member_of)
+                        .query(QueryBy::Name(username), return_member_of)
                         .await?
                     {
-                        AuthResult::Success(principal)
-                    } else {
-                        AuthResult::Failure
+                        trc::event!(
+                            Auth(trc::AuthEvent::Success),
+                            AccountName = username.to_string(),
+                            SpanId = session_id,
+                            AccountId = principal.id,
+                            Type = principal.typ.as_str(),
+                        );
+
+                        return Ok(principal);
                     }
-                } else {
-                    AuthResult::Success(Principal::fallback_admin(fallback_pass))
-                });
+                }
             }
+            _ => {}
         }
 
         if let Err(err) = result {
             Err(err)
-        } else if self.has_fail2ban() {
-            let login = match credentials {
-                Credentials::Plain { username, .. }
-                | Credentials::XOauth2 { username, .. }
-                | Credentials::OAuthBearer { token: username } => username,
-            };
-            if self.is_fail2banned(remote_ip, login.to_string()).await? {
-                tracing::info!(
-                    context = "directory",
-                    event = "fail2ban",
-                    remote_ip = ?remote_ip,
-                    login = ?login,
-                    "IP address blocked after too many failed login attempts",
-                );
-
-                Ok(AuthResult::Banned)
+        } else if self.has_auth_fail2ban() {
+            let login = credentials.login();
+            if self.is_auth_fail2banned(remote_ip, login).await? {
+                Err(trc::SecurityEvent::AuthenticationBan
+                    .into_err()
+                    .ctx(trc::Key::RemoteIp, remote_ip)
+                    .ctx(trc::Key::AccountName, login.to_string()))
             } else {
-                Ok(AuthResult::Failure)
+                Err(trc::AuthEvent::Failed
+                    .ctx(trc::Key::RemoteIp, remote_ip)
+                    .ctx(trc::Key::AccountName, login.to_string()))
             }
         } else {
-            Ok(AuthResult::Failure)
+            Err(trc::AuthEvent::Failed
+                .ctx(trc::Key::RemoteIp, remote_ip)
+                .ctx(trc::Key::AccountName, credentials.login().to_string()))
         }
+    }
+
+    pub async fn total_queued_messages(&self) -> trc::Result<u64> {
+        let mut total = 0;
+        self.storage
+            .data
+            .iterate(
+                IterateParams::new(
+                    ValueKey::from(ValueClass::Queue(QueueClass::Message(0))),
+                    ValueKey::from(ValueClass::Queue(QueueClass::Message(u64::MAX))),
+                )
+                .no_values(),
+                |_, _| {
+                    total += 1;
+
+                    Ok(true)
+                },
+            )
+            .await
+            .map(|_| total)
+    }
+
+    pub async fn total_accounts(&self) -> trc::Result<u64> {
+        self.storage
+            .data
+            .get_bitmap(BitmapKey::document_ids(u32::MAX, Collection::Principal))
+            .await
+            .caused_by(trc::location!())
+            .map(|bitmap| bitmap.map_or(0, |b| b.len()))
+    }
+
+    pub async fn total_domains(&self) -> trc::Result<u64> {
+        let mut total = 0;
+        self.storage
+            .data
+            .iterate(
+                IterateParams::new(
+                    ValueKey::from(ValueClass::Directory(DirectoryClass::Domain(vec![]))),
+                    ValueKey::from(ValueClass::Directory(DirectoryClass::Domain(vec![
+                        u8::MAX;
+                        10
+                    ]))),
+                )
+                .no_values()
+                .ascending(),
+                |_, _| {
+                    total += 1;
+                    Ok(true)
+                },
+            )
+            .await
+            .caused_by(trc::location!())
+            .map(|_| total)
     }
 }
 
-impl Tracers {
-    pub fn enable(self, config: &mut Config) -> Option<Vec<WorkerGuard>> {
-        let mut layers: Option<Box<dyn Layer<Registry> + Sync + Send>> = None;
-        let mut guards = Vec::new();
+trait CredentialsUsername {
+    fn login(&self) -> &str;
+}
 
-        for tracer in self.tracers {
-            let (Tracer::Stdout { level, .. }
-            | Tracer::Log { level, .. }
-            | Tracer::Journal { level }
-            | Tracer::Otel { level, .. }) = tracer;
-
-            let filter = match EnvFilter::builder().parse(format!(
-                "smtp={level},imap={level},jmap={level},store={level},common={level},utils={level},directory={level}"
-            )) {
-                Ok(filter) => {
-                    filter
-                }
-                Err(err) => {
-                    config.new_build_error("tracer", format!("Failed to set env filter: {err}"));
-                    continue;
-                }
-            };
-
-            let layer = match tracer {
-                Tracer::Stdout { ansi, .. } => tracing_subscriber::fmt::layer()
-                    .with_ansi(ansi)
-                    .with_filter(filter)
-                    .boxed(),
-                Tracer::Log { appender, ansi, .. } => {
-                    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-                    guards.push(guard);
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .with_ansi(ansi)
-                        .with_filter(filter)
-                        .boxed()
-                }
-                Tracer::Otel { tracer, .. } => {
-                    let tracer = match tracer {
-                        OtelTracer::Gprc(exporter) => opentelemetry_otlp::new_pipeline()
-                            .tracing()
-                            .with_exporter(exporter),
-                        OtelTracer::Http(exporter) => opentelemetry_otlp::new_pipeline()
-                            .tracing()
-                            .with_exporter(exporter),
-                    }
-                    .with_trace_config(
-                        trace::config()
-                            .with_resource(Resource::new(vec![
-                                KeyValue::new(SERVICE_NAME, "stalwart-mail".to_string()),
-                                KeyValue::new(
-                                    SERVICE_VERSION,
-                                    env!("CARGO_PKG_VERSION").to_string(),
-                                ),
-                            ]))
-                            .with_sampler(Sampler::AlwaysOn),
-                    )
-                    .install_batch(opentelemetry_sdk::runtime::Tokio);
-
-                    match tracer {
-                        Ok(tracer) => tracing_opentelemetry::layer()
-                            .with_tracer(tracer)
-                            .with_filter(filter)
-                            .boxed(),
-                        Err(err) => {
-                            config.new_build_error(
-                                "tracer",
-                                format!("Failed to start OpenTelemetry: {err}"),
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Tracer::Journal { .. } => {
-                    #[cfg(unix)]
-                    {
-                        match tracing_journald::layer() {
-                            Ok(layer) => layer.with_filter(filter).boxed(),
-                            Err(err) => {
-                                config.new_build_error(
-                                    "tracer",
-                                    format!("Failed to start Journald: {err}"),
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    #[cfg(not(unix))]
-                    {
-                        config.new_build_error(
-                            "tracer",
-                            "Journald is only available on Unix systems.",
-                        );
-                        continue;
-                    }
-                }
-            };
-
-            layers = Some(match layers {
-                Some(layers) => layers.and_then(layer).boxed(),
-                None => layer,
-            });
-        }
-
-        match tracing_subscriber::registry().with(layers?).try_init() {
-            Ok(_) => Some(guards),
-            Err(err) => {
-                config.new_build_error("tracer", format!("Failed to start tracing: {err}"));
-                None
-            }
+impl CredentialsUsername for Credentials<String> {
+    fn login(&self) -> &str {
+        match self {
+            Credentials::Plain { username, .. }
+            | Credentials::XOauth2 { username, .. }
+            | Credentials::OAuthBearer { token: username } => username,
         }
     }
 }

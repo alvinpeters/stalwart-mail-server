@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
@@ -71,7 +54,7 @@ pub(crate) struct ExternalConfig {
 }
 
 impl ConfigManager {
-    pub async fn build_config(&self, prefix: &str) -> store::Result<Config> {
+    pub async fn build_config(&self, prefix: &str) -> trc::Result<Config> {
         let mut config = Config {
             keys: self.cfg_local.load().as_ref().clone(),
             ..Default::default()
@@ -82,11 +65,7 @@ impl ConfigManager {
             .map(|_| config)
     }
 
-    pub(crate) async fn extend_config(
-        &self,
-        config: &mut Config,
-        prefix: &str,
-    ) -> store::Result<()> {
+    pub(crate) async fn extend_config(&self, config: &mut Config, prefix: &str) -> trc::Result<()> {
         for (key, value) in self.db_list(prefix, false).await? {
             config.keys.entry(key).or_insert(value);
         }
@@ -94,7 +73,7 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub async fn get(&self, key: impl AsRef<str>) -> store::Result<Option<String>> {
+    pub async fn get(&self, key: impl AsRef<str>) -> trc::Result<Option<String>> {
         let key = key.as_ref();
         match self.cfg_local.load().get(key) {
             Some(value) => Ok(Some(value.to_string())),
@@ -112,7 +91,7 @@ impl ConfigManager {
         &self,
         prefix: &str,
         strip_prefix: bool,
-    ) -> store::Result<Vec<(String, String)>> {
+    ) -> trc::Result<Vec<(String, String)>> {
         let mut results = self.db_list(prefix, strip_prefix).await?;
         for (key, value) in self.cfg_local.load().iter() {
             if prefix.is_empty() || (!strip_prefix && key.starts_with(prefix)) {
@@ -129,7 +108,7 @@ impl ConfigManager {
         &self,
         prefix: &str,
         suffix: &str,
-    ) -> store::Result<AHashMap<String, AHashMap<String, String>>> {
+    ) -> trc::Result<AHashMap<String, AHashMap<String, String>>> {
         let mut grouped = AHashMap::new();
 
         let mut list = self.list(prefix, true).await?;
@@ -155,7 +134,7 @@ impl ConfigManager {
         &self,
         prefix: &str,
         strip_prefix: bool,
-    ) -> store::Result<Vec<(String, String)>> {
+    ) -> trc::Result<Vec<(String, String)>> {
         let key = prefix.as_bytes();
         let from_key = ValueKey::from(ValueClass::Config(key.to_vec()));
         let to_key = ValueKey::from(ValueClass::Config(
@@ -171,7 +150,7 @@ impl ConfigManager {
                 IterateParams::new(from_key, to_key).ascending(),
                 |key, value| {
                     let mut key = std::str::from_utf8(key).map_err(|_| {
-                        store::Error::InternalError("Failed to deserialize config key".to_string())
+                        trc::Error::corrupted_key(key, value.into(), trc::location!())
                     })?;
 
                     if !patterns.is_local_key(key) {
@@ -190,7 +169,7 @@ impl ConfigManager {
         Ok(results)
     }
 
-    pub async fn set<I, T>(&self, keys: I) -> store::Result<()>
+    pub async fn set<I, T>(&self, keys: I) -> trc::Result<()>
     where
         I: IntoIterator<Item = T>,
         T: Into<ConfigKey>,
@@ -237,7 +216,7 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub async fn clear(&self, key: impl AsRef<str>) -> store::Result<()> {
+    pub async fn clear(&self, key: impl AsRef<str>) -> trc::Result<()> {
         let key = key.as_ref();
 
         if self.cfg_local_patterns.is_local_key(key) {
@@ -254,7 +233,7 @@ impl ConfigManager {
         }
     }
 
-    pub async fn clear_prefix(&self, key: impl AsRef<str>) -> store::Result<()> {
+    pub async fn clear_prefix(&self, key: impl AsRef<str>) -> trc::Result<()> {
         let key = key.as_ref();
 
         // Delete local keys
@@ -280,7 +259,7 @@ impl ConfigManager {
             .await
     }
 
-    async fn update_local(&self, map: BTreeMap<String, String>) -> store::Result<()> {
+    async fn update_local(&self, map: BTreeMap<String, String>) -> trc::Result<()> {
         let mut cfg_text = String::with_capacity(1024);
         for (key, value) in &map {
             cfg_text.push_str(key);
@@ -336,17 +315,23 @@ impl ConfigManager {
         tokio::fs::write(&self.cfg_local_path, cfg_text)
             .await
             .map_err(|err| {
-                store::Error::InternalError(format!(
-                    "Failed to write local configuration file: {err}"
-                ))
+                trc::EventType::Config(trc::ConfigEvent::WriteError)
+                    .reason(err)
+                    .details("Failed to write local configuration")
+                    .ctx(trc::Key::Path, self.cfg_local_path.display().to_string())
             })
     }
 
-    pub async fn update_config_resource(&self, resource_id: &str) -> store::Result<Option<String>> {
+    pub async fn update_config_resource(&self, resource_id: &str) -> trc::Result<Option<String>> {
         let external = self
             .fetch_config_resource(resource_id)
             .await
-            .map_err(store::Error::InternalError)?;
+            .map_err(|reason| {
+                trc::EventType::Config(trc::ConfigEvent::FetchError)
+                    .caused_by(trc::location!())
+                    .details("Failed to fetch external configuration")
+                    .ctx(trc::Key::Reason, reason)
+            })?;
 
         if self
             .get(&external.id)
@@ -354,15 +339,21 @@ impl ConfigManager {
             .map_or(true, |v| v != external.version)
         {
             self.set(external.keys).await?;
+
+            trc::event!(
+                Config(trc::ConfigEvent::ImportExternal),
+                Version = external.version.clone(),
+                Id = resource_id.to_string(),
+            );
+
             Ok(Some(external.version))
         } else {
-            tracing::debug!(
-                context = "config",
-                event = "update",
-                resource_id = resource_id,
-                version = external.version,
-                "Configuration version is up-to-date"
+            trc::event!(
+                Config(trc::ConfigEvent::AlreadyUpToDate),
+                Version = external.version,
+                Id = resource_id.to_string(),
             );
+
             Ok(None)
         }
     }
@@ -384,8 +375,8 @@ impl ConfigManager {
         };
         for (key, value) in config.keys {
             if key.starts_with("version.") {
-                external.id = key.clone();
-                external.version = value.clone();
+                external.id.clone_from(&key);
+                external.version.clone_from(&value);
                 external.keys.push(ConfigKey::from((key, value)));
             } else if key.starts_with("queue.quota.")
                 || key.starts_with("queue.throttle.")
@@ -395,13 +386,11 @@ impl ConfigManager {
             {
                 external.keys.push(ConfigKey::from((key, value)));
             } else {
-                tracing::debug!(
-                    context = "config",
-                    event = "import",
-                    key = key,
-                    value = value,
-                    resource_id = resource_id,
-                    "Ignoring key"
+                trc::event!(
+                    Config(trc::ConfigEvent::ExternalKeyIgnored),
+                    Key = key,
+                    Value = value,
+                    Id = resource_id.to_string(),
                 );
             }
         }
@@ -413,7 +402,7 @@ impl ConfigManager {
         }
     }
 
-    pub async fn get_services(&self) -> store::Result<Vec<(String, u16, bool)>> {
+    pub async fn get_services(&self) -> trc::Result<Vec<(String, u16, bool)>> {
         let mut result = Vec::new();
 
         for listener in self
@@ -502,18 +491,21 @@ impl Patterns {
                 Pattern::Include(MatchType::StartsWith("directory.".to_string())),
                 Pattern::Include(MatchType::StartsWith("tracer.".to_string())),
                 Pattern::Exclude(MatchType::StartsWith("server.blocked-ip.".to_string())),
+                Pattern::Exclude(MatchType::StartsWith("server.allowed-ip.".to_string())),
                 Pattern::Include(MatchType::StartsWith("server.".to_string())),
                 Pattern::Include(MatchType::StartsWith("certificate.".to_string())),
                 Pattern::Include(MatchType::StartsWith(
                     "authentication.fallback-admin.".to_string(),
                 )),
-                Pattern::Include(MatchType::Equal("cluster.node-id".to_string())),
+                Pattern::Exclude(MatchType::Equal("cluster.key".to_string())),
+                Pattern::Include(MatchType::StartsWith("cluster.".to_string())),
                 Pattern::Include(MatchType::Equal("storage.data".to_string())),
                 Pattern::Include(MatchType::Equal("storage.blob".to_string())),
                 Pattern::Include(MatchType::Equal("storage.lookup".to_string())),
                 Pattern::Include(MatchType::Equal("storage.fts".to_string())),
                 Pattern::Include(MatchType::Equal("storage.directory".to_string())),
                 Pattern::Include(MatchType::Equal("lookup.default.hostname".to_string())),
+                Pattern::Include(MatchType::Equal("enterprise.license-key".to_string())),
             ];
         }
 

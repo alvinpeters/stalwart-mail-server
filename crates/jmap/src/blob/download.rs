@@ -1,41 +1,22 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::ops::Range;
 
-use jmap_proto::{
-    error::method::MethodError,
-    types::{
-        acl::Acl,
-        blob::{BlobId, BlobSection},
-        collection::Collection,
-    },
+use jmap_proto::types::{
+    acl::Acl,
+    blob::{BlobId, BlobSection},
+    collection::Collection,
 };
 use mail_parser::{
     decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode},
     Encoding,
 };
 use store::BlobClass;
+use trc::AddContext;
 use utils::BlobHash;
 
 use crate::{auth::AccessToken, JMAP};
@@ -46,20 +27,14 @@ impl JMAP {
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
-    ) -> Result<Option<Vec<u8>>, MethodError> {
+    ) -> trc::Result<Option<Vec<u8>>> {
         if !self
             .core
             .storage
             .data
             .blob_has_access(&blob_id.hash, &blob_id.class)
             .await
-            .map_err(|err| {
-                tracing::error!(event = "error",
-                            context = "blob_download",
-                            error = ?err,
-                            "Failed to validate blob access");
-                MethodError::ServerPartialFail
-            })?
+            .caused_by(trc::location!())?
         {
             return Ok(None);
         }
@@ -112,7 +87,7 @@ impl JMAP {
         &self,
         hash: &BlobHash,
         section: &BlobSection,
-    ) -> Result<Option<Vec<u8>>, MethodError> {
+    ) -> trc::Result<Option<Vec<u8>>> {
         Ok(self
             .get_blob(
                 hash,
@@ -130,38 +105,27 @@ impl JMAP {
         &self,
         hash: &BlobHash,
         range: Range<usize>,
-    ) -> Result<Option<Vec<u8>>, MethodError> {
-        match self.core.storage.blob.get_blob(hash.as_ref(), range).await {
-            Ok(blob) => Ok(blob),
-            Err(err) => {
-                tracing::error!(event = "error",
-                                context = "blob_store",
-                                blob_id = ?hash,
-                                error = ?err,
-                                "Failed to retrieve blob");
-                Err(MethodError::ServerPartialFail)
-            }
-        }
+    ) -> trc::Result<Option<Vec<u8>>> {
+        self.core
+            .storage
+            .blob
+            .get_blob(hash.as_ref(), range)
+            .await
+            .caused_by(trc::location!())
     }
 
     pub async fn has_access_blob(
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
-    ) -> Result<bool, MethodError> {
+    ) -> trc::Result<bool> {
         Ok(self
             .core
             .storage
             .data
             .blob_has_access(&blob_id.hash, &blob_id.class)
             .await
-            .map_err(|err| {
-                tracing::error!(event = "error",
-                                context = "has_access_blob",
-                                error = ?err,
-                                "Failed to validate blob access");
-                MethodError::ServerPartialFail
-            })?
+            .caused_by(trc::location!())?
             && match &blob_id.class {
                 BlobClass::Linked {
                     account_id,

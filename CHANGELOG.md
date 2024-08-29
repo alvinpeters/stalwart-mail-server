@@ -2,6 +2,167 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.9.3] - 2024-08-29
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+## Added
+- Dashboard (Enterprise feature)
+- Alerts (Enterprise feature)
+- SYN Flood (session "loitering") attack protection (#482)
+- Mailbox brute force protection (#688)
+- Mail from is allowed (`session.mail.is-allowed`) expression (#609)
+
+### Changed
+- `authentication.fail2ban` setting renamed to `server.fail2ban.authentication`.
+- Added elapsed times to message filtering events.
+
+### Fixed
+- Include queueId in MTA Hooks (#708)
+- Do not insert empty keywords in FTS index.
+
+## [0.9.2] - 2024-08-21
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+## Added
+- Message delivery history (Enterprise feature)
+- Live tracing and logging (Enterprise feature)
+- SQL Read Replicas (Enterprise feature)
+- Distributed S3 Blob Store (Enterprise feature)
+
+### Changed
+
+### Fixed
+- Autodiscover request parser issues.
+- Do not create tables when using SQL as an external directory (fixes #291)
+- Do not hardcode logger id (fixes #348)
+- Include `Forwarded-For IP` address in `http.request-url` event (fixes #682)
+
+## [0.9.1] - 2024-08-08
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+## Added
+- Metrics support (closes #478)
+  - OpenTelemetry Push Exporter
+  - Prometheus Pull Exporter (closes #275)
+- HTTP endpoint access controls (closes #266 #329 #542)
+- Add `options` setting to PostgreSQL driver (closes #662)
+- Add `isActive` property to defaults on Sieve/get JMAP method (closes #624)
+
+### Changed
+- Perform `must-match-sender` checks after sender rewriting (closes #394)
+- Only perform email ingest duplicate check on the target mailbox (closes #632)
+
+### Fixed
+- Properly parse `Forwarded` and `X-Forwarded-For` headers (fixes #669)
+- Resolve DKIM macros when generating DNS records (fixes #666)
+- Fixed `is_local_domain` Sieve function (fixes #622)
+
+## [0.9.0] - 2024-08-01
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin. This version includes breaking changes to the Webhooks configuration and produces a slightly different log output, read [UPGRADING.md](UPGRADING.md) for details.
+
+## Added
+- Improved and faster tracing and logging.
+- Customizable event logging levels.
+
+### Changed
+
+### Fixed
+- ManageSieve: Return capabilities after successful `STARTTLS`
+- Do not provide `{auth_authen}` Milter macro unless the user is authenticated
+
+## [0.8.5] - 2024-07-07
+
+To upgrade replace the `stalwart-mail` binary.
+
+## Added
+- Restore deleted e-mails (Enterprise Edition only)
+- Kubernetes (K8S) livenessProbe and readinessProbe endpoints.
+
+### Changed
+- Avoid sending reports for DMARC/delivery reports (#173)
+
+### Fixed
+- Refresh old FoundationDB read transactions (#520)
+- Subscribing shared mailboxes doesn't work (#251)
+
+## [0.8.4] - 2024-07-03
+
+To upgrade replace the `stalwart-mail` binary.
+
+## Added
+
+### Changed
+
+### Fixed
+- Fix TOTP validation order.
+- Increase Jemalloc page size on armv7 builds.
+
+## [0.8.3] - 2024-07-01
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+## Added
+- Two-factor authentication with Time-based One-Time Passwords (#436)
+- Application passwords (#479).
+- Option to disable user accounts.
+
+### Changed
+- DANE success on EndEntity match regardless of TrustAnchor validation.
+
+### Fixed
+- Fix ManageSieve GETSCRIPT response: Add missing CRLF (#563)
+- Do not return CAPABILITIES after ManageSieve AUTH=PLAIN SASL exchange (#548)
+- POP3 QUIT must write a response (#568)
+
+## [0.8.2] - 2024-06-22
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin and spam filter versions.
+
+## Added
+- Webhooks support (#480)
+- MTA Hooks (like milter but over HTTP)
+- Manually train and test spam classifier (#473 #264 #257 #471)
+- Allow configuring default mailbox names, roles and subscriptions (#125 #290 #458 #498)
+- Include `robots.txt` (#542)
+
+### Changed
+- Milter support on all SMTP stages (#183)
+- Do not announce `STARTTLS` if the listener does not support it.
+
+### Fixed
+- Incoming reports stored in the wrong subspace (#543)
+- Return `OK` after a successful ManageSieve SASL authentication flow (#187)
+- Case-insensitive search in settings API (#487)
+- Fix `session.rcpt.script` default variable name (#502)
+
+## [0.8.1] - 2024-05-23
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin and spam filter versions.
+
+## Added
+- POP3 support.
+- DKIM signature length exploit protection.
+- Faster email deletion.
+- Junk/Trash folder auto-expunge and changelog auto-expiry (#403)
+- IP allowlists.
+- HTTP Strict Transport Security option.
+- Add TLS Reporting DNS entry (#464).
+
+### Changed
+- Use separate account for master user.
+- Include server hostname in SMTP greetings (#448).
+
+### Fixed
+- IP addresses trigger `R_SUSPICIOUS_URL` false positive (#461 #419).
+- JMAP identities should not return null signatures.
+- Include authentication headers and check queue quotas on Sieve message forwards.
+- ARC seal using just one signature.
+- Remove technical subdomains from MTA-STS policies and TLS records (#429).
+
 ## [0.8.0] - 2024-05-13
 
 This version uses a different database layout which is incompatible with previous versions. Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.

@@ -1,47 +1,41 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::ops::{BitAndAssign, Range};
+use std::{
+    ops::{BitAndAssign, Range},
+    time::Instant,
+};
 
 use roaring::RoaringBitmap;
+use trc::{AddContext, StoreEvent};
 
 use crate::{
     write::{
-        key::KeySerializer, now, AnyKey, AssignedIds, Batch, BitmapClass, BitmapHash, ReportClass,
-        ValueClass,
+        key::{DeserializeBigEndian, KeySerializer},
+        now, AnyClass, AnyKey, AssignedIds, Batch, BatchBuilder, BitmapClass, BitmapHash,
+        Operation, ReportClass, ValueClass, ValueOp,
     },
     BitmapKey, Deserialize, IterateParams, Key, Store, ValueKey, SUBSPACE_BITMAP_ID,
     SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT, SUBSPACE_INDEXES, SUBSPACE_LOGS, U32_LEN,
 };
 
+use super::DocumentSet;
+
 #[cfg(feature = "test_mode")]
-lazy_static::lazy_static! {
-pub static ref BITMAPS: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashSet<u32>>>> =
-                    std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-}
+#[allow(clippy::type_complexity)]
+static BITMAPS: std::sync::LazyLock<
+    std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashSet<u32>>>,
+    >,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+});
 
 impl Store {
-    pub async fn get_value<U>(&self, key: impl Key) -> crate::Result<Option<U>>
+    pub async fn get_value<U>(&self, key: impl Key) -> trc::Result<Option<U>>
     where
         U: Deserialize + 'static,
     {
@@ -56,14 +50,17 @@ impl Store {
             Self::MySQL(store) => store.get_value(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_value(key).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_value(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
     pub async fn get_bitmap(
         &self,
         key: BitmapKey<BitmapClass<u32>>,
-    ) -> crate::Result<Option<RoaringBitmap>> {
+    ) -> trc::Result<Option<RoaringBitmap>> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_bitmap(key).await,
@@ -75,17 +72,20 @@ impl Store {
             Self::MySQL(store) => store.get_bitmap(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_bitmap(key).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_bitmap(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
     pub async fn get_bitmaps_intersection(
         &self,
         keys: Vec<BitmapKey<BitmapClass<u32>>>,
-    ) -> crate::Result<Option<RoaringBitmap>> {
+    ) -> trc::Result<Option<RoaringBitmap>> {
         let mut result: Option<RoaringBitmap> = None;
         for key in keys {
-            if let Some(bitmap) = self.get_bitmap(key).await? {
+            if let Some(bitmap) = self.get_bitmap(key).await.caused_by(trc::location!())? {
                 if let Some(result) = &mut result {
                     result.bitand_assign(&bitmap);
                     if result.is_empty() {
@@ -104,9 +104,10 @@ impl Store {
     pub async fn iterate<T: Key>(
         &self,
         params: IterateParams<T>,
-        cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> crate::Result<bool> + Sync + Send,
-    ) -> crate::Result<()> {
-        match self {
+        cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+    ) -> trc::Result<()> {
+        let start_time = Instant::now();
+        let result = match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.iterate(params, cb).await,
             #[cfg(feature = "foundation")]
@@ -117,14 +118,24 @@ impl Store {
             Self::MySQL(store) => store.iterate(params, cb).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.iterate(params, cb).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.iterate(params, cb).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!());
+
+        trc::event!(
+            Store(StoreEvent::DataIterate),
+            Elapsed = start_time.elapsed(),
+        );
+
+        result
     }
 
     pub async fn get_counter(
         &self,
         key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
-    ) -> crate::Result<i64> {
+    ) -> trc::Result<i64> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_counter(key).await,
@@ -136,14 +147,16 @@ impl Store {
             Self::MySQL(store) => store.get_counter(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_counter(key).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_counter(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn write(&self, batch: Batch) -> crate::Result<AssignedIds> {
+    pub async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
         #[cfg(feature = "test_mode")]
         if std::env::var("PARANOID_WRITE").map_or(false, |v| v == "1") {
-            use crate::write::Operation;
             let mut account_id = u32::MAX;
             let mut collection = u8::MAX;
             let mut document_id = u32::MAX;
@@ -199,8 +212,11 @@ impl Store {
                 Self::MySQL(store) => store.write(batch).await,
                 #[cfg(feature = "rocks")]
                 Self::RocksDb(store) => store.write(batch).await,
-                Self::None => Err(crate::Error::InternalError("No store configured".into())),
-            }?;
+                #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+                Self::SQLReadReplica(store) => store.write(batch).await,
+                Self::None => Err(trc::StoreEvent::NotConfigured.into()),
+            }
+            .caused_by(trc::location!())?;
 
             for (key, class, document_id, set) in bitmaps {
                 let mut bitmaps = BITMAPS.lock();
@@ -229,7 +245,10 @@ impl Store {
             return Ok(AssignedIds::default());
         }
 
-        match self {
+        let start_time = Instant::now();
+        let ops = batch.ops.len();
+
+        let result = match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.write(batch).await,
             #[cfg(feature = "foundation")]
@@ -240,11 +259,21 @@ impl Store {
             Self::MySQL(store) => store.write(batch).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.write(batch).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
-        }
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.write(batch).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
+        };
+
+        trc::event!(
+            Store(StoreEvent::DataWrite),
+            Elapsed = start_time.elapsed(),
+            Total = ops,
+        );
+
+        result
     }
 
-    pub async fn purge_store(&self) -> crate::Result<()> {
+    pub async fn purge_store(&self) -> trc::Result<()> {
         // Delete expired reports
         let now = now();
         self.delete_range(
@@ -254,7 +283,8 @@ impl Store {
                 expires: now,
             })),
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
         self.delete_range(
             ValueKey::from(ValueClass::Report(ReportClass::Tls { id: 0, expires: 0 })),
             ValueKey::from(ValueClass::Report(ReportClass::Tls {
@@ -262,7 +292,8 @@ impl Store {
                 expires: now,
             })),
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
         self.delete_range(
             ValueKey::from(ValueClass::Report(ReportClass::Arf { id: 0, expires: 0 })),
             ValueKey::from(ValueClass::Report(ReportClass::Arf {
@@ -270,7 +301,8 @@ impl Store {
                 expires: now,
             })),
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         match self {
             #[cfg(feature = "sqlite")]
@@ -283,11 +315,14 @@ impl Store {
             Self::MySQL(store) => store.purge_store().await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.purge_store().await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.purge_store().await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn delete_range(&self, from: impl Key, to: impl Key) -> crate::Result<()> {
+    pub async fn delete_range(&self, from: impl Key, to: impl Key) -> trc::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.delete_range(from, to).await,
@@ -299,11 +334,93 @@ impl Store {
             Self::MySQL(store) => store.delete_range(from, to).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.delete_range(from, to).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.delete_range(from, to).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn purge_account(&self, account_id: u32) -> crate::Result<()> {
+    pub async fn delete_documents(
+        &self,
+        subspace: u8,
+        account_id: u32,
+        collection: u8,
+        collection_offset: Option<usize>,
+        document_ids: &impl DocumentSet,
+    ) -> trc::Result<()> {
+        // Serialize keys
+        let (from_key, to_key) = if collection_offset.is_some() {
+            (
+                KeySerializer::new(U32_LEN + 2)
+                    .write(account_id)
+                    .write(collection),
+                KeySerializer::new(U32_LEN + 2)
+                    .write(account_id)
+                    .write(collection + 1),
+            )
+        } else {
+            (
+                KeySerializer::new(U32_LEN).write(account_id),
+                KeySerializer::new(U32_LEN).write(account_id + 1),
+            )
+        };
+
+        // Find keys to delete
+        let mut delete_keys = Vec::new();
+        self.iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace,
+                    key: from_key.finalize(),
+                },
+                AnyKey {
+                    subspace,
+                    key: to_key.finalize(),
+                },
+            )
+            .no_values(),
+            |key, _| {
+                if collection_offset.map_or(true, |offset| {
+                    key.get(key.len() - U32_LEN - offset).copied() == Some(collection)
+                }) {
+                    let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
+                    if document_ids.contains(document_id) {
+                        delete_keys.push(key.to_vec());
+                    }
+                }
+
+                Ok(true)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+
+        // Remove keys
+        let mut batch = BatchBuilder::new();
+
+        for key in delete_keys {
+            if batch.ops.len() >= 1000 {
+                self.write(std::mem::take(&mut batch).build())
+                    .await
+                    .caused_by(trc::location!())?;
+            }
+            batch.ops.push(Operation::Value {
+                class: ValueClass::Any(AnyClass { subspace, key }),
+                op: ValueOp::Clear,
+            });
+        }
+
+        if !batch.is_empty() {
+            self.write(batch.build())
+                .await
+                .caused_by(trc::location!())?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn purge_account(&self, account_id: u32) -> trc::Result<()> {
         for subspace in [
             SUBSPACE_BITMAP_ID,
             SUBSPACE_BITMAP_TAG,
@@ -321,7 +438,8 @@ impl Store {
                     key: KeySerializer::new(U32_LEN).write(account_id + 1).finalize(),
                 },
             )
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
         }
 
         for (from_class, to_class) in [
@@ -352,17 +470,14 @@ impl Store {
                     class: to_class,
                 },
             )
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
         }
 
         Ok(())
     }
 
-    pub async fn get_blob(
-        &self,
-        key: &[u8],
-        range: Range<usize>,
-    ) -> crate::Result<Option<Vec<u8>>> {
+    pub async fn get_blob(&self, key: &[u8], range: Range<usize>) -> trc::Result<Option<Vec<u8>>> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_blob(key, range).await,
@@ -374,11 +489,14 @@ impl Store {
             Self::MySQL(store) => store.get_blob(key, range).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_blob(key, range).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_blob(key, range).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn put_blob(&self, key: &[u8], data: &[u8]) -> crate::Result<()> {
+    pub async fn put_blob(&self, key: &[u8], data: &[u8]) -> trc::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.put_blob(key, data).await,
@@ -390,11 +508,14 @@ impl Store {
             Self::MySQL(store) => store.put_blob(key, data).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.put_blob(key, data).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.put_blob(key, data).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn delete_blob(&self, key: &[u8]) -> crate::Result<bool> {
+    pub async fn delete_blob(&self, key: &[u8]) -> trc::Result<bool> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.delete_blob(key).await,
@@ -406,8 +527,11 @@ impl Store {
             Self::MySQL(store) => store.delete_blob(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.delete_blob(key).await,
-            Self::None => Err(crate::Error::InternalError("No store configured".into())),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.delete_blob(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
     #[cfg(feature = "test_mode")]
@@ -436,6 +560,9 @@ impl Store {
             SUBSPACE_REPORT_OUT,
             SUBSPACE_REPORT_IN,
             SUBSPACE_FTS_INDEX,
+            SUBSPACE_TELEMETRY_SPAN,
+            SUBSPACE_TELEMETRY_METRIC,
+            SUBSPACE_TELEMETRY_INDEX,
         ] {
             self.delete_range(
                 AnyKey {
@@ -466,10 +593,7 @@ impl Store {
     pub async fn blob_expire_all(&self) {
         use utils::{BlobHash, BLOB_HASH_LEN};
 
-        use crate::{
-            write::{key::DeserializeBigEndian, BatchBuilder, BlobOp, Operation, ValueOp},
-            U64_LEN,
-        };
+        use crate::{write::BlobOp, U64_LEN};
 
         // Delete all temporary hashes
         let from_key = ValueKey {
@@ -495,7 +619,7 @@ impl Store {
         self.iterate(
             IterateParams::new(from_key, to_key).ascending().no_values(),
             |key, _| {
-                let account_id = key.deserialize_be_u32(0)?;
+                let account_id = key.deserialize_be_u32(0).caused_by(trc::location!())?;
                 if account_id != last_account_id {
                     last_account_id = account_id;
                     batch.with_account_id(account_id);
@@ -507,7 +631,9 @@ impl Store {
                             key.get(U32_LEN..U32_LEN + BLOB_HASH_LEN).unwrap(),
                         )
                         .unwrap(),
-                        until: key.deserialize_be_u64(key.len() - U64_LEN)?,
+                        until: key
+                            .deserialize_be_u64(key.len() - U64_LEN)
+                            .caused_by(trc::location!())?,
                     }),
                     op: ValueOp::Clear,
                 });
@@ -522,9 +648,7 @@ impl Store {
 
     #[cfg(feature = "test_mode")]
     pub async fn lookup_expire_all(&self) {
-        use crate::write::{
-            key::DeserializeBigEndian, BatchBuilder, LookupClass, Operation, ValueOp,
-        };
+        use crate::write::LookupClass;
 
         // Delete all temporary counters
         let from_key = ValueKey::from(ValueClass::Lookup(LookupClass::Key(vec![0u8])));
@@ -534,7 +658,7 @@ impl Store {
         let mut expired_counters = Vec::new();
 
         self.iterate(IterateParams::new(from_key, to_key), |key, value| {
-            let expiry = value.deserialize_be_u64(0)?;
+            let expiry = value.deserialize_be_u64(0).caused_by(trc::location!())?;
             if expiry == 0 {
                 expired_counters.push(key.to_vec());
             } else if expiry != u64::MAX {
@@ -622,6 +746,9 @@ impl Store {
             (SUBSPACE_BITMAP_TAG, false),
             (SUBSPACE_BITMAP_TEXT, false),
             (SUBSPACE_INDEXES, false),
+            (SUBSPACE_TELEMETRY_SPAN, true),
+            (SUBSPACE_TELEMETRY_METRIC, true),
+            (SUBSPACE_TELEMETRY_INDEX, true),
         ] {
             let from_key = crate::write::AnyKey {
                 subspace,
@@ -649,31 +776,31 @@ impl Store {
 
                             match key[5] {
                                 BM_DOCUMENT_IDS => {
-                                    eprint!("Found document ids bitmap");
+                                    print!("Found document ids bitmap");
                                 }
                                 BM_TAG => {
-                                    eprint!(
+                                    print!(
                                         "Found tagged id {} bitmap",
                                         key[7..].iter().next_leb128::<u32>().unwrap()
                                     );
                                 }
                                 TAG_TEXT => {
-                                    eprint!(
+                                    print!(
                                         "Found tagged text {:?} bitmap",
                                         String::from_utf8_lossy(&key[7..])
                                     );
                                 }
                                 TAG_STATIC => {
-                                    eprint!("Found tagged static {} bitmap", key[7]);
+                                    print!("Found tagged static {} bitmap", key[7]);
                                 }
                                 other => {
                                     if other & BM_TEXT == BM_TEXT {
-                                        eprint!(
+                                        print!(
                                             "Found text hash {:?} bitmap",
                                             String::from_utf8_lossy(&key[7..])
                                         );
                                     } else {
-                                        eprint!("Found unknown bitmap");
+                                        print!("Found unknown bitmap");
                                     }
                                 }
                             }

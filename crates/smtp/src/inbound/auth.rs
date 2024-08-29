@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use common::{listener::SessionStream, AuthResult};
+use common::listener::SessionStream;
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
 use smtp_proto::{IntoString, AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2};
+use trc::{AuthEvent, SmtpEvent};
 
 use crate::core::Session;
 
@@ -183,17 +167,16 @@ impl<T: SessionStream> Session<T> {
             match self
                 .core
                 .core
-                .authenticate(directory, &credentials, self.data.remote_ip, false)
+                .authenticate(
+                    directory,
+                    self.data.session_id,
+                    &credentials,
+                    self.data.remote_ip,
+                    false,
+                )
                 .await
             {
-                Ok(AuthResult::Success(principal)) => {
-                    tracing::debug!(
-                        parent: &self.span,
-                        context = "auth",
-                        event = "authenticate",
-                        result = "success"
-                    );
-
+                Ok(principal) => {
                     self.data.authenticated_as = authenticated_as.to_lowercase();
                     self.data.authenticated_emails = principal
                         .emails
@@ -205,36 +188,35 @@ impl<T: SessionStream> Session<T> {
                         .await?;
                     return Ok(false);
                 }
-                Ok(AuthResult::Failure) => {
-                    tracing::debug!(
-                        parent: &self.span,
-                        context = "auth",
-                        event = "authenticate",
-                        result = "failed"
-                    );
+                Err(err) => {
+                    let reason = *err.as_ref();
 
-                    return self
-                        .auth_error(b"535 5.7.8 Authentication credentials invalid.\r\n")
-                        .await;
-                }
-                Ok(AuthResult::Banned) => {
-                    tracing::debug!(
-                        parent: &self.span,
-                        context = "auth",
-                        event = "authenticate",
-                        result = "banned"
-                    );
+                    trc::error!(err.span_id(self.data.session_id));
 
-                    return Err(());
+                    match reason {
+                        trc::EventType::Auth(trc::AuthEvent::Failed) => {
+                            return self
+                                .auth_error(b"535 5.7.8 Authentication credentials invalid.\r\n")
+                                .await;
+                        }
+                        trc::EventType::Auth(trc::AuthEvent::MissingTotp) => {
+                            return self
+                            .auth_error(
+                                b"334 5.7.8 Missing TOTP token, try with 'secret$totp_code'.\r\n",
+                            )
+                            .await;
+                        }
+                        trc::EventType::Security(_) => {
+                            return Err(());
+                        }
+                        _ => (),
+                    }
                 }
-                _ => (),
             }
         } else {
-            tracing::warn!(
-                parent: &self.span,
-                context = "auth",
-                event = "error",
-                "No lookup list configured for authentication."
+            trc::event!(
+                Smtp(SmtpEvent::MissingAuthDirectory),
+                SpanId = self.data.session_id,
             );
         }
         self.write(b"454 4.7.0 Temporary authentication failure\r\n")
@@ -250,14 +232,13 @@ impl<T: SessionStream> Session<T> {
         if self.data.auth_errors < self.params.auth_errors_max {
             Ok(false)
         } else {
+            trc::event!(
+                Auth(AuthEvent::TooManyAttempts),
+                SpanId = self.data.session_id,
+            );
+
             self.write(b"421 4.3.0 Too many authentication errors, disconnecting.\r\n")
                 .await?;
-            tracing::debug!(
-                parent: &self.span,
-                event = "disconnect",
-                reason = "auth-errors",
-                "Too many authentication errors."
-            );
             Err(())
         }
     }

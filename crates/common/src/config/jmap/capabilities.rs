@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use ahash::AHashSet;
 use jmap_proto::{
     request::capability::{
@@ -12,7 +18,7 @@ use utils::{config::Config, map::vec_map::VecMap};
 use super::settings::JmapConfig;
 
 impl JmapConfig {
-    pub fn add_capabilites(&mut self, config: &mut Config) {
+    pub fn add_capabilities(&mut self, config: &mut Config) {
         // Add core capabilities
         self.capabilities.session.append(
             Capability::Core,

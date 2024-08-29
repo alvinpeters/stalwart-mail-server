@@ -1,6 +1,6 @@
 [package]
 name = "jmap"
-version = "0.8.0"
+version = "0.9.3"
 edition = "2021"
 resolver = "2"
 
@@ -12,11 +12,12 @@ smtp = { path =  "../smtp" }
 utils = { path =  "../utils" }
 common = { path =  "../common" }
 directory = { path =  "../directory" }
+trc = { path = "../trc" }
 smtp-proto = { version = "0.1" }
 mail-parser = { version = "0.9", features = ["full_encoding", "serde_support", "ludicrous_mode"] } 
 mail-builder = { version = "0.3", features = ["ludicrous_mode"] }
-mail-send = { version = "0.4", default-features = false, features = ["cram-md5"] }
-mail-auth = { version = "0.3", features = ["generate"] }
+mail-send = { version = "0.4", default-features = false, features = ["cram-md5", "ring", "tls12"] }
+mail-auth = { version = "0.4", features = ["generate"] }
 sieve-rs = { version = "0.5" } 
 serde = { version = "1.0", features = ["derive"]}
 serde_json = "1.0"
@@ -24,7 +25,6 @@ hyper = { version = "1.0.1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1.1", features = ["tokio"] }
 http-body-util = "0.1.0"
 form_urlencoded = "1.1.0"
-tracing = "0.1"
 tokio = { version = "1.23", features = ["rt"] }
 aes-gcm = "0.10.1"
 aes-gcm-siv = "0.11.1"
@@ -39,10 +39,10 @@ hkdf = "0.12.3"
 sha1 = "0.10"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2"]}
-tokio-tungstenite = "0.21"
-tungstenite = "0.21"
+tokio-tungstenite = "0.23"
+tungstenite = "0.23"
 chrono = "0.4"
-dashmap = "5.4"
+dashmap = "6.0"
 aes = "0.8.3"
 cbc = { version = "0.1.2", features = ["alloc"] }
 sequoia-openpgp = { version = "1.16", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
@@ -56,10 +56,9 @@ async-trait = "0.1.68"
 lz4_flex = { version = "0.11", default-features = false }
 rev_lines = "0.3.0"
 x509-parser = "0.16.0"
-quick-xml = "0.31"
-
-[dev-dependencies]
-ece = "2.2"
+quick-xml = "0.36"
+memory-stats = "1.2.0"
 
 [features]
 test_mode = []
+enterprise = []

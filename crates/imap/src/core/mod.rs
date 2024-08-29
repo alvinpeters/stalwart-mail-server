@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     collections::BTreeMap,
@@ -33,7 +16,7 @@ use dashmap::DashMap;
 use imap_proto::{
     protocol::{list::Attribute, ProtocolVersion},
     receiver::Receiver,
-    Command, ResponseCode, StatusResponse,
+    Command,
 };
 use jmap::{
     auth::{rate_limit::ConcurrencyLimiters, AccessToken},
@@ -43,6 +26,7 @@ use tokio::{
     io::{ReadHalf, WriteHalf},
     sync::watch,
 };
+use trc::AddContext;
 use utils::lru_cache::LruCache;
 
 pub mod client;
@@ -93,14 +77,14 @@ pub struct Session<T: SessionStream> {
     pub stream_tx: Arc<tokio::sync::Mutex<WriteHalf<T>>>,
     pub in_flight: InFlight,
     pub remote_addr: IpAddr,
-    pub span: tracing::Span,
+    pub session_id: u64,
 }
 
 pub struct SessionData<T: SessionStream> {
     pub account_id: u32,
     pub jmap: JMAP,
     pub imap: Arc<Inner>,
-    pub span: tracing::Span,
+    pub session_id: u64,
     pub mailboxes: parking_lot::Mutex<Vec<Account>>,
     pub stream_tx: Arc<tokio::sync::Mutex<WriteHalf<T>>>,
     pub state: AtomicU32,
@@ -235,14 +219,11 @@ impl<T: SessionStream> State<T> {
 }
 
 impl<T: SessionStream> SessionData<T> {
-    pub async fn get_access_token(&self) -> crate::op::Result<Arc<AccessToken>> {
+    pub async fn get_access_token(&self) -> trc::Result<Arc<AccessToken>> {
         self.jmap
             .get_cached_access_token(self.account_id)
             .await
-            .ok_or_else(|| {
-                StatusResponse::no("Failed to obtain access token")
-                    .with_code(ResponseCode::ContactAdmin)
-            })
+            .caused_by(trc::location!())
     }
 
     pub fn replace_stream_tx<U: SessionStream>(
@@ -253,7 +234,7 @@ impl<T: SessionStream> SessionData<T> {
             account_id: self.account_id,
             jmap: self.jmap,
             imap: self.imap,
-            span: self.span,
+            session_id: self.session_id,
             mailboxes: self.mailboxes,
             stream_tx: new_stream,
             state: self.state,

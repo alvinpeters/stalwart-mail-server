@@ -1,28 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use jmap_proto::{
-    error::{method::MethodError, set::SetError},
+    error::set::SetError,
     method::{
         copy::{CopyRequest, CopyResponse, RequestArguments},
         set::{self, SetRequest},
@@ -55,9 +38,10 @@ use store::{
     },
     BlobClass, Serialize,
 };
+use trc::AddContext;
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, mailbox::UidMailbox, services::housekeeper::Event, JMAP};
+use crate::{api::http::HttpSessionData, auth::AccessToken, mailbox::UidMailbox, JMAP};
 
 use super::{
     index::{EmailIndexBuilder, TrimTextValue, VisitValues, MAX_ID_LENGTH, MAX_SORT_FIELD_LENGTH},
@@ -71,14 +55,15 @@ impl JMAP {
         request: CopyRequest<RequestArguments>,
         access_token: &AccessToken,
         next_call: &mut Option<Call<RequestMethod>>,
-    ) -> Result<CopyResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> trc::Result<CopyResponse> {
         let account_id = request.account_id.document_id();
         let from_account_id = request.from_account_id.document_id();
 
         if account_id == from_account_id {
-            return Err(MethodError::InvalidArguments(
-                "From accountId is equal to fromAccountId".to_string(),
-            ));
+            return Err(trc::JmapEvent::InvalidArguments
+                .into_err()
+                .details("From accountId is equal to fromAccountId"));
         }
         let old_state = self
             .assert_state(account_id, Collection::Email, &request.if_in_state)
@@ -235,6 +220,7 @@ impl JMAP {
                     mailboxes,
                     keywords,
                     received_at,
+                    session.session_id,
                 )
                 .await?
             {
@@ -294,7 +280,8 @@ impl JMAP {
         mailboxes: Vec<u32>,
         keywords: Vec<Keyword>,
         received_at: Option<UTCDate>,
-    ) -> Result<Result<IngestedEmail, SetError>, MethodError> {
+        session_id: u64,
+    ) -> trc::Result<Result<IngestedEmail, SetError>> {
         // Obtain metadata
         let mut metadata = if let Some(metadata) = self
             .get_property::<Bincode<MessageMetadata>>(
@@ -314,10 +301,19 @@ impl JMAP {
         };
 
         // Check quota
-        if account_quota > 0
-            && metadata.size as i64 + self.get_used_quota(account_id).await? > account_quota
+        match self
+            .has_available_quota(account_id, account_quota, metadata.size as i64)
+            .await
         {
-            return Ok(Err(SetError::over_quota()));
+            Ok(_) => (),
+            Err(err) => {
+                if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) {
+                    trc::error!(err.account_id(account_id).span_id(session_id));
+                    return Ok(Err(SetError::over_quota()));
+                } else {
+                    return Err(err);
+                }
+            }
         }
 
         // Set receivedAt
@@ -357,7 +353,7 @@ impl JMAP {
         let thread_id = if !references.is_empty() {
             self.find_or_merge_thread(account_id, subject, &references)
                 .await
-                .map_err(|_| MethodError::ServerPartialFail)?
+                .caused_by(trc::location!())?
         } else {
             None
         };
@@ -376,14 +372,7 @@ impl JMAP {
             let uid = self
                 .assign_imap_uid(account_id, *mailbox_id)
                 .await
-                .map_err(|err| {
-                    tracing::error!(
-                            event = "error",
-                            context = "email_copy",
-                            error = ?err,
-                            "Failed to assign IMAP UID.");
-                    MethodError::ServerPartialFail
-                })?;
+                .caused_by(trc::location!())?;
             mailbox_ids.push(UidMailbox::new(*mailbox_id, uid));
             email.imap_uids.push(uid);
         }
@@ -417,7 +406,7 @@ impl JMAP {
             .value(Property::Keywords, keywords, F_VALUE | F_BITMAP)
             .value(Property::Cid, change_id, F_VALUE)
             .set(
-                ValueClass::FtsQueue(FtsQueueClass::Insert {
+                ValueClass::FtsQueue(FtsQueueClass {
                     seq: self.generate_snowflake_id()?,
                     hash: metadata.blob_hash.clone(),
                 }),
@@ -432,26 +421,15 @@ impl JMAP {
             .data
             .write(batch.build())
             .await
-            .map_err(|err| {
-                tracing::error!(
-                    event = "error",
-                    context = "email_copy",
-                    error = ?err,
-                    "Failed to write message to database.");
-                MethodError::ServerPartialFail
-            })?;
+            .caused_by(trc::location!())?;
         let thread_id = match thread_id {
             Some(thread_id) => thread_id,
-            None => ids
-                .first_document_id()
-                .map_err(|_| MethodError::ServerPartialFail)?,
+            None => ids.first_document_id().caused_by(trc::location!())?,
         };
-        let document_id = ids
-            .last_document_id()
-            .map_err(|_| MethodError::ServerPartialFail)?;
+        let document_id = ids.last_document_id().caused_by(trc::location!())?;
 
         // Request FTS index
-        let _ = self.inner.housekeeper_tx.send(Event::IndexStart).await;
+        self.inner.request_fts_index();
 
         // Update response
         email.id = Id::from_parts(thread_id, document_id);

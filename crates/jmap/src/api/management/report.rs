@@ -1,28 +1,10 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use hyper::Method;
-use jmap_proto::error::request::RequestError;
 use mail_auth::report::{
     tlsrpt::{FailureDetails, Policy, TlsReport},
     Feedback,
@@ -49,7 +31,11 @@ enum ReportType {
 }
 
 impl JMAP {
-    pub async fn handle_manage_reports(&self, req: &HttpRequest, path: Vec<&str>) -> HttpResponse {
+    pub async fn handle_manage_reports(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+    ) -> trc::Result<HttpResponse> {
         match (
             path.get(1).copied().unwrap_or_default(),
             path.get(2).copied().map(decode_path_element),
@@ -106,8 +92,7 @@ impl JMAP {
                 let mut offset = page.saturating_sub(1) * limit;
                 let mut total = 0;
                 let mut last_id = 0;
-                let result = self
-                    .core
+                self.core
                     .storage
                     .data
                     .iterate(
@@ -158,17 +143,15 @@ impl JMAP {
                             Ok(max_total == 0 || total < max_total)
                         },
                     )
-                    .await;
-                match result {
-                    Ok(_) => JsonResponse::new(json!({
-                            "data": {
-                                "items": results,
-                                "total": total,
-                            },
-                    }))
-                    .into_http_response(),
-                    Err(err) => err.into_http_response(),
-                }
+                    .await?;
+
+                Ok(JsonResponse::new(json!({
+                        "data": {
+                            "items": results,
+                            "total": total,
+                        },
+                }))
+                .into_http_response())
             }
             (class @ ("dmarc" | "tls" | "arf"), Some(report_id), &Method::GET) => {
                 if let Some(report_id) = parse_incoming_report_id(class, report_id.as_ref()) {
@@ -180,14 +163,13 @@ impl JMAP {
                             .get_value::<Bincode<IncomingReport<TlsReport>>>(ValueKey::from(
                                 ValueClass::Report(report_id),
                             ))
-                            .await
+                            .await?
                         {
-                            Ok(Some(report)) => JsonResponse::new(json!({
+                            Some(report) => Ok(JsonResponse::new(json!({
                                     "data": report.inner,
                             }))
-                            .into_http_response(),
-                            Ok(None) => RequestError::not_found().into_http_response(),
-                            Err(err) => err.into_http_response(),
+                            .into_http_response()),
+                            None => Err(trc::ResourceEvent::NotFound.into_err()),
                         },
                         ReportClass::Dmarc { .. } => match self
                             .core
@@ -196,14 +178,13 @@ impl JMAP {
                             .get_value::<Bincode<IncomingReport<mail_auth::report::Report>>>(
                                 ValueKey::from(ValueClass::Report(report_id)),
                             )
-                            .await
+                            .await?
                         {
-                            Ok(Some(report)) => JsonResponse::new(json!({
+                            Some(report) => Ok(JsonResponse::new(json!({
                                     "data": report.inner,
                             }))
-                            .into_http_response(),
-                            Ok(None) => RequestError::not_found().into_http_response(),
-                            Err(err) => err.into_http_response(),
+                            .into_http_response()),
+                            None => Err(trc::ResourceEvent::NotFound.into_err()),
                         },
                         ReportClass::Arf { .. } => match self
                             .core
@@ -212,35 +193,34 @@ impl JMAP {
                             .get_value::<Bincode<IncomingReport<Feedback>>>(ValueKey::from(
                                 ValueClass::Report(report_id),
                             ))
-                            .await
+                            .await?
                         {
-                            Ok(Some(report)) => JsonResponse::new(json!({
+                            Some(report) => Ok(JsonResponse::new(json!({
                                     "data": report.inner,
                             }))
-                            .into_http_response(),
-                            Ok(None) => RequestError::not_found().into_http_response(),
-                            Err(err) => err.into_http_response(),
+                            .into_http_response()),
+                            None => Err(trc::ResourceEvent::NotFound.into_err()),
                         },
                     }
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
             (class @ ("dmarc" | "tls" | "arf"), Some(report_id), &Method::DELETE) => {
                 if let Some(report_id) = parse_incoming_report_id(class, report_id.as_ref()) {
                     let mut batch = BatchBuilder::new();
                     batch.clear(ValueClass::Report(report_id));
-                    let result = self.core.storage.data.write(batch.build()).await.is_ok();
+                    self.core.storage.data.write(batch.build()).await?;
 
-                    JsonResponse::new(json!({
-                            "data": result,
+                    Ok(JsonResponse::new(json!({
+                            "data": true,
                     }))
-                    .into_http_response()
+                    .into_http_response())
                 } else {
-                    RequestError::not_found().into_http_response()
+                    Err(trc::ResourceEvent::NotFound.into_err())
                 }
             }
-            _ => RequestError::not_found().into_http_response(),
+            _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
 }

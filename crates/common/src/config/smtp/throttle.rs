@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use utils::config::{utils::AsKey, Config, Rate};
 
@@ -44,6 +27,7 @@ pub fn parse_throttle(
         if let Some(throttle) = parse_throttle_item(
             config,
             (&prefix_, throttle_id),
+            throttle_id,
             token_map,
             available_throttle_keys,
         ) {
@@ -57,6 +41,7 @@ pub fn parse_throttle(
 fn parse_throttle_item(
     config: &mut Config,
     prefix: impl AsKey,
+    throttle_id: &str,
     token_map: &TokenMap,
     available_throttle_keys: u16,
 ) -> Option<Throttle> {
@@ -92,6 +77,7 @@ fn parse_throttle_item(
     }
 
     let throttle = Throttle {
+        id: throttle_id.to_string(),
         expr: Expression::try_parse(config, (prefix.as_str(), "match"), token_map)
             .unwrap_or_default(),
         keys,
@@ -121,7 +107,7 @@ fn parse_throttle_item(
     }
 }
 
-pub(crate) fn parse_throttle_key(value: &str) -> utils::config::Result<u16> {
+pub(crate) fn parse_throttle_key(value: &str) -> Result<u16, String> {
     match value {
         "rcpt" => Ok(THROTTLE_RCPT),
         "rcpt_domain" => Ok(THROTTLE_RCPT_DOMAIN),

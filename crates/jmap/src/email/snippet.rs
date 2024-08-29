@@ -1,28 +1,10 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use jmap_proto::{
-    error::method::MethodError,
     method::{
         query::Filter,
         search_snippet::{GetSearchSnippetRequest, GetSearchSnippetResponse, SearchSnippet},
@@ -42,7 +24,7 @@ impl JMAP {
         &self,
         request: GetSearchSnippetRequest,
         access_token: &AccessToken,
-    ) -> Result<GetSearchSnippetResponse, MethodError> {
+    ) -> trc::Result<GetSearchSnippetResponse> {
         let mut filter_stack = vec![];
         let mut include_term = true;
         let mut terms = vec![];
@@ -100,7 +82,7 @@ impl JMAP {
         };
 
         if email_ids.len() > self.core.jmap.snippet_max_results {
-            return Err(MethodError::RequestTooLarge);
+            return Err(trc::JmapEvent::RequestTooLarge.into_err());
         }
 
         for email_id in email_ids {
@@ -155,12 +137,16 @@ impl JMAP {
             {
                 raw_message
             } else {
-                tracing::warn!(event = "not-found",
-                    account_id = account_id,
-                    collection = ?Collection::Email,
-                    document_id = email_id.document_id(),
-                    blob_id = ?metadata.blob_hash,
-                    "Blob not found");
+                trc::event!(
+                    Store(trc::StoreEvent::NotFound),
+                    AccountId = account_id,
+                    DocumentId = email_id.document_id(),
+                    Collection = Collection::Email,
+                    BlobId = metadata.blob_hash.to_hex(),
+                    Details = "Blob not found.",
+                    CausedBy = trc::location!(),
+                );
+
                 response.not_found.push(email_id);
                 continue;
             };

@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::collections::hash_map::Entry;
 
@@ -36,6 +19,7 @@ use store::{
     write::{now, BatchBuilder, Bincode, QueueClass, ReportEvent, ValueClass},
     Deserialize, IterateParams, Serialize, ValueKey,
 };
+use trc::OutgoingReportEvent;
 use utils::config::Rate;
 
 use crate::{
@@ -68,7 +52,10 @@ impl<T: SessionStream> Session<T> {
 
         // Send failure report
         if let (Some(failure_rate), Some(report_options)) = (
-            self.core.core.eval_if::<Rate, _>(&config.send, self).await,
+            self.core
+                .core
+                .eval_if::<Rate, _>(&config.send, self, self.data.session_id)
+                .await,
             dmarc_output.failure_report(),
         ) {
             // Verify that any external reporting addresses are authorized
@@ -94,27 +81,30 @@ impl<T: SessionStream> Session<T> {
                         new_rcpts
                     } else {
                         if !dmarc_record.ruf().is_empty() {
-                            tracing::debug!(
-                                parent: &self.span,
-                                context = "report",
-                                report = "dkim",
-                                event = "unauthorized-ruf",
-                                ruf = ?dmarc_record.ruf(),
-                                "Unauthorized external reporting addresses"
+                            trc::event!(
+                                OutgoingReport(OutgoingReportEvent::UnauthorizedReportingAddress),
+                                SpanId = self.data.session_id,
+                                Url = dmarc_record
+                                    .ruf()
+                                    .iter()
+                                    .map(|u| trc::Value::String(u.uri().to_string()))
+                                    .collect::<Vec<_>>(),
                             );
                         }
                         vec![]
                     }
                 }
                 None => {
-                    tracing::debug!(
-                        parent: &self.span,
-                        context = "report",
-                        report = "dmarc",
-                        event = "dns-failure",
-                        ruf = ?dmarc_record.ruf(),
-                        "Failed to validate external report addresses",
+                    trc::event!(
+                        OutgoingReport(OutgoingReportEvent::ReportingAddressValidationError),
+                        SpanId = self.data.session_id,
+                        Url = dmarc_record
+                            .ruf()
+                            .iter()
+                            .map(|u| trc::Value::String(u.uri().to_string()))
+                            .collect::<Vec<_>>(),
                     );
+
                     vec![]
                 }
             };
@@ -125,7 +115,7 @@ impl<T: SessionStream> Session<T> {
                 let from_addr = self
                     .core
                     .core
-                    .eval_if(&config.address, self)
+                    .eval_if(&config.address, self, self.data.session_id)
                     .await
                     .unwrap_or_else(|| "MAILER-DAEMON@localhost".to_string());
                 let mut auth_failure = self
@@ -209,7 +199,7 @@ impl<T: SessionStream> Session<T> {
                         (
                             self.core
                                 .core
-                                .eval_if(&config.name, self)
+                                .eval_if(&config.name, self, self.data.session_id)
                                 .await
                                 .unwrap_or_else(|| "Mail Delivery Subsystem".to_string())
                                 .as_str(),
@@ -219,20 +209,21 @@ impl<T: SessionStream> Session<T> {
                         &self
                             .core
                             .core
-                            .eval_if(&config.subject, self)
+                            .eval_if(&config.subject, self, self.data.session_id)
                             .await
                             .unwrap_or_else(|| "DMARC Report".to_string()),
                         &mut report,
                     )
                     .ok();
 
-                tracing::info!(
-                    parent: &self.span,
-                    context = "report",
-                    report = "dmarc",
-                    event = "queue",
-                    rcpt = ?rcpts,
-                    "Queueing DMARC authentication failure report."
+                trc::event!(
+                    OutgoingReport(OutgoingReportEvent::DmarcReport),
+                    SpanId = self.data.session_id,
+                    From = from_addr.to_string(),
+                    To = rcpts
+                        .iter()
+                        .map(|a| trc::Value::String(a.to_string()))
+                        .collect::<Vec<_>>(),
                 );
 
                 // Send report
@@ -242,26 +233,31 @@ impl<T: SessionStream> Session<T> {
                         rcpts.into_iter(),
                         report,
                         &config.sign,
-                        &self.span,
                         true,
+                        self.data.session_id,
                     )
                     .await;
             } else {
-                tracing::debug!(
-                    parent: &self.span,
-                    context = "report",
-                    report = "dmarc",
-                    event = "throttle",
-                    ruf = ?dmarc_record.ruf(),
+                trc::event!(
+                    OutgoingReport(OutgoingReportEvent::DmarcRateLimited),
+                    SpanId = self.data.session_id,
+                    Limit = vec![
+                        trc::Value::from(failure_rate.requests),
+                        trc::Value::from(failure_rate.period)
+                    ],
                 );
             }
         }
 
-        // Send agregate reports
+        // Send aggregate reports
         let interval = self
             .core
             .core
-            .eval_if(&self.core.core.smtp.report.dmarc_aggregate.send, self)
+            .eval_if(
+                &self.core.core.smtp.report.dmarc_aggregate.send,
+                self,
+                self.data.session_id,
+            )
             .await
             .unwrap_or(AggregateFrequency::Never);
 
@@ -306,11 +302,15 @@ impl<T: SessionStream> Session<T> {
 
 impl SMTP {
     pub async fn send_dmarc_aggregate_report(&self, event: ReportEvent) {
-        let span = tracing::info_span!(
-            "dmarc-report",
-            domain = event.domain,
-            range_from = event.seq_id,
-            range_to = event.due,
+        let span_id = self.inner.span_id_gen.generate().unwrap_or_else(now);
+
+        trc::event!(
+            OutgoingReport(OutgoingReportEvent::DmarcAggregateReport),
+            SpanId = span_id,
+            ReportId = event.seq_id,
+            Domain = event.domain.clone(),
+            RangeFrom = trc::Value::Timestamp(event.seq_id),
+            RangeTo = trc::Value::Timestamp(event.due),
         );
 
         // Generate report
@@ -319,31 +319,28 @@ impl SMTP {
                 .eval_if(
                     &self.core.smtp.report.dmarc_aggregate.max_size,
                     &RecipientDomain::new(event.domain.as_str()),
+                    span_id,
                 )
                 .await
                 .unwrap_or(25 * 1024 * 1024),
         ));
         let mut rua = Vec::new();
         let report = match self
-            .generate_dmarc_aggregate_report(&event, &mut rua, Some(&mut serialized_size))
+            .generate_dmarc_aggregate_report(&event, &mut rua, Some(&mut serialized_size), span_id)
             .await
         {
             Ok(Some(report)) => report,
             Ok(None) => {
-                tracing::warn!(
-                    parent: &span,
-                    event = "missing",
-                    "Failed to read DMARC report: Report not found"
+                trc::event!(
+                    OutgoingReport(OutgoingReportEvent::NotFound),
+                    SpanId = span_id,
+                    CausedBy = trc::location!()
                 );
+
                 return;
             }
             Err(err) => {
-                tracing::warn!(
-                    parent: &span,
-                    event = "error",
-                    "Failed to read DMARC records: {}",
-                    err
-                );
+                trc::error!(err.span_id(span_id).details("Failed to read DMARC report"));
                 return;
             }
         };
@@ -364,25 +361,29 @@ impl SMTP {
                         .map(|u| u.uri().to_string())
                         .collect::<Vec<_>>()
                 } else {
-                    tracing::info!(
-                        parent: &span,
-                        event = "failed",
-                        reason = "unauthorized-rua",
-                        rua = ?rua,
-                        "Unauthorized external reporting addresses"
+                    trc::event!(
+                        OutgoingReport(OutgoingReportEvent::UnauthorizedReportingAddress),
+                        SpanId = span_id,
+                        Url = rua
+                            .iter()
+                            .map(|u| trc::Value::String(u.uri().to_string()))
+                            .collect::<Vec<_>>(),
                     );
+
                     self.delete_dmarc_report(event).await;
                     return;
                 }
             }
             None => {
-                tracing::info!(
-                    parent: &span,
-                    event = "failed",
-                    reason = "dns-failure",
-                    rua = ?rua,
-                    "Failed to validate external report addresses",
+                trc::event!(
+                    OutgoingReport(OutgoingReportEvent::ReportingAddressValidationError),
+                    SpanId = span_id,
+                    Url = rua
+                        .iter()
+                        .map(|u| trc::Value::String(u.uri().to_string()))
+                        .collect::<Vec<_>>(),
                 );
+
                 self.delete_dmarc_report(event).await;
                 return;
             }
@@ -395,6 +396,7 @@ impl SMTP {
             .eval_if(
                 &config.address,
                 &RecipientDomain::new(event.domain.as_str()),
+                span_id,
             )
             .await
             .unwrap_or_else(|| "MAILER-DAEMON@localhost".to_string());
@@ -405,12 +407,17 @@ impl SMTP {
                 .eval_if(
                     &self.core.smtp.report.submitter,
                     &RecipientDomain::new(event.domain.as_str()),
+                    span_id,
                 )
                 .await
                 .unwrap_or_else(|| "localhost".to_string()),
             (
                 self.core
-                    .eval_if(&config.name, &RecipientDomain::new(event.domain.as_str()))
+                    .eval_if(
+                        &config.name,
+                        &RecipientDomain::new(event.domain.as_str()),
+                        span_id,
+                    )
                     .await
                     .unwrap_or_else(|| "Mail Delivery Subsystem".to_string())
                     .as_str(),
@@ -421,8 +428,15 @@ impl SMTP {
         );
 
         // Send report
-        self.send_report(&from_addr, rua.iter(), message, &config.sign, &span, false)
-            .await;
+        self.send_report(
+            &from_addr,
+            rua.iter(),
+            message,
+            &config.sign,
+            false,
+            event.seq_id,
+        )
+        .await;
 
         self.delete_dmarc_report(event).await;
     }
@@ -432,7 +446,8 @@ impl SMTP {
         event: &ReportEvent,
         rua: &mut Vec<URI>,
         mut serialized_size: Option<&mut serde_json::Serializer<SerializedSize>>,
-    ) -> store::Result<Option<Report>> {
+        span_id: u64,
+    ) -> trc::Result<Option<Report>> {
         // Deserialize report
         let dmarc = match self
             .core
@@ -462,6 +477,7 @@ impl SMTP {
                     .eval_if(
                         &config.address,
                         &RecipientDomain::new(event.domain.as_str()),
+                        span_id,
                     )
                     .await
                     .unwrap_or_else(|| "MAILER-DAEMON@localhost".to_string()),
@@ -471,6 +487,7 @@ impl SMTP {
             .eval_if::<String, _>(
                 &config.org_name,
                 &RecipientDomain::new(event.domain.as_str()),
+                span_id,
             )
             .await
         {
@@ -481,6 +498,7 @@ impl SMTP {
             .eval_if::<String, _>(
                 &config.contact_info,
                 &RecipientDomain::new(event.domain.as_str()),
+                span_id,
             )
             .await
         {
@@ -567,24 +585,18 @@ impl SMTP {
             )
             .await
         {
-            tracing::warn!(
-                context = "report",
-                event = "error",
-                "Failed to remove repors: {}",
-                err
-            );
+            trc::error!(err
+                .caused_by(trc::location!())
+                .details("Failed to delete DMARC report"));
             return;
         }
 
         let mut batch = BatchBuilder::new();
         batch.clear(ValueClass::Queue(QueueClass::DmarcReportHeader(event)));
         if let Err(err) = self.core.storage.data.write(batch.build()).await {
-            tracing::warn!(
-                context = "report",
-                event = "error",
-                "Failed to remove repors: {}",
-                err
-            );
+            trc::error!(err
+                .caused_by(trc::location!())
+                .details("Failed to delete DMARC report"));
         }
     }
 
@@ -635,19 +647,16 @@ impl SMTP {
         }
 
         // Write entry
-        report_event.seq_id = self.inner.snowflake_id.generate().unwrap_or_else(now);
+        report_event.seq_id = self.inner.queue_id_gen.generate().unwrap_or_else(now);
         builder.set(
             ValueClass::Queue(QueueClass::DmarcReportEvent(report_event)),
             Bincode::new(event.report_record).serialize(),
         );
 
         if let Err(err) = self.core.storage.data.write(builder.build()).await {
-            tracing::error!(
-                context = "report",
-                event = "error",
-                "Failed to write DMARC report event: {}",
-                err
-            );
+            trc::error!(err
+                .caused_by(trc::location!())
+                .details("Failed to write DMARC report"));
         }
     }
 }

@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     borrow::Cow,
@@ -51,7 +34,7 @@ pub mod log;
 pub mod purge;
 
 pub trait SerializeWithId: Send + Sync {
-    fn serialize_with_id(&self, ids: &AssignedIds) -> crate::Result<Vec<u8>>;
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>>;
 }
 
 pub trait ResolveId {
@@ -170,12 +153,20 @@ pub enum ValueClass<T> {
     Config(Vec<u8>),
     Queue(QueueClass),
     Report(ReportClass),
+    Telemetry(TelemetryClass),
+    Any(AnyClass),
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
-pub enum FtsQueueClass {
-    Insert { seq: u64, hash: BlobHash },
-    Delete { seq: u64 },
+pub struct FtsQueueClass {
+    pub seq: u64,
+    pub hash: BlobHash,
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct AnyClass {
+    pub subspace: u8,
+    pub key: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
@@ -212,6 +203,22 @@ pub enum ReportClass {
     Tls { id: u64, expires: u64 },
     Dmarc { id: u64, expires: u64 },
     Arf { id: u64, expires: u64 },
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum TelemetryClass {
+    Span {
+        span_id: u64,
+    },
+    Metric {
+        timestamp: u64,
+        metric_id: u64,
+        node_id: u64,
+    },
+    Index {
+        span_id: u64,
+        value: Vec<u8>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
@@ -348,31 +355,31 @@ impl Serialize for Vec<u8> {
 }
 
 impl Deserialize for String {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
 impl Deserialize for u64 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| {
-            crate::Error::InternalError("Failed to deserialize u64".to_string())
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
         })?))
     }
 }
 
 impl Deserialize for i64 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(i64::from_be_bytes(bytes.try_into().map_err(|_| {
-            crate::Error::InternalError("Failed to deserialize i64".to_string())
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
         })?))
     }
 }
 
 impl Deserialize for u32 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
-            crate::Error::InternalError("Failed to deserialize u32".to_string())
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
         })?))
     }
 }
@@ -462,16 +469,17 @@ impl DeserializeFrom for Vec<u8> {
 }
 
 impl<T: DeserializeFrom + Sync + Send> Deserialize for Vec<T> {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         let mut bytes = bytes.iter();
         let len: usize = bytes
             .next_leb128()
-            .ok_or_else(|| crate::Error::InternalError("Failed to deserialize Vec".to_string()))?;
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))?;
         let mut list = Vec::with_capacity(len);
         for _ in 0..len {
-            list.push(T::deserialize_from(&mut bytes).ok_or_else(|| {
-                crate::Error::InternalError("Failed to deserialize Vec".to_string())
-            })?);
+            list.push(
+                T::deserialize_from(&mut bytes)
+                    .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))?,
+            );
         }
         Ok(list)
     }
@@ -586,7 +594,7 @@ impl ToBitmaps for () {
 }
 
 impl Deserialize for () {
-    fn deserialize(_bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(_bytes: &[u8]) -> trc::Result<Self> {
         Ok(())
     }
 }
@@ -692,17 +700,18 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Serialize for Bincode<T>
 impl<T: serde::Serialize + serde::de::DeserializeOwned + Sized + Sync + Send> Deserialize
     for Bincode<T>
 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         lz4_flex::decompress_size_prepended(bytes)
             .map_err(|err| {
-                crate::Error::InternalError(format!("Bincode decompression failed: {err:?}"))
+                trc::StoreEvent::DecompressError
+                    .caused_by(trc::location!())
+                    .reason(err)
             })
             .and_then(|result| {
                 bincode::deserialize(&result).map_err(|err| {
-                    crate::Error::InternalError(format!(
-                        "Bincode deserialization failed (len {}): {err:?}",
-                        result.len()
-                    ))
+                    trc::StoreEvent::DataCorruption
+                        .caused_by(trc::location!())
+                        .reason(err)
                 })
             })
             .map(|inner| Self { inner })
@@ -730,29 +739,32 @@ impl AssignedIds {
         self.counter_ids.push(id);
     }
 
-    pub fn get_document_id(&self, idx: usize) -> crate::Result<u32> {
-        self.document_ids
-            .get(idx)
-            .copied()
-            .ok_or_else(|| crate::Error::InternalError("No document ids were created".to_string()))
+    pub fn get_document_id(&self, idx: usize) -> trc::Result<u32> {
+        self.document_ids.get(idx).copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
     }
 
-    pub fn first_document_id(&self) -> crate::Result<u32> {
+    pub fn first_document_id(&self) -> trc::Result<u32> {
         self.get_document_id(0)
     }
 
-    pub fn last_document_id(&self) -> crate::Result<u32> {
-        self.document_ids
-            .last()
-            .copied()
-            .ok_or_else(|| crate::Error::InternalError("No document ids were created".to_string()))
+    pub fn last_document_id(&self) -> trc::Result<u32> {
+        self.document_ids.last().copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
     }
 
-    pub fn last_counter_id(&self) -> crate::Result<i64> {
-        self.counter_ids
-            .last()
-            .copied()
-            .ok_or_else(|| crate::Error::InternalError("No counter ids were created".to_string()))
+    pub fn last_counter_id(&self) -> trc::Result<i64> {
+        self.counter_ids.last().copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
     }
 }
 
@@ -775,7 +787,7 @@ impl From<Vec<u8>> for MaybeDynamicValue {
 }
 
 impl MaybeDynamicValue {
-    pub fn resolve(&self, ids: &AssignedIds) -> crate::Result<Cow<[u8]>> {
+    pub fn resolve(&self, ids: &AssignedIds) -> trc::Result<Cow<[u8]>> {
         match self {
             MaybeDynamicValue::Static(value) => Ok(Cow::Borrowed(value.as_slice())),
             MaybeDynamicValue::Dynamic(value) => value.serialize_with_id(ids).map(Cow::Owned),
@@ -784,7 +796,7 @@ impl MaybeDynamicValue {
 }
 
 impl MaybeDynamicId {
-    pub fn resolve(&self, ids: &AssignedIds) -> crate::Result<u32> {
+    pub fn resolve(&self, ids: &AssignedIds) -> trc::Result<u32> {
         match self {
             MaybeDynamicId::Static(id) => Ok(*id),
             MaybeDynamicId::Dynamic(idx) => ids.get_document_id(*idx),
@@ -852,7 +864,7 @@ impl From<MaybeDynamicId> for MaybeDynamicValue {
 }
 
 impl SerializeWithId for DynamicDocumentId {
-    fn serialize_with_id(&self, ids: &AssignedIds) -> crate::Result<Vec<u8>> {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>> {
         ids.get_document_id(self.0).map(|id| id.serialize())
     }
 }

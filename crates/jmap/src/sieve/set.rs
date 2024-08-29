@@ -1,31 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::set::{SetRequest, SetResponse},
     object::{
         index::{IndexAs, IndexProperty, ObjectIndexBuilder},
@@ -53,7 +33,7 @@ use store::{
     BlobClass,
 };
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{api::http::HttpSessionData, auth::AccessToken, JMAP};
 
 struct SetContext<'x> {
     account_id: u32,
@@ -78,7 +58,8 @@ impl JMAP {
         &self,
         mut request: SetRequest<SetArguments>,
         access_token: &AccessToken,
-    ) -> Result<SetResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> trc::Result<SetResponse> {
         let account_id = request.account_id.document_id();
         let mut sieve_ids = self
             .get_document_ids(account_id, Collection::SieveScript)
@@ -98,7 +79,10 @@ impl JMAP {
         let mut changes = ChangeLogBuilder::new();
         for (id, object) in request.unwrap_create() {
             if sieve_ids.len() as usize <= self.core.jmap.sieve_max_scripts {
-                match self.sieve_set_item(object, None, &ctx).await? {
+                match self
+                    .sieve_set_item(object, None, &ctx, session.session_id)
+                    .await?
+                {
                     Ok((mut builder, Some(blob))) => {
                         // Store blob
                         let blob_id = builder.changes_mut().unwrap().blob_id_mut().unwrap();
@@ -144,9 +128,13 @@ impl JMAP {
                     _ => unreachable!(),
                 }
             } else {
-                ctx.response.not_created.append(id, SetError::new(SetErrorType::OverQuota).with_description(
-                    "There are too many sieve scripts, please delete some before adding a new one.",
-                ));
+                ctx.response.not_created.append(
+                    id,
+                    SetError::new(SetErrorType::OverQuota).with_description(concat!(
+                        "There are too many sieve scripts, ",
+                        "please delete some before adding a new one."
+                    )),
+                );
             }
         }
 
@@ -175,19 +163,20 @@ impl JMAP {
                     .inner
                     .blob_id()
                     .ok_or_else(|| {
-                        tracing::warn!(
-                            event = "error",
-                            context = "sieve_set",
-                            account_id = account_id,
-                            document_id = document_id,
-                            "Sieve does not contain a blobId."
-                        );
-                        MethodError::ServerPartialFail
+                        trc::StoreEvent::NotFound
+                            .into_err()
+                            .caused_by(trc::location!())
+                            .document_id(document_id)
                     })?
                     .clone();
 
                 match self
-                    .sieve_set_item(object, (document_id, sieve).into(), &ctx)
+                    .sieve_set_item(
+                        object,
+                        (document_id, sieve).into(),
+                        &ctx,
+                        session.session_id,
+                    )
                     .await?
                 {
                     Ok((mut builder, blob)) => {
@@ -246,20 +235,14 @@ impl JMAP {
                             changes.log_update(Collection::SieveScript, document_id);
                             match self.core.storage.data.write(batch.build()).await {
                                 Ok(_) => (),
-                                Err(store::Error::AssertValueFailed) => {
+                                Err(err) if err.is_assertion_failure() => {
                                     ctx.response.not_updated.append(id, SetError::forbidden().with_description(
                                         "Another process modified this sieve, please try again.",
                                     ));
                                     continue 'update;
                                 }
                                 Err(err) => {
-                                    tracing::error!(
-                                        event = "error",
-                                        context = "sieve_set",
-                                        account_id = account_id,
-                                        error = ?err,
-                                        "Failed to update sieve script(s).");
-                                    return Err(MethodError::ServerPartialFail);
+                                    return Err(err.caused_by(trc::location!()));
                                 }
                             }
                         }
@@ -352,7 +335,7 @@ impl JMAP {
         account_id: u32,
         document_id: u32,
         fail_if_active: bool,
-    ) -> Result<bool, MethodError> {
+    ) -> trc::Result<bool> {
         // Fetch record
         let obj = self
             .get_property::<HashedValue<Object<Value>>>(
@@ -363,14 +346,10 @@ impl JMAP {
             )
             .await?
             .ok_or_else(|| {
-                tracing::warn!(
-                    event = "error",
-                    context = "sieve_script_delete",
-                    account_id = account_id,
-                    document_id = document_id,
-                    "Sieve script not found."
-                );
-                MethodError::ServerPartialFail
+                trc::StoreEvent::NotFound
+                    .into_err()
+                    .caused_by(trc::location!())
+                    .document_id(document_id)
             })?;
 
         // Make sure the script is not active
@@ -386,14 +365,10 @@ impl JMAP {
         // Delete record
         let mut batch = BatchBuilder::new();
         let blob_id = obj.inner.blob_id().ok_or_else(|| {
-            tracing::warn!(
-                event = "error",
-                context = "sieve_script_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Sieve does not contain a blobId."
-            );
-            MethodError::ServerPartialFail
+            trc::StoreEvent::NotFound
+                .into_err()
+                .caused_by(trc::location!())
+                .document_id(document_id)
         })?;
         batch
             .with_account_id(account_id)
@@ -418,13 +393,15 @@ impl JMAP {
         changes_: Object<SetValue>,
         update: Option<(u32, HashedValue<Object<Value>>)>,
         ctx: &SetContext<'_>,
-    ) -> Result<Result<(ObjectIndexBuilder, Option<Vec<u8>>), SetError>, MethodError> {
+        session_id: u64,
+    ) -> trc::Result<Result<(ObjectIndexBuilder, Option<Vec<u8>>), SetError>> {
         // Vacation script cannot be modified
         if matches!(update.as_ref().and_then(|(_, obj)| obj.inner.properties.get(&Property::Name)), Some(Value::Text ( value )) if value.eq_ignore_ascii_case("vacation"))
         {
-            return Ok(Err(SetError::forbidden().with_description(
-                "The 'vacation' script cannot be modified, use VacationResponse/set instead.",
-            )));
+            return Ok(Err(SetError::forbidden().with_description(concat!(
+                "The 'vacation' script cannot be modified, ",
+                "use VacationResponse/set instead."
+            ))));
         }
 
         // Parse properties
@@ -521,12 +498,19 @@ impl JMAP {
                 // Check access
                 if let Some(mut bytes) = self.blob_download(&blob_id, ctx.access_token).await? {
                     // Check quota
-                    if ctx.account_quota > 0
-                        && bytes.len() as i64 + self.get_used_quota(ctx.account_id).await?
-                            > ctx.account_quota
-                    {
-                        return Ok(Err(SetError::over_quota()));
-                    }
+                    match self
+                        .has_available_quota(ctx.account_id, ctx.account_quota, bytes.len() as i64)
+                        .await {
+                            Ok(_) => (),
+                            Err(err) => {
+                                if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) {
+                                    trc::error!(err.account_id(ctx.account_id).span_id(session_id));
+                                    return Ok(Err(SetError::over_quota()));
+                                } else {
+                                    return Err(err);
+                                }
+                            },
+                        }
 
                     // Compile script
                     match self.core.sieve.untrusted_compiler.compile(&bytes) {
@@ -574,7 +558,7 @@ impl JMAP {
         &self,
         account_id: u32,
         mut activate_id: Option<u32>,
-    ) -> Result<Vec<(u32, bool)>, MethodError> {
+    ) -> trc::Result<Vec<(u32, bool)>> {
         let mut changed_ids = Vec::new();
         // Find the currently active script
         let mut active_ids = self
@@ -652,17 +636,11 @@ impl JMAP {
         if !changed_ids.is_empty() {
             match self.core.storage.data.write(batch.build()).await {
                 Ok(_) => (),
-                Err(store::Error::AssertValueFailed) => {
+                Err(err) if err.is_assertion_failure() => {
                     return Ok(vec![]);
                 }
                 Err(err) => {
-                    tracing::error!(
-                        event = "error",
-                        context = "sieve_activate_script",
-                        account_id = account_id,
-                        error = ?err,
-                        "Failed to activate sieve script(s).");
-                    return Err(MethodError::ServerPartialFail);
+                    return Err(err.caused_by(trc::location!()));
                 }
             }
         }

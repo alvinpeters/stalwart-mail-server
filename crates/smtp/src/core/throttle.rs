@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use common::{
     config::smtp::{queue::QueueQuota, *},
@@ -27,11 +10,15 @@ use common::{
     listener::{limiter::ConcurrencyLimiter, SessionStream},
 };
 use dashmap::mapref::entry::Entry;
+use trc::SmtpEvent;
 use utils::config::Rate;
 
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::{
+    hash::{BuildHasher, Hash, Hasher},
+    sync::atomic::Ordering,
+};
 
-use super::Session;
+use super::{Session, SMTP};
 
 #[derive(Debug, Clone, Eq)]
 pub struct ThrottleKey {
@@ -224,7 +211,7 @@ impl<T: SessionStream> Session<T> {
                 || self
                     .core
                     .core
-                    .eval_expr(&t.expr, self, "throttle")
+                    .eval_expr(&t.expr, self, "throttle", self.data.session_id)
                     .await
                     .unwrap_or(false)
             {
@@ -252,12 +239,11 @@ impl<T: SessionStream> Session<T> {
                             if let Some(inflight) = limiter.is_allowed() {
                                 self.in_flight.push(inflight);
                             } else {
-                                tracing::debug!(
-                                    parent: &self.span,
-                                    context = "throttle",
-                                    event = "too-many-requests",
-                                    max_concurrent = limiter.max_concurrent,
-                                    "Too many concurrent requests."
+                                trc::event!(
+                                    Smtp(SmtpEvent::ConcurrencyLimitExceeded),
+                                    SpanId = self.data.session_id,
+                                    Id = t.id.clone(),
+                                    Limit = limiter.max_concurrent
                                 );
                                 return false;
                             }
@@ -284,14 +270,16 @@ impl<T: SessionStream> Session<T> {
                         .unwrap_or_default()
                         .is_some()
                     {
-                        tracing::debug!(
-                            parent: &self.span,
-                            context = "throttle",
-                            event = "rate-limit-exceeded",
-                            max_requests = rate.requests,
-                            max_interval = rate.period.as_secs(),
-                            "Rate limit exceeded."
+                        trc::event!(
+                            Smtp(SmtpEvent::RateLimitExceeded),
+                            SpanId = self.data.session_id,
+                            Id = t.id.clone(),
+                            Limit = vec![
+                                trc::Value::from(rate.requests),
+                                trc::Value::from(rate.period)
+                            ],
                         );
+
                         return false;
                     }
                 }
@@ -316,5 +304,13 @@ impl<T: SessionStream> Session<T> {
             .await
             .unwrap_or_default()
             .is_none()
+    }
+}
+
+impl SMTP {
+    pub fn cleanup(&self) {
+        for throttle in [&self.inner.session_throttle, &self.inner.queue_throttle] {
+            throttle.retain(|_, v| v.concurrent.load(Ordering::Relaxed) > 0);
+        }
     }
 }

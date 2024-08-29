@@ -1,29 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::fmt::Display;
 
 use tokio::sync::watch;
+use trc::PurgeEvent;
 use utils::config::cron::SimpleCron;
 
 use crate::{BlobStore, LookupStore, Store};
@@ -44,24 +28,31 @@ pub struct PurgeSchedule {
 
 impl PurgeSchedule {
     pub fn spawn(self, mut shutdown_rx: watch::Receiver<bool>) {
-        tracing::debug!(
-            "Purge {} task started for store {:?}.",
-            self.store,
-            self.store_id
+        trc::event!(
+            Purge(PurgeEvent::Started),
+            Type = self.store.as_str(),
+            Id = self.store_id.to_string()
         );
+
         tokio::spawn(async move {
             loop {
                 if tokio::time::timeout(self.cron.time_to_next(), shutdown_rx.changed())
                     .await
                     .is_ok()
                 {
-                    tracing::debug!(
-                        "Purge {} task exiting for store {:?}.",
-                        self.store,
-                        self.store_id
+                    trc::event!(
+                        Purge(PurgeEvent::Finished),
+                        Type = self.store.as_str(),
+                        Id = self.store_id.to_string()
                     );
                     return;
                 }
+
+                trc::event!(
+                    Purge(PurgeEvent::Running),
+                    Type = self.store.as_str(),
+                    Id = self.store_id.to_string()
+                );
 
                 let result = match &self.store {
                     PurgeStore::Data(store) => store.purge_store().await,
@@ -72,15 +63,25 @@ impl PurgeSchedule {
                 };
 
                 if let Err(err) = result {
-                    tracing::warn!(
-                        "Purge {} task failed for store {:?}: {:?}",
-                        self.store,
-                        self.store_id,
-                        err
+                    trc::event!(
+                        Purge(PurgeEvent::Error),
+                        Type = self.store.as_str(),
+                        Id = self.store_id.to_string(),
+                        CausedBy = err
                     );
                 }
             }
         });
+    }
+}
+
+impl PurgeStore {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PurgeStore::Data(_) => "data",
+            PurgeStore::Blobs { .. } => "blobs",
+            PurgeStore::Lookup(_) => "lookup",
+        }
     }
 }
 

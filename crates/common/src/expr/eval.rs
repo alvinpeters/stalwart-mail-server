@@ -1,27 +1,13 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{borrow::Cow, cmp::Ordering, fmt::Display};
+
+use hyper::StatusCode;
+use trc::EvalEvent;
 
 use crate::Core;
 
@@ -36,23 +22,52 @@ impl Core {
         &self,
         if_block: &'x IfBlock,
         resolver: &'x V,
+        session_id: u64,
     ) -> Option<R> {
         if if_block.is_empty() {
-            tracing::trace!(context = "eval_if", property = if_block.key, result = "");
+            trc::event!(
+                Eval(EvalEvent::Result),
+                SpanId = session_id,
+                Id = if_block.key.clone(),
+                Result = ""
+            );
 
             return None;
         }
 
-        let result = if_block.eval(resolver, self, &if_block.key).await;
+        match if_block.eval(resolver, self, session_id).await {
+            Ok(result) => {
+                trc::event!(
+                    Eval(EvalEvent::Result),
+                    SpanId = session_id,
+                    Id = if_block.key.clone(),
+                    Result = format!("{result:?}"),
+                );
 
-        tracing::trace!(context = "eval_if",
-                property = if_block.key,
-                result = ?result,
-        );
+                match result.try_into() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        trc::event!(
+                            Eval(EvalEvent::Result),
+                            SpanId = session_id,
+                            Id = if_block.key.clone(),
+                            Result = "",
+                        );
 
-        match result.try_into() {
-            Ok(value) => Some(value),
-            Err(_) => None,
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                trc::event!(
+                    Eval(EvalEvent::Error),
+                    SpanId = session_id,
+                    Id = if_block.key.clone(),
+                    CausedBy = err,
+                );
+
+                None
+            }
         }
     }
 
@@ -61,21 +76,45 @@ impl Core {
         expr: &'x Expression,
         resolver: &'x V,
         expr_id: &str,
+        session_id: u64,
     ) -> Option<R> {
         if expr.is_empty() {
             return None;
         }
 
-        let result = expr.eval(resolver, self, expr_id, &mut Vec::new()).await;
+        match expr.eval(resolver, self, &mut Vec::new(), session_id).await {
+            Ok(result) => {
+                trc::event!(
+                    Eval(EvalEvent::Result),
+                    SpanId = session_id,
+                    Id = expr_id.to_string(),
+                    Result = format!("{result:?}"),
+                );
 
-        tracing::trace!(context = "eval_expr",
-                property = expr_id,
-                result = ?result,
-        );
+                match result.try_into() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        trc::event!(
+                            Eval(EvalEvent::Error),
+                            SpanId = session_id,
+                            Id = expr_id.to_string(),
+                            Details = "Failed to convert result",
+                        );
 
-        match result.try_into() {
-            Ok(value) => Some(value),
-            Err(_) => None,
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                trc::event!(
+                    Eval(EvalEvent::Error),
+                    SpanId = session_id,
+                    Id = expr_id.to_string(),
+                    CausedBy = err,
+                );
+
+                None
+            }
         }
     }
 }
@@ -85,26 +124,26 @@ impl IfBlock {
         &'x self,
         resolver: &'x V,
         core: &Core,
-        property: &str,
-    ) -> Variable<'x> {
+        session_id: u64,
+    ) -> trc::Result<Variable<'x>> {
         let mut captures = Vec::new();
 
         for if_then in &self.if_then {
             if if_then
                 .expr
-                .eval(resolver, core, property, &mut captures)
-                .await
+                .eval(resolver, core, &mut captures, session_id)
+                .await?
                 .to_bool()
             {
                 return if_then
                     .then
-                    .eval(resolver, core, property, &mut captures)
+                    .eval(resolver, core, &mut captures, session_id)
                     .await;
             }
         }
 
         self.default
-            .eval(resolver, core, property, &mut captures)
+            .eval(resolver, core, &mut captures, session_id)
             .await
     }
 }
@@ -114,9 +153,9 @@ impl Expression {
         &'x self,
         resolver: &'x V,
         core: &Core,
-        property: &str,
         captures: &'y mut Vec<String>,
-    ) -> Variable<'x> {
+        session_id: u64,
+    ) -> trc::Result<Variable<'x>> {
         let mut stack = Vec::new();
         let mut exprs = self.items.iter();
 
@@ -174,8 +213,8 @@ impl Expression {
                     let result = if let Some((_, fnc, _)) = FUNCTIONS.get(*id as usize) {
                         (fnc)(arguments)
                     } else {
-                        core.eval_fnc(*id - FUNCTIONS.len() as u32, arguments, property)
-                            .await
+                        core.eval_fnc(*id - FUNCTIONS.len() as u32, arguments, session_id)
+                            .await?
                     };
 
                     stack.push(result);
@@ -219,7 +258,7 @@ impl Expression {
             }
         }
 
-        stack.pop().unwrap_or_default()
+        Ok(stack.pop().unwrap_or_default())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -625,5 +664,19 @@ impl<'x> TryFrom<Variable<'x>> for usize {
 
     fn try_from(value: Variable<'x>) -> Result<Self, Self::Error> {
         value.to_usize().ok_or(())
+    }
+}
+
+impl<'x> TryFrom<Variable<'x>> for StatusCode {
+    type Error = ();
+
+    fn try_from(value: Variable<'x>) -> Result<Self, Self::Error> {
+        match value.to_integer() {
+            Some(v) => match StatusCode::from_u16(v as u16) {
+                Ok(status) => Ok(status),
+                Err(_) => Err(()),
+            },
+            None => Err(()),
+        }
     }
 }

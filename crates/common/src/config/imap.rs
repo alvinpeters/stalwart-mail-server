@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::time::Duration;
 
 use utils::config::{Config, Rate};
@@ -6,7 +12,6 @@ use utils::config::{Config, Rate};
 pub struct ImapConfig {
     pub max_request_size: usize,
     pub max_auth_failures: u32,
-    pub name_shared: String,
     pub allow_plain_auth: bool,
 
     pub timeout_auth: Duration,
@@ -26,10 +31,6 @@ impl ImapConfig {
             max_auth_failures: config
                 .property_or_default("imap.auth.max-failures", "3")
                 .unwrap_or(3),
-            name_shared: config
-                .value("imap.folders.name.shared")
-                .unwrap_or("Shared Folders")
-                .to_string(),
             timeout_auth: config
                 .property_or_default("imap.timeout.authenticated", "30m")
                 .unwrap_or_else(|| Duration::from_secs(1800)),

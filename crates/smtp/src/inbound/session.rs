@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use common::{
     config::{server::ServerProtocol, smtp::session::Mechanism},
@@ -34,6 +17,7 @@ use smtp_proto::{
     *,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use trc::{NetworkEvent, SmtpEvent};
 
 use crate::core::{Session, State};
 
@@ -59,6 +43,11 @@ impl<T: SessionStream> Session<T> {
                                 if self.instance.protocol == ServerProtocol::Smtp {
                                     self.handle_ehlo(host, true).await?;
                                 } else {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::LhloExpected),
+                                        SpanId = self.data.session_id,
+                                    );
+
                                     self.write(b"500 5.5.1 Invalid command.\r\n").await?;
                                 }
                             }
@@ -100,13 +89,25 @@ impl<T: SessionStream> Session<T> {
                                     .eval_if::<Mechanism, _>(
                                         &self.core.core.smtp.session.auth.mechanisms,
                                         self,
+                                        self.data.session_id,
                                     )
                                     .await
                                     .unwrap_or_default()
                                     .into();
                                 if auth == 0 || self.params.auth_directory.is_none() {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::AuthNotAllowed),
+                                        SpanId = self.data.session_id,
+                                    );
+
                                     self.write(b"503 5.5.1 AUTH not allowed.\r\n").await?;
                                 } else if !self.data.authenticated_as.is_empty() {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::AlreadyAuthenticated),
+                                        SpanId = self.data.session_id,
+                                        AccountName = self.data.authenticated_as.clone(),
+                                    );
+
                                     self.write(b"503 5.5.1 Already authenticated.\r\n").await?;
                                 } else if let Some(mut token) =
                                     SaslToken::from_mechanism(mechanism & auth)
@@ -122,6 +123,11 @@ impl<T: SessionStream> Session<T> {
                                         continue 'outer;
                                     }
                                 } else {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::AuthMechanismNotSupported),
+                                        SpanId = self.data.session_id,
+                                    );
+
                                     self.write(
                                         b"554 5.7.8 Authentication mechanism not supported.\r\n",
                                     )
@@ -129,6 +135,8 @@ impl<T: SessionStream> Session<T> {
                                 }
                             }
                             Request::Noop { .. } => {
+                                trc::event!(Smtp(SmtpEvent::Noop), SpanId = self.data.session_id,);
+
                                 self.write(b"250 2.0.0 OK\r\n").await?;
                             }
                             Request::Vrfy { value } => {
@@ -140,6 +148,11 @@ impl<T: SessionStream> Session<T> {
                             Request::StartTls => {
                                 if !self.stream.is_tls() {
                                     if self.instance.acceptor.is_tls() {
+                                        trc::event!(
+                                            Smtp(SmtpEvent::StartTls),
+                                            SpanId = self.data.session_id,
+                                        );
+
                                         self.write(b"220 2.0.0 Ready to start TLS.\r\n").await?;
                                         #[cfg(any(test, feature = "test_mode"))]
                                         if self.data.helo_domain.contains("badtls") {
@@ -148,41 +161,75 @@ impl<T: SessionStream> Session<T> {
                                         self.state = State::default();
                                         return Ok(false);
                                     } else {
+                                        trc::event!(
+                                            Smtp(SmtpEvent::StartTlsUnavailable),
+                                            SpanId = self.data.session_id,
+                                        );
+
                                         self.write(b"502 5.7.0 TLS not available.\r\n").await?;
                                     }
                                 } else {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::StartTlsAlready),
+                                        SpanId = self.data.session_id,
+                                    );
+
                                     self.write(b"504 5.7.4 Already in TLS mode.\r\n").await?;
                                 }
                             }
                             Request::Rset => {
+                                trc::event!(Smtp(SmtpEvent::Rset), SpanId = self.data.session_id,);
+
                                 self.reset();
                                 self.write(b"250 2.0.0 OK\r\n").await?;
                             }
                             Request::Quit => {
+                                trc::event!(Smtp(SmtpEvent::Quit), SpanId = self.data.session_id,);
+
                                 self.write(b"221 2.0.0 Bye.\r\n").await?;
                                 return Err(());
                             }
                             Request::Help { .. } => {
-                                self.write(
-                                    b"250 2.0.0 Help can be found at https://stalw.art/smtp/\r\n",
-                                )
-                                .await?;
+                                trc::event!(Smtp(SmtpEvent::Help), SpanId = self.data.session_id,);
+
+                                self.write(b"250 2.0.0 Help can be found at https://stalw.art\r\n")
+                                    .await?;
                             }
                             Request::Helo { host } => {
                                 if self.instance.protocol == ServerProtocol::Smtp {
                                     self.handle_ehlo(host, false).await?;
                                 } else {
-                                    self.write(b"500 5.5.1 Invalid command.\r\n").await?;
+                                    trc::event!(
+                                        Smtp(SmtpEvent::LhloExpected),
+                                        SpanId = self.data.session_id,
+                                    );
+
+                                    self.write(b"500 5.5.1 Invalid command: LHLO expected.\r\n")
+                                        .await?;
                                 }
                             }
                             Request::Lhlo { host } => {
                                 if self.instance.protocol == ServerProtocol::Lmtp {
                                     self.handle_ehlo(host, true).await?;
                                 } else {
-                                    self.write(b"502 5.5.1 Invalid command.\r\n").await?;
+                                    trc::event!(
+                                        Smtp(SmtpEvent::EhloExpected),
+                                        SpanId = self.data.session_id,
+                                    );
+
+                                    self.write(b"502 5.5.1 Invalid command: EHLO expected.\r\n")
+                                        .await?;
                                 }
                             }
-                            Request::Etrn { .. } | Request::Atrn { .. } | Request::Burl { .. } => {
+                            cmd @ (Request::Etrn { .. }
+                            | Request::Atrn { .. }
+                            | Request::Burl { .. }) => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::CommandNotImplemented),
+                                    SpanId = self.data.session_id,
+                                    Details = format!("{cmd:?}"),
+                                );
+
                                 self.write(b"502 5.5.1 Command not implemented.\r\n")
                                     .await?;
                             }
@@ -190,19 +237,40 @@ impl<T: SessionStream> Session<T> {
                         Err(err) => match err {
                             Error::NeedsMoreData { .. } => break 'outer,
                             Error::UnknownCommand | Error::InvalidResponse { .. } => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::InvalidCommand),
+                                    SpanId = self.data.session_id,
+                                );
+
                                 self.write(b"500 5.5.1 Invalid command.\r\n").await?;
                             }
                             Error::InvalidSenderAddress => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::InvalidSenderAddress),
+                                    SpanId = self.data.session_id,
+                                );
+
                                 self.write(b"501 5.1.8 Bad sender's system address.\r\n")
                                     .await?;
                             }
                             Error::InvalidRecipientAddress => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::InvalidRecipientAddress),
+                                    SpanId = self.data.session_id,
+                                );
+
                                 self.write(
                                     b"501 5.1.3 Bad destination mailbox address syntax.\r\n",
                                 )
                                 .await?;
                             }
                             Error::SyntaxError { syntax } => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::SyntaxError),
+                                    SpanId = self.data.session_id,
+                                    Details = syntax
+                                );
+
                                 self.write(
                                     format!("501 5.5.2 Syntax error, expected: {syntax}\r\n")
                                         .as_bytes(),
@@ -210,6 +278,12 @@ impl<T: SessionStream> Session<T> {
                                 .await?;
                             }
                             Error::InvalidParameter { param } => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::InvalidParameter),
+                                    SpanId = self.data.session_id,
+                                    Details = param
+                                );
+
                                 self.write(
                                     format!("501 5.5.4 Invalid parameter {param:?}.\r\n")
                                         .as_bytes(),
@@ -217,6 +291,12 @@ impl<T: SessionStream> Session<T> {
                                 .await?;
                             }
                             Error::UnsupportedParameter { param } => {
+                                trc::event!(
+                                    Smtp(SmtpEvent::UnsupportedParameter),
+                                    SpanId = self.data.session_id,
+                                    Details = param.clone()
+                                );
+
                                 self.write(
                                     format!("504 5.5.4 Unsupported parameter {param:?}.\r\n")
                                         .as_bytes(),
@@ -297,6 +377,12 @@ impl<T: SessionStream> Session<T> {
                                 continue 'outer;
                             }
                         } else {
+                            trc::event!(
+                                Smtp(SmtpEvent::AuthExchangeTooLong),
+                                SpanId = self.data.session_id,
+                                Limit = MAX_LINE_LENGTH,
+                            );
+
                             self.auth_error(
                                 b"500 5.5.6 Authentication Exchange line is too long.\r\n",
                             )
@@ -309,11 +395,9 @@ impl<T: SessionStream> Session<T> {
                 }
                 State::DataTooLarge(receiver) => {
                     if receiver.ingest(&mut iter) {
-                        tracing::debug!(
-                            parent: &self.span,
-                            context = "data",
-                            event = "too-large",
-                            "Message is too large."
+                        trc::event!(
+                            Smtp(SmtpEvent::MessageTooLarge),
+                            SpanId = self.data.session_id,
                         );
 
                         self.data.message = Vec::with_capacity(0);
@@ -326,6 +410,11 @@ impl<T: SessionStream> Session<T> {
                 }
                 State::RequestTooLarge(receiver) => {
                     if receiver.ingest(&mut iter) {
+                        trc::event!(
+                            Smtp(SmtpEvent::RequestTooLarge),
+                            SpanId = self.data.session_id,
+                        );
+
                         self.write(b"554 5.3.4 Line is too long.\r\n").await?;
                         state = State::default();
                     } else {
@@ -354,45 +443,60 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
 
     #[inline(always)]
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        let err = match self.stream.write_all(bytes).await {
+        match self.stream.write_all(bytes).await {
             Ok(_) => match self.stream.flush().await {
                 Ok(_) => {
-                    tracing::trace!(parent: &self.span,
-                            event = "write",
-                            data = std::str::from_utf8(bytes).unwrap_or_default() ,
-                            size = bytes.len());
-                    return Ok(());
-                }
-                Err(err) => err,
-            },
-            Err(err) => err,
-        };
+                    trc::event!(
+                        Smtp(SmtpEvent::RawOutput),
+                        SpanId = self.data.session_id,
+                        Size = bytes.len(),
+                        Contents = trc::Value::from_maybe_string(bytes),
+                    );
 
-        tracing::trace!(parent: &self.span,
-            event = "error",
-            "Failed to write to stream: {:?}", err);
-        Err(())
+                    Ok(())
+                }
+                Err(err) => {
+                    trc::event!(
+                        Network(NetworkEvent::FlushError),
+                        SpanId = self.data.session_id,
+                        Reason = err.to_string(),
+                    );
+                    Err(())
+                }
+            },
+            Err(err) => {
+                trc::event!(
+                    Network(NetworkEvent::WriteError),
+                    SpanId = self.data.session_id,
+                    Reason = err.to_string(),
+                );
+
+                Err(())
+            }
+        }
     }
 
     #[inline(always)]
     pub async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, ()> {
         match self.stream.read(bytes).await {
             Ok(len) => {
-                tracing::trace!(parent: &self.span,
-                                event = "read",
-                                data =  if matches!(self.state, State::Request(_)) {bytes
-                                    .get(0..len)
-                                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                                    .unwrap_or("[invalid UTF8]")} else {"[DATA]"},
-                                size = len);
+                trc::event!(
+                    Smtp(SmtpEvent::RawInput),
+                    SpanId = self.data.session_id,
+                    Size = len,
+                    Contents =
+                        String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default()).into_owned(),
+                );
+
                 Ok(len)
             }
             Err(err) => {
-                tracing::trace!(
-                    parent: &self.span,
-                    event = "error",
-                    "Failed to read from stream: {:?}", err
+                trc::event!(
+                    Network(NetworkEvent::ReadError),
+                    SpanId = self.data.session_id,
+                    Reason = err.to_string(),
                 );
+
                 Err(())
             }
         }

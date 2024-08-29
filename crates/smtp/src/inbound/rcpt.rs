@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use common::{listener::SessionStream, scripts::ScriptModification};
+use common::{config::smtp::session::Stage, listener::SessionStream, scripts::ScriptModification};
 use smtp_proto::{
     RcptTo, RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS,
 };
+use trc::{SecurityEvent, SmtpEvent};
 
 use crate::{
     core::{Session, SessionAddress},
@@ -44,8 +28,17 @@ impl<T: SessionStream> Session<T> {
         }
 
         if self.data.mail_from.is_none() {
+            trc::event!(
+                Smtp(SmtpEvent::MailFromMissing),
+                SpanId = self.data.session_id,
+            );
             return self.write(b"503 5.5.1 MAIL is required first.\r\n").await;
         } else if self.data.rcpt_to.len() >= self.params.rcpt_max {
+            trc::event!(
+                Smtp(SmtpEvent::TooManyRecipients),
+                SpanId = self.data.session_id,
+                Limit = self.params.rcpt_max,
+            );
             return self.write(b"451 4.5.3 Too many recipients.\r\n").await;
         }
 
@@ -56,6 +49,7 @@ impl<T: SessionStream> Session<T> {
             || to.orcpt.is_some())
             && !self.params.rcpt_dsn
         {
+            trc::event!(Smtp(SmtpEvent::DsnDisabled), SpanId = self.data.session_id,);
             return self
                 .write(b"501 5.5.4 DSN extension has been disabled.\r\n")
                 .await;
@@ -72,6 +66,11 @@ impl<T: SessionStream> Session<T> {
         };
 
         if self.data.rcpt_to.contains(&rcpt) {
+            trc::event!(
+                Smtp(SmtpEvent::RcptToDuplicate),
+                SpanId = self.data.session_id,
+                To = rcpt.address_lcase,
+            );
             return self.write(b"250 2.1.5 OK\r\n").await;
         }
         self.data.rcpt_to.push(rcpt);
@@ -80,25 +79,42 @@ impl<T: SessionStream> Session<T> {
         let rcpt_script = self
             .core
             .core
-            .eval_if::<String, _>(&self.core.core.smtp.session.rcpt.script, self)
+            .eval_if::<String, _>(
+                &self.core.core.smtp.session.rcpt.script,
+                self,
+                self.data.session_id,
+            )
             .await
-            .and_then(|name| self.core.core.get_sieve_script(&name))
-            .cloned();
+            .and_then(|name| {
+                self.core
+                    .core
+                    .get_sieve_script(&name, self.data.session_id)
+                    .map(|s| (s.clone(), name))
+            });
 
-        if rcpt_script.is_some() || !self.core.core.smtp.session.rcpt.rewrite.is_empty() {
+        if rcpt_script.is_some()
+            || !self.core.core.smtp.session.rcpt.rewrite.is_empty()
+            || self
+                .core
+                .core
+                .smtp
+                .session
+                .milters
+                .iter()
+                .any(|m| m.run_on_stage.contains(&Stage::Rcpt))
+        {
             // Sieve filtering
-            if let Some(script) = rcpt_script {
+            if let Some((script, script_id)) = rcpt_script {
                 match self
-                    .run_script(script.clone(), self.build_script_parameters("rcpt"))
+                    .run_script(
+                        script_id,
+                        script.clone(),
+                        self.build_script_parameters("rcpt"),
+                    )
                     .await
                 {
                     ScriptResult::Accept { modifications } => {
                         if !modifications.is_empty() {
-                            tracing::debug!(parent: &self.span,
-                            context = "sieve",
-                            event = "modify",
-                            address = self.data.rcpt_to.last().unwrap().address,
-                            modifications = ?modifications);
                             for modification in modifications {
                                 if let ScriptModification::SetEnvelope { name, value } =
                                     modification
@@ -109,11 +125,6 @@ impl<T: SessionStream> Session<T> {
                         }
                     }
                     ScriptResult::Reject(message) => {
-                        tracing::info!(parent: &self.span,
-                        context = "sieve",
-                        event = "reject",
-                        address = self.data.rcpt_to.last().unwrap().address,
-                        reason = message);
                         self.data.rcpt_to.pop();
                         return self.write(message.as_bytes()).await;
                     }
@@ -121,14 +132,38 @@ impl<T: SessionStream> Session<T> {
                 }
             }
 
+            // Milter filtering
+            if let Err(message) = self.run_milters(Stage::Rcpt, None).await {
+                self.data.rcpt_to.pop();
+                return self.write(message.message.as_bytes()).await;
+            }
+
+            // MTAHook filtering
+            if let Err(message) = self.run_mta_hooks(Stage::Rcpt, None, None).await {
+                self.data.rcpt_to.pop();
+                return self.write(message.message.as_bytes()).await;
+            }
+
             // Address rewriting
             if let Some(new_address) = self
                 .core
                 .core
-                .eval_if::<String, _>(&self.core.core.smtp.session.rcpt.rewrite, self)
+                .eval_if::<String, _>(
+                    &self.core.core.smtp.session.rcpt.rewrite,
+                    self,
+                    self.data.session_id,
+                )
                 .await
             {
                 let rcpt = self.data.rcpt_to.last_mut().unwrap();
+
+                trc::event!(
+                    Smtp(SmtpEvent::RcptToRewritten),
+                    SpanId = self.data.session_id,
+                    Details = rcpt.address_lcase.clone(),
+                    To = new_address.clone(),
+                );
+
                 if new_address.contains('@') {
                     rcpt.address_lcase = new_address.to_lowercase();
                     rcpt.domain = rcpt.address_lcase.domain_part().to_string();
@@ -139,6 +174,11 @@ impl<T: SessionStream> Session<T> {
             // Check for duplicates
             let rcpt = self.data.rcpt_to.last().unwrap();
             if self.data.rcpt_to.iter().filter(|r| r == &rcpt).count() > 1 {
+                trc::event!(
+                    Smtp(SmtpEvent::RcptToDuplicate),
+                    SpanId = self.data.session_id,
+                    To = rcpt.address_lcase.clone(),
+                );
                 self.data.rcpt_to.pop();
                 return self.write(b"250 2.1.5 OK\r\n").await;
             }
@@ -149,90 +189,116 @@ impl<T: SessionStream> Session<T> {
         if let Some(directory) = self
             .core
             .core
-            .eval_if::<String, _>(&self.core.core.smtp.session.rcpt.directory, self)
+            .eval_if::<String, _>(
+                &self.core.core.smtp.session.rcpt.directory,
+                self,
+                self.data.session_id,
+            )
             .await
             .and_then(|name| self.core.core.get_directory(&name))
         {
-            if let Ok(is_local_domain) = directory.is_local_domain(&rcpt.domain).await {
-                if is_local_domain {
-                    if let Ok(is_local_address) =
-                        self.core.core.rcpt(directory, &rcpt.address_lcase).await
-                    {
-                        if !is_local_address {
-                            tracing::debug!(parent: &self.span,
-                                            context = "rcpt", 
-                                            event = "error",
-                                            address = &rcpt.address_lcase,
-                                            "Mailbox does not exist.");
+            match directory.is_local_domain(&rcpt.domain).await {
+                Ok(is_local_domain) => {
+                    if is_local_domain {
+                        match self
+                            .core
+                            .core
+                            .rcpt(directory, &rcpt.address_lcase, self.data.session_id)
+                            .await
+                        {
+                            Ok(is_local_address) => {
+                                if !is_local_address {
+                                    trc::event!(
+                                        Smtp(SmtpEvent::MailboxDoesNotExist),
+                                        SpanId = self.data.session_id,
+                                        To = rcpt.address_lcase.clone(),
+                                    );
 
-                            self.data.rcpt_to.pop();
-                            return self
-                                .rcpt_error(b"550 5.1.2 Mailbox does not exist.\r\n")
-                                .await;
+                                    self.data.rcpt_to.pop();
+                                    return self
+                                        .rcpt_error(b"550 5.1.2 Mailbox does not exist.\r\n")
+                                        .await;
+                                }
+                            }
+                            Err(err) => {
+                                trc::error!(err
+                                    .span_id(self.data.session_id)
+                                    .caused_by(trc::location!())
+                                    .details("Failed to verify address."));
+
+                                self.data.rcpt_to.pop();
+                                return self
+                                    .write(b"451 4.4.3 Unable to verify address at this time.\r\n")
+                                    .await;
+                            }
                         }
-                    } else {
-                        tracing::debug!(parent: &self.span,
-                            context = "rcpt", 
-                            event = "error",
-                            address = &rcpt.address_lcase,
-                            "Temporary address verification failure.");
+                    } else if !self
+                        .core
+                        .core
+                        .eval_if(
+                            &self.core.core.smtp.session.rcpt.relay,
+                            self,
+                            self.data.session_id,
+                        )
+                        .await
+                        .unwrap_or(false)
+                    {
+                        trc::event!(
+                            Smtp(SmtpEvent::RelayNotAllowed),
+                            SpanId = self.data.session_id,
+                            To = rcpt.address_lcase.clone(),
+                        );
 
                         self.data.rcpt_to.pop();
-                        return self
-                            .write(b"451 4.4.3 Unable to verify address at this time.\r\n")
-                            .await;
+                        return self.rcpt_error(b"550 5.1.2 Relay not allowed.\r\n").await;
                     }
-                } else if !self
-                    .core
-                    .core
-                    .eval_if(&self.core.core.smtp.session.rcpt.relay, self)
-                    .await
-                    .unwrap_or(false)
-                {
-                    tracing::debug!(parent: &self.span,
-                        context = "rcpt", 
-                        event = "error",
-                        address = &rcpt.address_lcase,
-                        "Relay not allowed.");
+                }
+                Err(err) => {
+                    trc::error!(err
+                        .span_id(self.data.session_id)
+                        .caused_by(trc::location!())
+                        .details("Failed to verify address."));
 
                     self.data.rcpt_to.pop();
-                    return self.rcpt_error(b"550 5.1.2 Relay not allowed.\r\n").await;
+                    return self
+                        .write(b"451 4.4.3 Unable to verify address at this time.\r\n")
+                        .await;
                 }
-            } else {
-                tracing::debug!(parent: &self.span,
-                    context = "rcpt", 
-                    event = "error",
-                    address = &rcpt.address_lcase,
-                    "Temporary address verification failure.");
-
-                self.data.rcpt_to.pop();
-                return self
-                    .write(b"451 4.4.3 Unable to verify address at this time.\r\n")
-                    .await;
             }
         } else if !self
             .core
             .core
-            .eval_if(&self.core.core.smtp.session.rcpt.relay, self)
+            .eval_if(
+                &self.core.core.smtp.session.rcpt.relay,
+                self,
+                self.data.session_id,
+            )
             .await
             .unwrap_or(false)
         {
-            tracing::debug!(parent: &self.span,
-                context = "rcpt", 
-                event = "error",
-                address = &rcpt.address_lcase,
-                "Relay not allowed.");
+            trc::event!(
+                Smtp(SmtpEvent::RelayNotAllowed),
+                SpanId = self.data.session_id,
+                To = rcpt.address_lcase.clone(),
+            );
 
             self.data.rcpt_to.pop();
             return self.rcpt_error(b"550 5.1.2 Relay not allowed.\r\n").await;
         }
 
         if self.is_allowed().await {
-            tracing::debug!(parent: &self.span,
-                    context = "rcpt",
-                    event = "success",
-                    address = &self.data.rcpt_to.last().unwrap().address);
+            trc::event!(
+                Smtp(SmtpEvent::RcptTo),
+                SpanId = self.data.session_id,
+                To = self.data.rcpt_to.last().unwrap().address_lcase.clone(),
+            );
         } else {
+            trc::event!(
+                Smtp(SmtpEvent::RateLimitExceeded),
+                SpanId = self.data.session_id,
+                To = self.data.rcpt_to.last().unwrap().address_lcase.clone(),
+            );
+
             self.data.rcpt_to.pop();
             return self
                 .write(b"451 4.4.5 Rate limit exceeded, try again later.\r\n")
@@ -249,15 +315,36 @@ impl<T: SessionStream> Session<T> {
         if self.data.rcpt_errors < self.params.rcpt_errors_max {
             Ok(())
         } else {
+            match self
+                .core
+                .core
+                .is_rcpt_fail2banned(self.data.remote_ip)
+                .await
+            {
+                Ok(true) => {
+                    trc::event!(
+                        Security(SecurityEvent::BruteForceBan),
+                        SpanId = self.data.session_id,
+                        RemoteIp = self.data.remote_ip,
+                    );
+                }
+                Ok(false) => {
+                    trc::event!(
+                        Smtp(SmtpEvent::TooManyInvalidRcpt),
+                        SpanId = self.data.session_id,
+                        Limit = self.params.rcpt_errors_max,
+                    );
+                }
+                Err(err) => {
+                    trc::error!(err
+                        .span_id(self.data.session_id)
+                        .caused_by(trc::location!())
+                        .details("Failed to check if IP should be banned."));
+                }
+            }
+
             self.write(b"421 4.3.0 Too many errors, disconnecting.\r\n")
                 .await?;
-            tracing::debug!(
-                parent: &self.span,
-                context = "rcpt",
-                event = "disconnect",
-                reason = "too-many-errors",
-                "Too many invalid RCPT commands."
-            );
             Err(())
         }
     }

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
@@ -308,16 +314,18 @@ impl Policy {
 
 impl Core {
     pub fn build_mta_sts_policy(&self) -> Option<Policy> {
-        self.smtp
-            .session
-            .mta_sts_policy
-            .clone()
-            .and_then(|policy| policy.try_build(self.tls.certificates.load().keys()))
+        self.smtp.session.mta_sts_policy.clone().and_then(|policy| {
+            policy.try_build(self.tls.certificates.load().keys().filter(|key| {
+                !key.starts_with("mta-sts.")
+                    && !key.starts_with("autoconfig.")
+                    && !key.starts_with("autodiscover.")
+            }))
+        })
     }
 }
 
 impl ParseValue for Mode {
-    fn parse_value(value: &str) -> utils::config::Result<Self> {
+    fn parse_value(value: &str) -> Result<Self, String> {
         match value {
             "enforce" => Ok(Self::Enforce),
             "testing" | "test" => Ok(Self::Testing),
@@ -368,18 +376,23 @@ impl Display for Policy {
 
         for mx in &self.mx {
             f.write_str("mx: ")?;
-            let mx = match mx {
-                MxPattern::StartsWith(mx) => {
-                    f.write_str("*.")?;
-                    mx
-                }
-                MxPattern::Equals(mx) => mx,
-            };
-            f.write_str(mx)?;
+            mx.fmt(f)?;
             f.write_str("\r\n")?;
         }
 
         Ok(())
+    }
+}
+
+impl Display for MxPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MxPattern::Equals(mx) => f.write_str(mx),
+            MxPattern::StartsWith(mx) => {
+                f.write_str("*.")?;
+                f.write_str(mx)
+            }
+        }
     }
 }
 

@@ -1,27 +1,10 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{borrow::Cow, fmt::Display, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 pub mod backend;
 pub mod config;
@@ -64,7 +47,7 @@ use backend::elastic::ElasticSearchStore;
 use backend::redis::RedisStore;
 
 pub trait Deserialize: Sized + Sync + Send {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self>;
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self>;
 }
 
 pub trait Serialize {
@@ -74,7 +57,7 @@ pub trait Serialize {
 // Key serialization flags
 pub(crate) const WITH_SUBSPACE: u32 = 1;
 
-pub trait Key: Sync + Send {
+pub trait Key: Sync + Send + Clone {
     fn serialize(&self, flags: u32) -> Vec<u8>;
     fn subspace(&self) -> u8;
 }
@@ -121,8 +104,6 @@ pub struct LogKey {
 pub const U64_LEN: usize = std::mem::size_of::<u64>();
 pub const U32_LEN: usize = std::mem::size_of::<u32>();
 
-pub type Result<T> = std::result::Result<T, Error>;
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BlobClass {
     Reserved {
@@ -142,29 +123,6 @@ impl Default for BlobClass {
             account_id: 0,
             expires: 0,
         }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    InternalError(String),
-    AssertValueFailed,
-}
-
-impl std::error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::InternalError(msg) => write!(f, "Internal Error: {}", msg),
-            Error::AssertValueFailed => write!(f, "Transaction failed: Hash mismatch"),
-        }
-    }
-}
-
-impl From<String> for Error {
-    fn from(msg: String) -> Self {
-        Error::InternalError(msg)
     }
 }
 
@@ -189,13 +147,14 @@ pub const SUBSPACE_QUOTA: u8 = b'u';
 pub const SUBSPACE_REPORT_OUT: u8 = b'h';
 pub const SUBSPACE_REPORT_IN: u8 = b'r';
 pub const SUBSPACE_FTS_INDEX: u8 = b'g';
+pub const SUBSPACE_TELEMETRY_SPAN: u8 = b'o';
+pub const SUBSPACE_TELEMETRY_INDEX: u8 = b'w';
+pub const SUBSPACE_TELEMETRY_METRIC: u8 = b'x';
 
-pub const SUBSPACE_RESERVED_1: u8 = b'o';
-pub const SUBSPACE_RESERVED_2: u8 = b'w';
-pub const SUBSPACE_RESERVED_3: u8 = b'x';
-pub const SUBSPACE_RESERVED_4: u8 = b'y';
-pub const SUBSPACE_RESERVED_5: u8 = b'z';
+pub const SUBSPACE_RESERVED_1: u8 = b'y';
+pub const SUBSPACE_RESERVED_2: u8 = b'z';
 
+#[derive(Clone)]
 pub struct IterateParams<T: Key> {
     begin: T,
     end: T,
@@ -225,6 +184,8 @@ pub enum Store {
     MySQL(Arc<MysqlStore>),
     #[cfg(feature = "rocks")]
     RocksDb(Arc<RocksDbStore>),
+    #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+    SQLReadReplica(Arc<backend::composite::read_replica::SQLReadReplica>),
     #[default]
     None,
 }
@@ -247,6 +208,8 @@ pub enum BlobBackend {
     Fs(Arc<FsStore>),
     #[cfg(feature = "s3")]
     S3(Arc<S3Store>),
+    #[cfg(feature = "enterprise")]
+    Composite(Arc<backend::composite::distributed_blob::DistributedBlob>),
 }
 
 #[derive(Clone)]
@@ -706,8 +669,34 @@ impl Store {
             Store::PostgreSQL(_) => true,
             #[cfg(feature = "mysql")]
             Store::MySQL(_) => true,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Store::SQLReadReplica(_) => true,
             _ => false,
         }
+    }
+
+    pub fn is_pg_or_mysql(&self) -> bool {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Store::SQLite(_) => true,
+            #[cfg(feature = "postgres")]
+            Store::PostgreSQL(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub fn is_enterprise_store(&self) -> bool {
+        match self {
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Store::SQLReadReplica(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    pub fn is_enterprise_store(&self) -> bool {
+        false
     }
 }
 
@@ -724,7 +713,35 @@ impl std::fmt::Debug for Store {
             Self::MySQL(_) => f.debug_tuple("MySQL").finish(),
             #[cfg(feature = "rocks")]
             Self::RocksDb(_) => f.debug_tuple("RocksDb").finish(),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(_) => f.debug_tuple("SQLReadReplica").finish(),
             Self::None => f.debug_tuple("None").finish(),
+        }
+    }
+}
+
+impl From<Value<'_>> for trc::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Integer(v) => trc::Value::Int(v),
+            Value::Bool(v) => trc::Value::Bool(v),
+            Value::Float(v) => trc::Value::Float(v),
+            Value::Text(v) => trc::Value::String(v.into_owned()),
+            Value::Blob(v) => trc::Value::Bytes(v.into_owned()),
+            Value::Null => trc::Value::None,
+        }
+    }
+}
+
+impl Stores {
+    pub fn disable_enterprise_only(&mut self) {
+        #[cfg(feature = "enterprise")]
+        {
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            self.stores
+                .retain(|_, store| !matches!(store, Store::SQLReadReplica(_)));
+            self.blob_stores
+                .retain(|_, store| !matches!(store.backend, BlobBackend::Composite(_)));
         }
     }
 }

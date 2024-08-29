@@ -1,34 +1,17 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use crate::protocol::status::Status;
 use crate::protocol::{status, ProtocolVersion};
-use crate::receiver::{Request, Token};
+use crate::receiver::{bad, Request, Token};
 use crate::utf7::utf7_maybe_decode;
 use crate::Command;
 
 impl Request<Command> {
-    pub fn parse_status(self, version: ProtocolVersion) -> crate::Result<status::Arguments> {
+    pub fn parse_status(self, version: ProtocolVersion) -> trc::Result<status::Arguments> {
         match self.tokens.len() {
             0..=3 => Err(self.into_error("Missing arguments.")),
             len => {
@@ -38,7 +21,7 @@ impl Request<Command> {
                         .next()
                         .unwrap()
                         .unwrap_string()
-                        .map_err(|v| (self.tag.as_ref(), v))?,
+                        .map_err(|v| bad(self.tag.clone(), v))?,
                     version,
                 );
                 let mut items = Vec::with_capacity(len - 2);
@@ -47,11 +30,10 @@ impl Request<Command> {
                     .next()
                     .map_or(true, |token| !token.is_parenthesis_open())
                 {
-                    return Err((
-                        self.tag.as_str(),
+                    return Err(bad(
+                        self.tag.to_string(),
                         "Expected parenthesis after mailbox name.",
-                    )
-                        .into());
+                    ));
                 }
 
                 #[allow(clippy::while_let_on_iterator)]
@@ -59,14 +41,15 @@ impl Request<Command> {
                     match token {
                         Token::ParenthesisClose => break,
                         Token::Argument(value) => {
-                            items.push(Status::parse(&value).map_err(|v| (self.tag.as_str(), v))?);
+                            items.push(
+                                Status::parse(&value).map_err(|v| bad(self.tag.to_string(), v))?,
+                            );
                         }
                         _ => {
-                            return Err((
-                                self.tag.as_str(),
+                            return Err(bad(
+                                self.tag.to_string(),
                                 "Invalid status return option argument.",
-                            )
-                                .into())
+                            ))
                         }
                     }
                 }
@@ -78,7 +61,7 @@ impl Request<Command> {
                         items,
                     })
                 } else {
-                    Err((self.tag, "At least one status item is required.").into())
+                    Err(bad(self.tag, "At least one status item is required."))
                 }
             }
         }

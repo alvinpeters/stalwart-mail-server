@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -28,27 +11,33 @@ use base64::{
     Engine,
 };
 use common::{
-    config::server::{ServerProtocol, Servers},
+    config::{
+        server::{ServerProtocol, Servers},
+        telemetry::Telemetry,
+    },
     manager::config::{ConfigManager, Patterns},
-    Core,
+    Core, Ipc, IPC_CHANNEL_BUFFER,
 };
+use enterprise::insert_test_metrics;
 use hyper::{header::AUTHORIZATION, Method};
 use imap::core::{ImapSessionManager, IMAP};
-use jmap::{
-    api::JmapSessionManager,
-    services::{housekeeper::Event, IPC_CHANNEL_BUFFER},
-    JMAP,
-};
+use jmap::{api::JmapSessionManager, JMAP};
 use jmap_client::client::{Client, Credentials};
 use jmap_proto::{error::request::RequestError, types::id::Id};
 use managesieve::core::ManageSieveSessionManager;
+use pop3::Pop3SessionManager;
 use reqwest::header;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smtp::core::{SmtpSessionManager, SMTP};
 
-use store::Stores;
+use store::{
+    roaring::RoaringBitmap,
+    write::{key::DeserializeBigEndian, AnyKey, FtsQueueClass, ValueClass},
+    IterateParams, Stores, ValueKey, SUBSPACE_PROPERTY,
+};
 use tokio::sync::{mpsc, watch};
-use utils::config::Config;
+use utils::{config::Config, BlobHash};
+use webhooks::{spawn_mock_webhook_endpoint, MockWebhookEndpoint};
 
 use crate::{add_test_certs, directory::DirectoryStore, store::TempDir, AssertConfig};
 
@@ -67,8 +56,10 @@ pub mod email_query_changes;
 pub mod email_search_snippet;
 pub mod email_set;
 pub mod email_submission;
+pub mod enterprise;
 pub mod event_source;
 pub mod mailbox;
+pub mod purge;
 pub mod push_subscription;
 pub mod quota;
 pub mod sieve_script;
@@ -76,6 +67,7 @@ pub mod stress_test;
 pub mod thread_get;
 pub mod thread_merge;
 pub mod vacation_response;
+pub mod webhooks;
 pub mod websocket;
 
 const SERVER: &str = r#"
@@ -108,8 +100,10 @@ enable = true
 implicit = false
 certificate = "default"
 
+[server.fail2ban]
+authentication = "101/5s"
+
 [authentication]
-fail2ban = "101/5s"
 rate-limit = "100/2s"
 
 [session.ehlo]
@@ -234,6 +228,12 @@ throttle = "500ms"
 throttle = "500ms"
 attempts.interval = "500ms"
 
+[jmap.email]
+auto-expunge = "1s"
+
+[jmap.protocol.changes]
+max-history = "1s"
+
 [store."auth"]
 type = "sqlite"
 path = "{TMP}/auth.db"
@@ -259,6 +259,9 @@ email = "address"
 quota = "quota"
 class = "type"
 
+[imap.auth]
+allow-plain-text = true
+
 [oauth]
 key = "parerga_und_paralipomena"
 
@@ -275,25 +278,23 @@ refresh-token-renew = "2s"
 expn = true
 vrfy = true
 
+[tracer.console]
+type = "console"
+level = "{LEVEL}"
+multiline = false
+ansi = true
+disabled-events = ["network.*"]
+
+[webhook."test"]
+url = "http://127.0.0.1:8821/hook"
+events = ["auth.*", "delivery.dsn*", "message-ingest.*"]
+signature-key = "ovos-moles"
+throttle = "100ms"
+
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn jmap_tests() {
-    if let Ok(level) = std::env::var("LOG") {
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::FmtSubscriber::builder()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::builder()
-                        .parse(
-                            format!("smtp={level},imap={level},jmap={level},store={level},utils={level},directory={level},common={level}"),
-                        )
-                        .unwrap(),
-                )
-                .finish(),
-        )
-        .unwrap();
-    }
-
     let delete = true;
     let mut params = init_jmap_tests(
         &std::env::var("STORE")
@@ -302,6 +303,7 @@ pub async fn jmap_tests() {
     )
     .await;
 
+    webhooks::test(&mut params).await;
     email_query::test(&mut params, delete).await;
     email_get::test(&mut params).await;
     email_set::test(&mut params).await;
@@ -326,6 +328,8 @@ pub async fn jmap_tests() {
     quota::test(&mut params).await;
     crypto::test(&mut params).await;
     blob::test(&mut params).await;
+    purge::test(&mut params).await;
+    enterprise::test(&mut params).await;
 
     if delete {
         params.temp_dir.delete();
@@ -335,21 +339,6 @@ pub async fn jmap_tests() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 pub async fn jmap_stress_tests() {
-    if let Ok(level) = std::env::var("LOG") {
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::FmtSubscriber::builder()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::builder()
-                        .parse(
-                            format!("smtp={level},imap={level},jmap={level},store={level},utils={level},directory={level},common={level}"),
-                        )
-                        .unwrap(),
-                )
-                .finish(),
-        )
-        .unwrap();
-    }
-
     let params = init_jmap_tests(
         &std::env::var("STORE")
             .expect("Missing store type. Try running `STORE=<store_type> cargo test`"),
@@ -360,26 +349,69 @@ pub async fn jmap_stress_tests() {
     params.temp_dir.delete();
 }
 
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+pub async fn jmap_metric_tests() {
+    let params = init_jmap_tests(
+        &std::env::var("STORE")
+            .expect("Missing store type. Try running `STORE=<store_type> cargo test`"),
+        false,
+    )
+    .await;
+
+    insert_test_metrics(params.server.core.clone()).await;
+}
+
 #[allow(dead_code)]
 pub struct JMAPTest {
     server: Arc<JMAP>,
     client: Client,
     directory: DirectoryStore,
     temp_dir: TempDir,
+    webhook: Arc<MockWebhookEndpoint>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 pub async fn wait_for_index(server: &JMAP) {
     loop {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut has_index_tasks = false;
         server
-            .inner
-            .housekeeper_tx
-            .send(Event::IndexIsActive(tx))
+            .core
+            .storage
+            .data
+            .iterate(
+                IterateParams::new(
+                    ValueKey::<ValueClass<u32>> {
+                        account_id: 0,
+                        collection: 0,
+                        document_id: 0,
+                        class: ValueClass::FtsQueue(FtsQueueClass {
+                            seq: 0,
+                            hash: BlobHash::default(),
+                        }),
+                    },
+                    ValueKey::<ValueClass<u32>> {
+                        account_id: u32::MAX,
+                        collection: u8::MAX,
+                        document_id: u32::MAX,
+                        class: ValueClass::FtsQueue(FtsQueueClass {
+                            seq: u64::MAX,
+                            hash: BlobHash::default(),
+                        }),
+                    },
+                )
+                .ascending(),
+                |_, _| {
+                    has_index_tasks = true;
+
+                    Ok(false)
+                },
+            )
             .await
             .unwrap();
-        if rx.await.unwrap() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+
+        if has_index_tasks {
+            tokio::time::sleep(Duration::from_millis(300)).await;
         } else {
             break;
         }
@@ -390,6 +422,9 @@ pub async fn assert_is_empty(server: Arc<JMAP>) {
     // Wait for pending FTS index tasks
     wait_for_index(&server).await;
 
+    // Purge accounts
+    emails_purge_tombstoned(&server).await;
+
     // Assert is empty
     server
         .core
@@ -399,13 +434,49 @@ pub async fn assert_is_empty(server: Arc<JMAP>) {
         .await;
 }
 
+pub async fn emails_purge_tombstoned(server: &JMAP) {
+    let mut account_ids = RoaringBitmap::new();
+    server
+        .core
+        .storage
+        .data
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: SUBSPACE_PROPERTY,
+                    key: vec![0u8],
+                },
+                AnyKey {
+                    subspace: SUBSPACE_PROPERTY,
+                    key: vec![u8::MAX, u8::MAX, u8::MAX, u8::MAX],
+                },
+            )
+            .no_values(),
+            |key, _| {
+                account_ids.insert(key.deserialize_be_u32(0).unwrap());
+
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+
+    for account_id in account_ids {
+        server.emails_purge_tombstoned(account_id).await.unwrap();
+    }
+}
+
 async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
     // Load and parse config
     let temp_dir = TempDir::new("jmap_tests", delete_if_exists);
     let mut config = Config::new(
         add_test_certs(SERVER)
             .replace("{STORE}", store_id)
-            .replace("{TMP}", &temp_dir.path.display().to_string()),
+            .replace("{TMP}", &temp_dir.path.display().to_string())
+            .replace(
+                "{LEVEL}",
+                &std::env::var("LOG").unwrap_or_else(|_| "disable".to_string()),
+            ),
     )
     .unwrap();
     config.resolve_all_macros().await;
@@ -430,6 +501,7 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
             .cloned()
             .unwrap_or_default(),
     };
+    let tracers = Telemetry::parse(&mut config, &stores);
     let core = Core::parse(&mut config, stores, config_manager).await;
     let store = core.storage.data.clone();
     let shared_core = core.into_shared();
@@ -437,9 +509,21 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
     // Parse acceptors
     servers.parse_tcp_acceptors(&mut config, shared_core.clone());
 
-    // Init servers
+    // Enable tracing
+    tracers.enable(true);
+
+    // Setup IPC channels
     let (delivery_tx, delivery_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
-    let smtp = SMTP::init(&mut config, shared_core.clone(), delivery_tx).await;
+    let ipc = Ipc { delivery_tx };
+
+    // Init servers
+    let smtp = SMTP::init(
+        &mut config,
+        shared_core.clone(),
+        ipc,
+        servers.span_id_gen.clone(),
+    )
+    .await;
     let jmap = JMAP::init(
         &mut config,
         delivery_rx,
@@ -467,6 +551,12 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
             ),
             ServerProtocol::Imap => server.spawn(
                 ImapSessionManager::new(imap.clone()),
+                shared_core.clone(),
+                acceptor,
+                shutdown_rx,
+            ),
+            ServerProtocol::Pop3 => server.spawn(
+                Pop3SessionManager::new(imap.clone()),
                 shared_core.clone(),
                 acceptor,
                 shutdown_rx,
@@ -515,6 +605,7 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
         client,
         directory,
         shutdown_tx,
+        webhook: spawn_mock_webhook_endpoint(),
     }
 }
 
@@ -632,7 +723,7 @@ pub async fn test_account_login(login: &str, secret: &str) -> Client {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum Response<T> {
-    RequestError(RequestError),
+    RequestError(RequestError<'static>),
     Error { error: String, details: String },
     Data { data: T },
 }
@@ -679,6 +770,14 @@ impl ManagementApi {
         })
     }
 
+    pub async fn get<T: DeserializeOwned>(&self, query: &str) -> Result<Response<T>, String> {
+        self.request_raw(Method::GET, query, None)
+            .await
+            .map(|result| {
+                serde_json::from_str::<Response<T>>(&result)
+                    .unwrap_or_else(|err| panic!("{err}: {result}"))
+            })
+    }
     pub async fn request<T: DeserializeOwned>(
         &self,
         method: Method,

@@ -8,11 +8,13 @@ members = [
     "crates/imap-proto",
     "crates/smtp",
     "crates/managesieve",
+    "crates/pop3",
     "crates/nlp",
     "crates/store",
     "crates/directory",
     "crates/utils",
     "crates/common",
+    "crates/trc",
     "crates/cli",
     "tests",
 ]

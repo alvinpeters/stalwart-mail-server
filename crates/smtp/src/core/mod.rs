@@ -1,40 +1,23 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     hash::Hash,
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use common::{
-    config::smtp::auth::VerifyStrategy,
+    config::{scripts::ScriptCache, smtp::auth::VerifyStrategy},
     listener::{
         limiter::{ConcurrencyLimiter, InFlight},
         ServerInstance,
     },
-    Core, DeliveryEvent, SharedCore,
+    Core, Ipc, SharedCore,
 };
 use dashmap::DashMap;
 use directory::Directory;
@@ -47,7 +30,6 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::TlsConnector;
-use tracing::Span;
 use utils::snowflake::SnowflakeIdGenerator;
 
 use crate::{
@@ -60,7 +42,6 @@ use self::throttle::{ThrottleKey, ThrottleKeyHasherBuilder};
 
 pub mod params;
 pub mod throttle;
-pub mod worker;
 
 #[derive(Clone)]
 pub struct SmtpInstance {
@@ -95,15 +76,15 @@ pub struct SMTP {
 }
 
 pub struct Inner {
-    pub worker_pool: rayon::ThreadPool,
     pub session_throttle: DashMap<ThrottleKey, ConcurrencyLimiter, ThrottleKeyHasherBuilder>,
     pub queue_throttle: DashMap<ThrottleKey, ConcurrencyLimiter, ThrottleKeyHasherBuilder>,
     pub queue_tx: mpsc::Sender<queue::Event>,
     pub report_tx: mpsc::Sender<reporting::Event>,
-    pub snowflake_id: SnowflakeIdGenerator,
+    pub queue_id_gen: SnowflakeIdGenerator,
+    pub span_id_gen: Arc<SnowflakeIdGenerator>,
     pub connectors: TlsConnectors,
-    #[cfg(feature = "local_delivery")]
-    pub delivery_tx: mpsc::Sender<DeliveryEvent>,
+    pub ipc: Ipc,
+    pub script_cache: ScriptCache,
 }
 
 pub struct TlsConnectors {
@@ -127,7 +108,6 @@ pub struct Session<T: AsyncWrite + AsyncRead> {
     pub state: State,
     pub instance: Arc<ServerInstance>,
     pub core: SMTP,
-    pub span: Span,
     pub stream: T,
     pub data: SessionData,
     pub params: SessionParameters,
@@ -135,6 +115,7 @@ pub struct Session<T: AsyncWrite + AsyncRead> {
 }
 
 pub struct SessionData {
+    pub session_id: u64,
     pub local_ip: IpAddr,
     pub local_ip_str: String,
     pub local_port: u16,
@@ -207,8 +188,15 @@ pub struct SessionParameters {
 }
 
 impl SessionData {
-    pub fn new(local_ip: IpAddr, local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Self {
+    pub fn new(
+        local_ip: IpAddr,
+        local_port: u16,
+        remote_ip: IpAddr,
+        remote_port: u16,
+        session_id: u64,
+    ) -> Self {
         SessionData {
+            session_id,
             local_ip,
             local_port,
             remote_ip,
@@ -275,25 +263,24 @@ impl PartialOrd for SessionAddress {
 impl From<SmtpInstance> for SMTP {
     fn from(value: SmtpInstance) -> Self {
         SMTP {
-            core: value.core.load().clone(),
+            core: value.core.load_full(),
             inner: value.inner,
         }
     }
 }
 
-#[cfg(feature = "local_delivery")]
-lazy_static::lazy_static! {
-static ref SIEVE: Arc<ServerInstance> = Arc::new(ServerInstance {
-    id: "sieve".to_string(),
-    protocol: common::config::server::ServerProtocol::Lmtp,
-    acceptor: common::listener::TcpAcceptor::Plain,
-    limiter: ConcurrencyLimiter::new(0),
-    shutdown_rx: tokio::sync::watch::channel(false).1,
-    proxy_networks: vec![],
+static SIEVE: LazyLock<Arc<ServerInstance>> = LazyLock::new(|| {
+    Arc::new(ServerInstance {
+        id: "sieve".to_string(),
+        protocol: common::config::server::ServerProtocol::Lmtp,
+        acceptor: common::listener::TcpAcceptor::Plain,
+        limiter: ConcurrencyLimiter::new(0),
+        shutdown_rx: tokio::sync::watch::channel(false).1,
+        proxy_networks: vec![],
+        span_id_gen: Arc::new(SnowflakeIdGenerator::new()),
+    })
 });
-}
 
-#[cfg(feature = "local_delivery")]
 impl Session<common::listener::stream::NullIo> {
     pub fn local(core: SMTP, instance: std::sync::Arc<ServerInstance>, data: SessionData) -> Self {
         Session {
@@ -301,21 +288,6 @@ impl Session<common::listener::stream::NullIo> {
             state: State::None,
             instance,
             core,
-            span: tracing::info_span!(
-                "local_delivery",
-                "return_path" =
-                    if let Some(addr) = data.mail_from.as_ref().map(|a| a.address_lcase.as_str()) {
-                        if !addr.is_empty() {
-                            addr
-                        } else {
-                            "<>"
-                        }
-                    } else {
-                        "<>"
-                    },
-                "nrcpt" = data.rcpt_to.len(),
-                "size" = data.message.len(),
-            ),
             stream: common::listener::stream::NullIo::default(),
             data,
             params: SessionParameters {
@@ -347,11 +319,12 @@ impl Session<common::listener::stream::NullIo> {
         mail_from: SessionAddress,
         rcpt_to: Vec<SessionAddress>,
         message: Vec<u8>,
+        session_id: u64,
     ) -> Self {
         Self::local(
             core,
             SIEVE.clone(),
-            SessionData::local(mail_from.into(), rcpt_to, message),
+            SessionData::local(mail_from.into(), rcpt_to, message, session_id),
         )
     }
 
@@ -370,12 +343,12 @@ impl Session<common::listener::stream::NullIo> {
     }
 }
 
-#[cfg(feature = "local_delivery")]
 impl SessionData {
     pub fn local(
         mail_from: Option<SessionAddress>,
         rcpt_to: Vec<SessionAddress>,
         message: Vec<u8>,
+        session_id: u64,
     ) -> Self {
         SessionData {
             local_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -384,6 +357,7 @@ impl SessionData {
             remote_ip_str: "127.0.0.1".to_string(),
             remote_port: 0,
             local_port: 0,
+            session_id,
             helo_domain: "localhost".into(),
             mail_from,
             rcpt_to,
@@ -406,14 +380,12 @@ impl SessionData {
     }
 }
 
-#[cfg(feature = "local_delivery")]
 impl Default for SessionData {
     fn default() -> Self {
-        Self::local(None, vec![], vec![])
+        Self::local(None, vec![], vec![], 0)
     }
 }
 
-#[cfg(feature = "local_delivery")]
 impl SessionAddress {
     pub fn new(address: String) -> Self {
         let address_lcase = address.to_lowercase();
@@ -431,20 +403,20 @@ impl SessionAddress {
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            worker_pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(num_cpus::get())
-                .build()
-                .unwrap(),
             session_throttle: Default::default(),
             queue_throttle: Default::default(),
             queue_tx: mpsc::channel(1).0,
             report_tx: mpsc::channel(1).0,
-            snowflake_id: Default::default(),
+            queue_id_gen: Default::default(),
+            span_id_gen: Arc::new(SnowflakeIdGenerator::new()),
             connectors: TlsConnectors {
                 pki_verify: mail_send::smtp::tls::build_tls_connector(false),
                 dummy_verify: mail_send::smtp::tls::build_tls_connector(true),
             },
-            delivery_tx: mpsc::channel(1).0,
+            ipc: Ipc {
+                delivery_tx: mpsc::channel(1).0,
+            },
+            script_cache: Default::default(),
         }
     }
 }

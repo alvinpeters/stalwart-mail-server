@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
@@ -150,7 +133,7 @@ impl QueueReceiver {
     pub async fn expect_message_then_deliver(&mut self) -> DeliveryAttempt {
         let message = self.expect_message().await;
 
-        self.delivery_attempt(message.id).await
+        self.delivery_attempt(message.queue_id).await
     }
 
     pub async fn delivery_attempt(&mut self, queue_id: u64) -> DeliveryAttempt {
@@ -200,7 +183,7 @@ impl QueueReceiver {
                 IterateParams::new(from_key, to_key).descending(),
                 |key, value| {
                     let value = Bincode::<Message>::deserialize(value)?;
-                    assert_eq!(key.deserialize_be_u64(0)?, value.inner.id);
+                    assert_eq!(key.deserialize_be_u64(0)?, value.inner.queue_id);
                     messages.push(value.inner);
                     Ok(true)
                 },
@@ -260,7 +243,8 @@ impl QueueReceiver {
     }
 
     pub async fn last_queued_due(&self) -> u64 {
-        self.message_due(self.last_queued_message().await.id).await
+        self.message_due(self.last_queued_message().await.queue_id)
+            .await
     }
 
     pub async fn message_due(&self, queue_id: QueueId) -> u64 {
@@ -279,7 +263,7 @@ impl QueueReceiver {
 
     pub async fn clear_queue(&self, core: &SMTP) {
         for message in self.read_queued_messages().await {
-            let due = self.message_due(message.id).await;
+            let due = self.message_due(message.queue_id).await;
             message.remove(core, due).await;
         }
     }

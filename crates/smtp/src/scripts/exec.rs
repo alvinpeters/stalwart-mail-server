@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{sync::Arc, time::SystemTime};
 
@@ -27,14 +10,13 @@ use common::listener::SessionStream;
 use mail_auth::common::resolver::ToReverseName;
 use sieve::{runtime::Variable, Envelope, Sieve};
 use smtp_proto::*;
-use tokio::runtime::Handle;
 
 use crate::{core::Session, inbound::AuthResult};
 
 use super::{ScriptParameters, ScriptResult};
 
 impl<T: SessionStream> Session<T> {
-    pub fn build_script_parameters(&self, stage: &'static str) -> ScriptParameters {
+    pub fn build_script_parameters(&self, stage: &'static str) -> ScriptParameters<'_> {
         let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
         let mut params = ScriptParameters::new()
             .set_variable("remote_ip", self.data.remote_ip.to_string())
@@ -136,17 +118,21 @@ impl<T: SessionStream> Session<T> {
         params
     }
 
-    pub async fn run_script(&self, script: Arc<Sieve>, params: ScriptParameters) -> ScriptResult {
-        let core = self.core.clone();
-        let span = self.span.clone();
-        let params = params.with_envelope(&self.core.core, self).await;
-
-        let handle = Handle::current();
+    pub async fn run_script(
+        &self,
+        script_id: String,
+        script: Arc<Sieve>,
+        params: ScriptParameters<'_>,
+    ) -> ScriptResult {
         self.core
-            .spawn_worker(move || core.run_script_blocking(script, params, handle, span))
+            .run_script(
+                script_id,
+                script,
+                params
+                    .with_envelope(&self.core.core, self, self.data.session_id)
+                    .await,
+                self.data.session_id,
+            )
             .await
-            .unwrap_or(ScriptResult::Accept {
-                modifications: vec![],
-            })
     }
 }

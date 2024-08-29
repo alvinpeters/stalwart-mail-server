@@ -1,22 +1,44 @@
-use utils::config::Config;
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use crate::{
     expr::{if_block::IfBlock, tokenizer::TokenMap},
-    listener::blocked::BlockedIps,
+    listener::blocked::{AllowedIps, BlockedIps},
     Network,
 };
+use utils::config::Config;
 
-use super::CONNECTION_VARS;
+use super::*;
+
+pub(crate) const HTTP_VARS: &[u32; 11] = &[
+    V_LISTENER,
+    V_REMOTE_IP,
+    V_REMOTE_PORT,
+    V_LOCAL_IP,
+    V_LOCAL_PORT,
+    V_PROTOCOL,
+    V_TLS,
+    V_URL,
+    V_URL_PATH,
+    V_HEADERS,
+    V_METHOD,
+];
 
 impl Default for Network {
     fn default() -> Self {
         Self {
             blocked_ips: Default::default(),
-            url: IfBlock::new::<()>(
+            allowed_ips: Default::default(),
+            node_id: 0,
+            http_response_url: IfBlock::new::<()>(
                 "server.http.url",
                 [],
                 "protocol + '://' + key_get('default', 'hostname') + ':' + local_port",
             ),
+            http_allowed_endpoint: IfBlock::new::<()>("server.http.allowed-endpoint", [], "200"),
         }
     }
 }
@@ -24,12 +46,20 @@ impl Default for Network {
 impl Network {
     pub fn parse(config: &mut Config) -> Self {
         let mut network = Network {
+            node_id: config.property("cluster.node-id").unwrap_or_default(),
             blocked_ips: BlockedIps::parse(config),
+            allowed_ips: AllowedIps::parse(config),
             ..Default::default()
         };
-        let token_map = &TokenMap::default().with_variables(CONNECTION_VARS);
+        let token_map = &TokenMap::default().with_variables(HTTP_VARS);
 
-        for (value, key) in [(&mut network.url, "server.http.url")] {
+        for (value, key) in [
+            (&mut network.http_response_url, "server.http.url"),
+            (
+                &mut network.http_allowed_endpoint,
+                "server.http.allowed-endpoint",
+            ),
+        ] {
             if let Some(if_block) = IfBlock::try_parse(config, key, token_map) {
                 *value = if_block;
             }

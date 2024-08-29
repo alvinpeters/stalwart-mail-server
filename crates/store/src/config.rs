@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::sync::Arc;
 
@@ -70,12 +53,14 @@ impl Stores {
 
     pub async fn parse_stores(&mut self, config: &mut Config) {
         let is_reload = !self.stores.is_empty();
-
-        for id in config
+        #[cfg(feature = "enterprise")]
+        let mut composite_stores = Vec::new();
+        let store_ids = config
             .sub_keys("store", ".type")
             .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-        {
+            .collect::<Vec<_>>();
+
+        for id in store_ids {
             let id = id.as_str();
             // Parse store
             #[cfg(feature = "test_mode")]
@@ -84,7 +69,6 @@ impl Stores {
                     .property_or_default::<bool>(("store", id, "disable"), "false")
                     .unwrap_or(false)
                 {
-                    tracing::debug!("Skipping disabled store {id:?}.");
                     continue;
                 }
             }
@@ -146,7 +130,11 @@ impl Stores {
                 }
                 #[cfg(feature = "postgres")]
                 "postgresql" => {
-                    if let Some(db) = PostgresStore::open(config, prefix).await.map(Store::from) {
+                    if let Some(db) =
+                        PostgresStore::open(config, prefix, config.is_active_store(id))
+                            .await
+                            .map(Store::from)
+                    {
                         self.stores.insert(store_id.clone(), db.clone());
                         self.fts_stores.insert(store_id.clone(), db.clone().into());
                         self.blob_stores.insert(
@@ -158,7 +146,10 @@ impl Stores {
                 }
                 #[cfg(feature = "mysql")]
                 "mysql" => {
-                    if let Some(db) = MysqlStore::open(config, prefix).await.map(Store::from) {
+                    if let Some(db) = MysqlStore::open(config, prefix, config.is_active_store(id))
+                        .await
+                        .map(Store::from)
+                    {
                         self.stores.insert(store_id.clone(), db.clone());
                         self.fts_stores.insert(store_id.clone(), db.clone().into());
                         self.blob_stores.insert(
@@ -221,9 +212,63 @@ impl Stores {
                         self.lookup_stores.insert(store_id, db);
                     }
                 }
-                unknown => {
-                    tracing::debug!("Unknown directory type: {unknown:?}");
+                #[cfg(feature = "enterprise")]
+                "sql-read-replica" | "distributed-blob" => {
+                    composite_stores.push((store_id, protocol));
                 }
+                unknown => {
+                    config.new_parse_warning(
+                        ("store", id, "type"),
+                        format!("Unknown directory type: {unknown:?}"),
+                    );
+                }
+            }
+        }
+
+        #[cfg(feature = "enterprise")]
+        for (id, protocol) in composite_stores {
+            let prefix = ("store", id.as_str());
+            let compression = config
+                .property_or_default::<CompressionAlgo>(
+                    ("store", id.as_str(), "compression"),
+                    "none",
+                )
+                .unwrap_or(CompressionAlgo::None);
+            match protocol.as_str() {
+                #[cfg(any(feature = "postgres", feature = "mysql"))]
+                "sql-read-replica" => {
+                    if let Some(db) = crate::backend::composite::read_replica::SQLReadReplica::open(
+                        config,
+                        prefix,
+                        self,
+                        config.is_active_store(&id),
+                    )
+                    .await
+                    {
+                        let db = Store::SQLReadReplica(db.into());
+                        self.stores.insert(id.to_string(), db.clone());
+                        self.fts_stores.insert(id.to_string(), db.clone().into());
+                        self.blob_stores.insert(
+                            id.to_string(),
+                            BlobStore::from(db.clone()).with_compression(compression),
+                        );
+                        self.lookup_stores.insert(id.to_string(), db.into());
+                    }
+                }
+                "distributed-blob" => {
+                    if let Some(db) =
+                        crate::backend::composite::distributed_blob::DistributedBlob::open(
+                            config, prefix, self,
+                        )
+                    {
+                        let store = BlobStore {
+                            backend: crate::BlobBackend::Composite(db.into()),
+                            compression,
+                        };
+                        self.blob_stores.insert(id, store);
+                    }
+                }
+                _ => (),
             }
         }
     }
@@ -323,11 +368,25 @@ impl Stores {
     }
 }
 
-impl From<crate::Error> for String {
-    fn from(err: crate::Error) -> Self {
-        match err {
-            crate::Error::InternalError(err) => err,
-            crate::Error::AssertValueFailed => unimplemented!(),
+trait IsActiveStore {
+    fn is_active_store(&self, id: &str) -> bool;
+}
+
+impl IsActiveStore for Config {
+    fn is_active_store(&self, id: &str) -> bool {
+        for key in [
+            "storage.data",
+            "storage.blob",
+            "storage.lookup",
+            "storage.fts",
+        ] {
+            if let Some(store_id) = self.value(key) {
+                if store_id == id {
+                    return true;
+                }
+            }
         }
+
+        false
     }
 }

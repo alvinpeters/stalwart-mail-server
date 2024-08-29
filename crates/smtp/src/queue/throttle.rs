@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use common::{
     config::smtp::Throttle,
@@ -45,12 +28,12 @@ impl SMTP {
         throttle: &'x Throttle,
         envelope: &impl ResolveVariable,
         in_flight: &mut Vec<InFlight>,
-        span: &tracing::Span,
+        session_id: u64,
     ) -> Result<(), Error> {
         if throttle.expr.is_empty()
             || self
                 .core
-                .eval_expr(&throttle.expr, envelope, "throttle")
+                .eval_expr(&throttle.expr, envelope, "throttle", session_id)
                 .await
                 .unwrap_or(false)
         {
@@ -64,14 +47,16 @@ impl SMTP {
                     .is_rate_allowed(key.as_ref(), rate, false)
                     .await
                 {
-                    tracing::info!(
-                        parent: span,
-                        context = "throttle",
-                        event = "rate-limit-exceeded",
-                        max_requests = rate.requests,
-                        max_interval = rate.period.as_secs(),
-                        "Queue rate limit exceeded."
+                    trc::event!(
+                        Queue(trc::QueueEvent::RateLimitExceeded),
+                        SpanId = session_id,
+                        Id = throttle.id.clone(),
+                        Limit = vec![
+                            trc::Value::from(rate.requests),
+                            trc::Value::from(rate.period)
+                        ],
                     );
+
                     return Err(Error::Rate {
                         retry_at: now() + next_refill,
                     });
@@ -85,13 +70,13 @@ impl SMTP {
                         if let Some(inflight) = limiter.is_allowed() {
                             in_flight.push(inflight);
                         } else {
-                            tracing::info!(
-                                parent: span,
-                                context = "throttle",
-                                event = "too-many-requests",
-                                max_concurrent = limiter.max_concurrent,
-                                "Queue concurrency limit exceeded."
+                            trc::event!(
+                                Queue(trc::QueueEvent::ConcurrencyLimitExceeded),
+                                SpanId = session_id,
+                                Id = throttle.id.clone(),
+                                Limit = limiter.max_concurrent,
                             );
+
                             return Err(Error::Concurrency {
                                 limiter: limiter.clone(),
                             });

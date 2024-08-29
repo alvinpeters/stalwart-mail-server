@@ -13,7 +13,7 @@ pub(crate) fn sign(
     nonce: String,
     url: &str,
     payload: &str,
-) -> Result<String, JoseError> {
+) -> trc::Result<String> {
     let jwk = match kid {
         None => Some(Jwk::new(key)),
         Some(_) => None,
@@ -21,17 +21,20 @@ pub(crate) fn sign(
     let protected = Protected::base64(jwk, kid, nonce, url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
     let combined = format!("{}.{}", &protected, &payload);
-    let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
+    let signature = key
+        .sign(&SystemRandom::new(), combined.as_bytes())
+        .map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).caused_by(trc::location!()).reason(err))?;
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
         protected,
         payload,
         signature,
     };
-    Ok(serde_json::to_string(&body)?)
+
+    serde_json::to_string(&body).map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).from_json_error(err))
 }
 
-pub(crate) fn key_authorization(key: &EcdsaKeyPair, token: &str) -> Result<String, JoseError> {
+pub(crate) fn key_authorization(key: &EcdsaKeyPair, token: &str) -> trc::Result<String> {
     Ok(format!(
         "{}.{}",
         token,
@@ -39,17 +42,14 @@ pub(crate) fn key_authorization(key: &EcdsaKeyPair, token: &str) -> Result<Strin
     ))
 }
 
-pub(crate) fn key_authorization_sha256(
-    key: &EcdsaKeyPair,
-    token: &str,
-) -> Result<Digest, JoseError> {
+pub(crate) fn key_authorization_sha256(key: &EcdsaKeyPair, token: &str) -> trc::Result<Digest> {
     key_authorization(key, token).map(|s| digest(&SHA256, s.as_bytes()))
 }
 
 pub(crate) fn key_authorization_sha256_base64(
     key: &EcdsaKeyPair,
     token: &str,
-) -> Result<String, JoseError> {
+) -> trc::Result<String> {
     key_authorization_sha256(key, token).map(|s| URL_SAFE_NO_PAD.encode(s.as_ref()))
 }
 
@@ -77,7 +77,7 @@ impl<'a> Protected<'a> {
         kid: Option<&'a str>,
         nonce: String,
         url: &'a str,
-    ) -> Result<String, JoseError> {
+    ) -> trc::Result<String> {
         let protected = Self {
             alg: "ES256",
             jwk,
@@ -85,7 +85,8 @@ impl<'a> Protected<'a> {
             nonce,
             url,
         };
-        let protected = serde_json::to_vec(&protected)?;
+        let protected = serde_json::to_vec(&protected)
+            .map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).from_json_error(err))?;
         Ok(URL_SAFE_NO_PAD.encode(protected))
     }
 }
@@ -113,14 +114,15 @@ impl Jwk {
             y: URL_SAFE_NO_PAD.encode(y),
         }
     }
-    pub(crate) fn thumb_sha256_base64(&self) -> Result<String, JoseError> {
+    pub(crate) fn thumb_sha256_base64(&self) -> trc::Result<String> {
         let jwk_thumb = JwkThumb {
             crv: self.crv,
             kty: self.kty,
             x: &self.x,
             y: &self.y,
         };
-        let json = serde_json::to_vec(&jwk_thumb)?;
+        let json = serde_json::to_vec(&jwk_thumb)
+            .map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).from_json_error(err))?;
         let hash = digest(&SHA256, &json);
         Ok(URL_SAFE_NO_PAD.encode(hash))
     }
@@ -132,22 +134,4 @@ struct JwkThumb<'a> {
     kty: &'a str,
     x: &'a str,
     y: &'a str,
-}
-
-#[derive(Debug)]
-pub enum JoseError {
-    Json(serde_json::Error),
-    Crypto(ring::error::Unspecified),
-}
-
-impl From<serde_json::Error> for JoseError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
-    }
-}
-
-impl From<ring::error::Unspecified> for JoseError {
-    fn from(err: ring::error::Unspecified) -> Self {
-        Self::Crypto(err)
-    }
 }

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -24,6 +30,9 @@ pub struct Scripting {
     pub return_path: IfBlock,
     pub sign: IfBlock,
     pub scripts: AHashMap<String, Arc<Sieve>>,
+}
+
+pub struct ScriptCache {
     pub bayes_cache: BayesTokenCache,
     pub remote_lists: RwLock<AHashMap<String, RemoteList>>,
 }
@@ -307,29 +316,32 @@ impl Scripting {
                         "'MAILER-DAEMON@' + key_get('default', 'domain')",
                     )
                 }),
-                from_name: IfBlock::try_parse(config, "sieve.trusted.from-name", &token_map)
+            from_name: IfBlock::try_parse(config, "sieve.trusted.from-name", &token_map)
                 .unwrap_or_else(|| {
-                    IfBlock::new::<()>(
-                        "sieve.trusted.from-name",
-                        [],
-                        "'Automated Message'",
-                    )
+                    IfBlock::new::<()>("sieve.trusted.from-name", [], "'Automated Message'")
                 }),
-                return_path: IfBlock::try_parse(config, "sieve.trusted.return-path", &token_map)
-                .unwrap_or_else(|| {
-                    IfBlock::empty(
-                        "sieve.trusted.return-path",
-                    )
-                }),
-                sign: IfBlock::try_parse(config, "sieve.trusted.sign", &token_map)
-                .unwrap_or_else(|| {
+            return_path: IfBlock::try_parse(config, "sieve.trusted.return-path", &token_map)
+                .unwrap_or_else(|| IfBlock::empty("sieve.trusted.return-path")),
+            sign: IfBlock::try_parse(config, "sieve.trusted.sign", &token_map).unwrap_or_else(
+                || {
                     IfBlock::new::<()>(
                         "sieve.trusted.sign",
                         [],
-                        "['rsa-' + key_get('default', 'domain'), 'ed25519-' + key_get('default', 'domain')]",
+                        concat!(
+                            "['rsa-' + key_get('default', 'domain'), ",
+                            "'ed25519-' + key_get('default', 'domain')]"
+                        ),
                     )
-                }),
+                },
+            ),
             scripts,
+        }
+    }
+}
+
+impl ScriptCache {
+    pub fn parse(config: &mut Config) -> Self {
+        ScriptCache {
             bayes_cache: BayesTokenCache::new(
                 config
                     .property_or_default("cache.bayes.capacity", "8192")
@@ -362,9 +374,19 @@ impl Default for Scripting {
             sign: IfBlock::new::<()>(
                 "sieve.trusted.sign",
                 [],
-                "['rsa-' + key_get('default', 'domain'), 'ed25519-' + key_get('default', 'domain')]",
+                concat!(
+                    "['rsa-' + key_get('default', 'domain'), ",
+                    "'ed25519-' + key_get('default', 'domain')]"
+                ),
             ),
             scripts: AHashMap::new(),
+        }
+    }
+}
+
+impl Default for ScriptCache {
+    fn default() -> Self {
+        Self {
             bayes_cache: BayesTokenCache::new(
                 8192,
                 Duration::from_secs(3600),
@@ -386,8 +408,6 @@ impl Clone for Scripting {
             return_path: self.return_path.clone(),
             sign: self.sign.clone(),
             scripts: self.scripts.clone(),
-            bayes_cache: self.bayes_cache.clone(),
-            remote_lists: RwLock::new(self.remote_lists.read().clone()),
         }
     }
 }

@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::{Duration, Instant};
 
@@ -37,20 +20,20 @@ use crate::{
     BitmapKey, IndexKey, Key, LogKey, SUBSPACE_COUNTER, SUBSPACE_QUOTA, U32_LEN,
 };
 
-use super::MysqlStore;
+use super::{into_error, MysqlStore};
 
 #[derive(Debug)]
 enum CommitError {
     Mysql(mysql_async::Error),
-    Internal(crate::Error),
+    Internal(trc::Error),
     Retry,
 }
 
 impl MysqlStore {
-    pub(crate) async fn write(&self, batch: Batch) -> crate::Result<AssignedIds> {
+    pub(crate) async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
         let start = Instant::now();
         let mut retry_count = 0;
-        let mut conn = self.conn_pool.get_conn().await?;
+        let mut conn = self.conn_pool.get_conn().await.map_err(into_error)?;
 
         loop {
             match self.write_trx(&mut conn, &batch).await {
@@ -63,11 +46,11 @@ impl MysqlStore {
                         && start.elapsed() < MAX_COMMIT_TIME => {}
                 Err(CommitError::Retry) => {
                     if retry_count > MAX_COMMIT_ATTEMPTS || start.elapsed() > MAX_COMMIT_TIME {
-                        return Err(crate::Error::AssertValueFailed);
+                        return Err(trc::StoreEvent::AssertValueFailed.into());
                     }
                 }
                 Err(CommitError::Mysql(err)) => {
-                    return Err(err.into());
+                    return Err(into_error(err));
                 }
                 Err(CommitError::Internal(err)) => {
                     return Err(err);
@@ -152,7 +135,9 @@ impl MysqlStore {
                                 Ok(_) => {
                                     if exists.is_some() && trx.affected_rows() == 0 {
                                         trx.rollback().await?;
-                                        return Err(crate::Error::AssertValueFailed.into());
+                                        return Err(trc::StoreEvent::AssertValueFailed
+                                            .into_err()
+                                            .into());
                                     }
                                 }
                                 Err(err) => {
@@ -325,7 +310,7 @@ impl MysqlStore {
                         .unwrap_or_else(|| (false, assert_value.is_none()));
                     if !matches {
                         trx.rollback().await?;
-                        return Err(crate::Error::AssertValueFailed.into());
+                        return Err(trc::StoreEvent::AssertValueFailed.into_err().into());
                     }
                     asserted_values.insert(key, exists);
                 }
@@ -335,35 +320,37 @@ impl MysqlStore {
         trx.commit().await.map(|_| result).map_err(Into::into)
     }
 
-    pub(crate) async fn purge_store(&self) -> crate::Result<()> {
-        let mut conn = self.conn_pool.get_conn().await?;
+    pub(crate) async fn purge_store(&self) -> trc::Result<()> {
+        let mut conn = self.conn_pool.get_conn().await.map_err(into_error)?;
         for subspace in [SUBSPACE_QUOTA, SUBSPACE_COUNTER] {
             let s = conn
                 .prep(&format!("DELETE FROM {} WHERE v = 0", char::from(subspace),))
-                .await?;
-            conn.exec_drop(&s, ()).await?;
+                .await
+                .map_err(into_error)?;
+            conn.exec_drop(&s, ()).await.map_err(into_error)?;
         }
 
         Ok(())
     }
 
-    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> crate::Result<()> {
-        let mut conn = self.conn_pool.get_conn().await?;
+    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> trc::Result<()> {
+        let mut conn = self.conn_pool.get_conn().await.map_err(into_error)?;
 
         let s = conn
             .prep(&format!(
                 "DELETE FROM {} WHERE k >= ? AND k < ?",
                 char::from(from.subspace()),
             ))
-            .await?;
+            .await
+            .map_err(into_error)?;
         conn.exec_drop(&s, (&from.serialize(0), &to.serialize(0)))
             .await
-            .map_err(Into::into)
+            .map_err(into_error)
     }
 }
 
-impl From<crate::Error> for CommitError {
-    fn from(err: crate::Error) -> Self {
+impl From<trc::Error> for CommitError {
+    fn from(err: trc::Error) -> Self {
         CommitError::Internal(err)
     }
 }

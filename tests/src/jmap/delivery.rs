@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
@@ -104,6 +87,7 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Delivering to individuals
     let mut lmtp = SmtpConnection::connect().await;
+    params.webhook.clear();
 
     lmtp.ingest(
         "bill@example.com",
@@ -320,6 +304,14 @@ pub async fn test(params: &mut JMAPTest) {
         destroy_all_mailboxes(params).await;
     }
     assert_is_empty(server).await;
+
+    // Check webhook events
+    params.webhook.assert_contains(&[
+        "message-ingest.",
+        "delivery.dsn",
+        "\"from\": \"bill@example.com\"",
+        "\"john.doe@example.com\"",
+    ]);
 }
 
 pub struct SmtpConnection {
@@ -503,7 +495,7 @@ impl SmtpConnection {
 
 pub trait AssertResult: Sized {
     fn assert_contains(self, text: &str) -> Self;
-    fn assert_count(self, text: &str, occurences: usize) -> Self;
+    fn assert_count(self, text: &str, occurrences: usize) -> Self;
     fn assert_equals(self, text: &str) -> Self;
 }
 
@@ -517,12 +509,12 @@ impl AssertResult for Vec<String> {
         panic!("Expected response to contain {:?}, got {:?}", text, self);
     }
 
-    fn assert_count(self, text: &str, occurences: usize) -> Self {
+    fn assert_count(self, text: &str, occurrences: usize) -> Self {
         assert_eq!(
             self.iter().filter(|l| l.contains(text)).count(),
-            occurences,
+            occurrences,
             "Expected {} occurrences of {:?}, found {}.",
-            occurences,
+            occurrences,
             text,
             self.iter().filter(|l| l.contains(text)).count()
         );
