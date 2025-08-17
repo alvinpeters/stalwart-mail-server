@@ -1,62 +1,184 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::path::PathBuf;
-
+use super::{
+    WEBADMIN_KEY,
+    backup::BackupParams,
+    config::{ConfigManager, Patterns},
+    console::store_console,
+};
+use crate::{
+    Caches, Core, Data, IPC_CHANNEL_BUFFER, Inner, Ipc,
+    config::{network::AsnGeoLookupConfig, server::Listeners, telemetry::Telemetry},
+    core::BuildServer,
+    ipc::{BroadcastEvent, HousekeeperEvent, QueueEvent, ReportingEvent, StateEvent},
+};
 use arc_swap::ArcSwap;
 use pwhash::sha512_crypt;
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    sync::Arc,
+};
 use store::{
-    rand::{distributions::Alphanumeric, thread_rng, Rng},
     Stores,
+    rand::{Rng, distr::Alphanumeric, rng},
 };
+use tokio::sync::{Notify, mpsc};
 use utils::{
+    UnwrapFailure,
     config::{Config, ConfigKey},
-    failed, UnwrapFailure,
-};
-
-use crate::{
-    config::{server::Servers, telemetry::Telemetry},
-    Core, SharedCore,
-};
-
-use super::{
-    config::{ConfigManager, Patterns},
-    WEBADMIN_KEY,
+    failed,
 };
 
 pub struct BootManager {
     pub config: Config,
-    pub core: SharedCore,
-    pub servers: Servers,
+    pub inner: Arc<Inner>,
+    pub servers: Listeners,
+    pub ipc_rxs: IpcReceivers,
 }
 
-const HELP: &str = r#"Stalwart Mail Server
+pub struct IpcReceivers {
+    pub state_rx: Option<mpsc::Receiver<StateEvent>>,
+    pub housekeeper_rx: Option<mpsc::Receiver<HousekeeperEvent>>,
+    pub queue_rx: Option<mpsc::Receiver<QueueEvent>>,
+    pub report_rx: Option<mpsc::Receiver<ReportingEvent>>,
+    pub broadcast_rx: Option<mpsc::Receiver<BroadcastEvent>>,
+}
 
-Usage: stalwart-mail [OPTIONS]
+const HELP: &str = concat!(
+    "Stalwart Server v",
+    env!("CARGO_PKG_VERSION"),
+    r#"
+
+Usage: stalwart [OPTIONS]
 
 Options:
   -c, --config <PATH>              Start server with the specified configuration file
   -e, --export <PATH>              Export all store data to a specific path
   -i, --import <PATH>              Import store data from a specific path
+  -o, --console                    Open the store console
   -I, --init <PATH>                Initialize a new server at a specific path
   -h, --help                       Print help
   -V, --version                    Print version
-"#;
+"#
+);
 
 #[derive(PartialEq, Eq)]
-enum ImportExport {
-    Export(PathBuf),
+enum StoreOp {
+    Export(BackupParams),
     Import(PathBuf),
+    Console,
     None,
 }
+
+pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
+    ("queue.quota.size.messages", "100000"),
+    ("queue.quota.size.size", "10737418240"),
+    ("queue.quota.size.enable", "true"),
+    ("queue.limiter.inbound.ip.key", "remote_ip"),
+    ("queue.limiter.inbound.ip.rate", "5/1s"),
+    ("queue.limiter.inbound.ip.enable", "true"),
+    ("queue.limiter.inbound.sender.key.0", "sender_domain"),
+    ("queue.limiter.inbound.sender.key.1", "rcpt"),
+    ("queue.limiter.inbound.sender.rate", "25/1h"),
+    ("queue.limiter.inbound.sender.enable", "true"),
+    ("report.analysis.addresses", "postmaster@*"),
+    ("queue.virtual.local.threads-per-node", "25"),
+    ("queue.virtual.local.description", "Local delivery queue"),
+    ("queue.virtual.remote.threads-per-node", "50"),
+    ("queue.virtual.remote.description", "Remote delivery queue"),
+    ("queue.virtual.dsn.threads-per-node", "5"),
+    (
+        "queue.virtual.dsn.description",
+        "Delivery Status Notification delivery queue",
+    ),
+    ("queue.virtual.report.threads-per-node", "5"),
+    (
+        "queue.virtual.report.description",
+        "DMARC and TLS report delivery queue",
+    ),
+    ("queue.schedule.local.queue-name", "local"),
+    ("queue.schedule.local.retry.0", "2m"),
+    ("queue.schedule.local.retry.1", "5m"),
+    ("queue.schedule.local.retry.2", "10m"),
+    ("queue.schedule.local.retry.3", "15m"),
+    ("queue.schedule.local.retry.4", "30m"),
+    ("queue.schedule.local.retry.5", "1h"),
+    ("queue.schedule.local.retry.6", "2h"),
+    ("queue.schedule.local.notify.0", "1d"),
+    ("queue.schedule.local.notify.1", "3d"),
+    ("queue.schedule.local.expire-type", "ttl"),
+    ("queue.schedule.local.expire", "3d"),
+    (
+        "queue.schedule.local.description",
+        "Local delivery schedule",
+    ),
+    ("queue.schedule.remote.queue-name", "remote"),
+    ("queue.schedule.remote.retry.0", "2m"),
+    ("queue.schedule.remote.retry.1", "5m"),
+    ("queue.schedule.remote.retry.2", "10m"),
+    ("queue.schedule.remote.retry.3", "15m"),
+    ("queue.schedule.remote.retry.4", "30m"),
+    ("queue.schedule.remote.retry.5", "1h"),
+    ("queue.schedule.remote.retry.6", "2h"),
+    ("queue.schedule.remote.notify.0", "1d"),
+    ("queue.schedule.remote.notify.1", "3d"),
+    ("queue.schedule.remote.expire-type", "ttl"),
+    ("queue.schedule.remote.expire", "3d"),
+    (
+        "queue.schedule.remote.description",
+        "Remote delivery schedule",
+    ),
+    ("queue.schedule.dsn.queue-name", "dsn"),
+    ("queue.schedule.dsn.retry.0", "15m"),
+    ("queue.schedule.dsn.retry.1", "30m"),
+    ("queue.schedule.dsn.retry.2", "1h"),
+    ("queue.schedule.dsn.retry.3", "2h"),
+    ("queue.schedule.dsn.expire-type", "attempts"),
+    ("queue.schedule.dsn.max-attempts", "10"),
+    (
+        "queue.schedule.dsn.description",
+        "Delivery Status Notification delivery schedule",
+    ),
+    ("queue.schedule.report.queue-name", "report"),
+    ("queue.schedule.report.retry.0", "30m"),
+    ("queue.schedule.report.retry.1", "1h"),
+    ("queue.schedule.report.retry.2", "2h"),
+    ("queue.schedule.report.expire-type", "attempts"),
+    ("queue.schedule.report.max-attempts", "8"),
+    (
+        "queue.schedule.report.description",
+        "DMARC and TLS report delivery schedule",
+    ),
+    ("queue.tls.invalid-tls.allow-invalid-certs", "true"),
+    (
+        "queue.tls.invalid-tls.description",
+        "Allow invalid TLS certificates",
+    ),
+    ("queue.tls.default.allow-invalid-certs", "false"),
+    ("queue.tls.default.description", "Default TLS settings"),
+    ("queue.route.local.type", "local"),
+    ("queue.route.local.description", "Local delivery route"),
+    ("queue.route.mx.type", "mx"),
+    ("queue.route.mx.limits.multihomed", "2"),
+    ("queue.route.mx.limits.mx", "5"),
+    ("queue.route.mx.ip-lookup", "ipv4_then_ipv6"),
+    ("queue.route.mx.description", "MX delivery route"),
+    ("queue.connection.default.timeout.connect", "5m"),
+    (
+        "queue.connection.default.description",
+        "Default connection settings",
+    ),
+];
 
 impl BootManager {
     pub async fn init() -> Self {
         let mut config_path = std::env::var("CONFIG_PATH").ok();
-        let mut import_export = ImportExport::None;
+        let mut import_export = StoreOp::None;
 
         if config_path.is_none() {
             let mut args = std::env::args().skip(1);
@@ -89,10 +211,13 @@ impl BootManager {
                         std::process::exit(0);
                     }
                     ("export" | "e", Some(value)) => {
-                        import_export = ImportExport::Export(value.into());
+                        import_export = StoreOp::Export(BackupParams::new(value.into()));
                     }
                     ("import" | "i", Some(value)) => {
-                        import_export = ImportExport::Import(value.into());
+                        import_export = StoreOp::Import(value.into());
+                    }
+                    ("console" | "o", None) => {
+                        import_export = StoreOp::Console;
                     }
                     (_, None) => {
                         failed(&format!("Unrecognized command '{key}', try '--help'."));
@@ -104,7 +229,7 @@ impl BootManager {
             }
 
             if config_path.is_none() {
-                if import_export == ImportExport::None {
+                if import_export == StoreOp::None {
                     eprintln!("{HELP}");
                 } else {
                     eprintln!("Missing '--config' argument for import/export.")
@@ -130,7 +255,7 @@ impl BootManager {
         config.resolve_macros(&["env"]).await;
 
         // Parser servers
-        let mut servers = Servers::parse(&mut config);
+        let mut servers = Listeners::parse(&mut config);
 
         // Bind ports and drop privileges
         servers.bind_and_drop_priv(&mut config);
@@ -140,12 +265,31 @@ impl BootManager {
 
         // Load stores
         let mut stores = Stores::parse(&mut config).await;
+        let local_patterns = Patterns::parse(&mut config);
+
+        // Build local keys and warn about database keys defined in the local configuration
+        let mut warn_keys = Vec::new();
+        for key in config.keys.keys() {
+            if !local_patterns.is_local_key(key) {
+                warn_keys.push(key.clone());
+            }
+        }
+        for warn_key in warn_keys {
+            config.new_build_warning(
+                warn_key,
+                concat!(
+                    "Database key defined in local configuration, this might cause issues. ",
+                    "See https://stalw.art/docs/configuration/overview/#loc",
+                    "al-and-database-settings"
+                ),
+            );
+        }
 
         // Build manager
         let manager = ConfigManager {
             cfg_local: ArcSwap::from_pointee(cfg_local),
             cfg_local_path,
-            cfg_local_patterns: Patterns::parse(&mut config).into(),
+            cfg_local_patterns: local_patterns.into(),
             cfg_store: config
                 .value("storage.data")
                 .and_then(|id| stores.stores.get(id))
@@ -155,31 +299,33 @@ impl BootManager {
 
         // Extend configuration with settings stored in the db
         if !manager.cfg_store.is_none() {
-            manager
-                .extend_config(&mut config, "")
+            for (key, value) in manager
+                .db_list("", false)
                 .await
-                .failed("Failed to read configuration");
+                .failed("Failed to read database configuration")
+            {
+                if manager.cfg_local_patterns.is_local_key(&key) {
+                    config.new_build_warning(
+                        &key,
+                        concat!(
+                            "Local key defined in database, this might cause issues. ",
+                            "See https://stalw.art/docs/configuration/overview/#loc",
+                            "al-and-database-settings"
+                        ),
+                    );
+                }
+
+                config.keys.entry(key).or_insert(value);
+            }
         }
 
         // Parse telemetry
         let telemetry = Telemetry::parse(&mut config, &stores);
 
         match import_export {
-            ImportExport::None => {
+            StoreOp::None => {
                 // Add hostname lookup if missing
                 let mut insert_keys = Vec::new();
-                if config
-                    .value("lookup.default.hostname")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-                {
-                    insert_keys.push(ConfigKey::from((
-                        "lookup.default.hostname",
-                        hostname::get()
-                            .map(|v| v.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| "localhost".to_string()),
-                    )));
-                }
 
                 // Generate an OAuth key if missing
                 if config
@@ -189,7 +335,7 @@ impl BootManager {
                 {
                     insert_keys.push(ConfigKey::from((
                         "oauth.key",
-                        thread_rng()
+                        rng()
                             .sample_iter(Alphanumeric)
                             .take(64)
                             .map(char::from)
@@ -197,33 +343,13 @@ impl BootManager {
                     )));
                 }
 
-                // Generate a Cluster encryption key if missing
-                if config
-                    .value("cluster.key")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-                {
-                    insert_keys.push(ConfigKey::from((
-                        "cluster.key",
-                        thread_rng()
-                            .sample_iter(Alphanumeric)
-                            .take(64)
-                            .map(char::from)
-                            .collect::<String>(),
-                    )));
-                }
-
-                // Download SPAM filters if missing
-                if config
-                    .value("version.spam-filter")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-                {
-                    match manager.fetch_config_resource("spam-filter").await {
+                // Download Spam filter rules if missing
+                if config.value("version.spam-filter").is_none() {
+                    match manager.fetch_spam_rules().await {
                         Ok(external_config) => {
                             trc::event!(
                                 Config(trc::ConfigEvent::ImportExternal),
-                                Version = external_config.version,
+                                Version = external_config.version.to_string(),
                                 Id = "spam-filter"
                             );
                             insert_keys.extend(external_config.keys);
@@ -237,23 +363,8 @@ impl BootManager {
                     }
 
                     // Add default settings
-                    for key in [
-                        ("queue.quota.size.messages", "100000"),
-                        ("queue.quota.size.size", "10737418240"),
-                        ("queue.quota.size.enable", "true"),
-                        ("queue.throttle.rcpt.key", "rcpt_domain"),
-                        ("queue.throttle.rcpt.concurrency", "5"),
-                        ("queue.throttle.rcpt.enable", "true"),
-                        ("session.throttle.ip.key", "remote_ip"),
-                        ("session.throttle.ip.concurrency", "5"),
-                        ("session.throttle.ip.enable", "true"),
-                        ("session.throttle.sender.key.0", "sender_domain"),
-                        ("session.throttle.sender.key.1", "rcpt"),
-                        ("session.throttle.sender.rate", "25/1h"),
-                        ("session.throttle.sender.enable", "true"),
-                        ("report.analysis.addresses", "postmaster@*"),
-                    ] {
-                        insert_keys.push(ConfigKey::from(key));
+                    for key in DEFAULT_SETTINGS {
+                        insert_keys.push(ConfigKey::from(*key));
                     }
                 }
 
@@ -297,21 +408,33 @@ impl BootManager {
                         config.keys.insert(item.key.clone(), item.value.clone());
                     }
 
-                    if let Err(err) = manager.set(insert_keys).await {
+                    if let Err(err) = manager.set(insert_keys, true).await {
                         config
                             .new_build_error("*", format!("Failed to update configuration: {err}"));
                     }
                 }
 
-                // Parse lookup stores
-                stores.parse_lookups(&mut config).await;
+                // Parse in-memory stores
+                stores.parse_in_memory(&mut config, false).await;
 
                 // Parse settings
-                let core = Core::parse(&mut config, stores, manager).await;
+                let core = Box::pin(Core::parse(&mut config, stores, manager)).await;
+
+                // Parse data
+                let data = Data::parse(&mut config);
+
+                // Parse caches
+                let cache = Caches::parse(&mut config);
 
                 // Enable telemetry
+
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
                 #[cfg(feature = "enterprise")]
                 telemetry.enable(core.is_enterprise_edition());
+                // SPDX-SnippetEnd
+
                 #[cfg(not(feature = "enterprise"))]
                 telemetry.enable(false);
 
@@ -320,42 +443,127 @@ impl BootManager {
                     Version = env!("CARGO_PKG_VERSION"),
                 );
 
-                // Build shared core
-                let core = core.into_shared();
+                // Webadmin auto-update
+                // Disabled temporarily until selective updates are implemented
+                /*if config
+                    .property_or_default::<bool>("webadmin.auto-update", "false")
+                    .unwrap_or_default()
+                {
+                    if let Err(err) = data.webadmin.update(&core).await {
+                        trc::event!(
+                            Resource(trc::ResourceEvent::Error),
+                            Details = "Failed to update webadmin",
+                            CausedBy = err
+                        );
+                    }
+                }*/
+
+                // Spam filter auto-update
+                if config
+                    .property_or_default::<bool>("spam-filter.auto-update", "false")
+                    .unwrap_or_default()
+                {
+                    if let Err(err) = core.storage.config.update_spam_rules(false, false).await {
+                        trc::event!(
+                            Resource(trc::ResourceEvent::Error),
+                            Details = "Failed to update spam-filter",
+                            CausedBy = err
+                        );
+                    }
+                }
+
+                // Build shared inner
+                let has_remote_asn = matches!(
+                    core.network.asn_geo_lookup,
+                    AsnGeoLookupConfig::Resource { .. }
+                );
+                let (ipc, ipc_rxs) = build_ipc(!core.storage.pubsub.is_none());
+                let inner = Arc::new(Inner {
+                    shared_core: ArcSwap::from_pointee(core),
+                    data,
+                    ipc,
+                    cache,
+                });
+
+                // Fetch ASN database
+                if has_remote_asn {
+                    inner
+                        .build_server()
+                        .lookup_asn_country(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+                        .await;
+                }
 
                 // Parse TCP acceptors
-                servers.parse_tcp_acceptors(&mut config, core.clone());
+                servers.parse_tcp_acceptors(&mut config, inner.clone());
 
                 BootManager {
-                    core,
+                    inner,
                     config,
                     servers,
+                    ipc_rxs,
                 }
             }
-            ImportExport::Export(path) => {
+            StoreOp::Export(path) => {
                 // Enable telemetry
                 telemetry.enable(false);
 
                 // Parse settings and backup
-                Core::parse(&mut config, stores, manager)
+                Box::pin(Core::parse(&mut config, stores, manager))
                     .await
                     .backup(path)
                     .await;
                 std::process::exit(0);
             }
-            ImportExport::Import(path) => {
+            StoreOp::Import(path) => {
                 // Enable telemetry
                 telemetry.enable(false);
 
                 // Parse settings and restore
-                Core::parse(&mut config, stores, manager)
+                Box::pin(Core::parse(&mut config, stores, manager))
                     .await
                     .restore(path)
                     .await;
                 std::process::exit(0);
             }
+            StoreOp::Console => {
+                // Store console
+                store_console(
+                    Box::pin(Core::parse(&mut config, stores, manager))
+                        .await
+                        .storage
+                        .data,
+                )
+                .await;
+                std::process::exit(0);
+            }
         }
     }
+}
+
+pub fn build_ipc(has_pubsub: bool) -> (Ipc, IpcReceivers) {
+    // Build ipc receivers
+    let (state_tx, state_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
+    let (housekeeper_tx, housekeeper_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
+    let (queue_tx, queue_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
+    let (report_tx, report_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
+    let (broadcast_tx, broadcast_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
+    (
+        Ipc {
+            state_tx,
+            housekeeper_tx,
+            queue_tx,
+            report_tx,
+            broadcast_tx: has_pubsub.then_some(broadcast_tx),
+            task_tx: Arc::new(Notify::new()),
+        },
+        IpcReceivers {
+            state_rx: Some(state_rx),
+            housekeeper_rx: Some(housekeeper_rx),
+            queue_rx: Some(queue_rx),
+            report_rx: Some(report_rx),
+            broadcast_rx: has_pubsub.then_some(broadcast_rx),
+        },
+    )
 }
 
 fn quickstart(path: impl Into<PathBuf>) {
@@ -373,7 +581,7 @@ fn quickstart(path: impl Into<PathBuf>) {
     }
 
     let admin_pass = std::env::var("STALWART_ADMIN_PASSWORD").unwrap_or_else(|_| {
-        thread_rng()
+        rng()
             .sample_iter(Alphanumeric)
             .take(10)
             .map(char::from)

@@ -1,25 +1,34 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::sync::Arc;
 
+use common::{Server, auth::AccessToken};
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
 use trc::JmapEvent;
 use tungstenite::{handshake::derive_accept_key, protocol::Role};
 
-use crate::{
-    api::{http::HttpSessionData, HttpRequest, HttpResponse, HttpResponseBody},
-    auth::AccessToken,
-    JMAP,
-};
+use http_proto::*;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn upgrade_websocket_connection(
+use super::stream::WebSocketHandler;
+
+pub trait WebSocketUpgrade: Sync + Send {
+    fn upgrade_websocket_connection(
+        &self,
+        req: HttpRequest,
+        access_token: Arc<AccessToken>,
+        session: HttpSessionData,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl WebSocketUpgrade for Server {
+    async fn upgrade_websocket_connection(
         &self,
         req: HttpRequest,
         access_token: Arc<AccessToken>,
@@ -70,15 +79,17 @@ impl JMAP {
             let session_id = session.session_id;
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
-                    jmap.handle_websocket_stream(
-                        WebSocketStream::from_raw_socket(
-                            TokioIo::new(upgraded),
-                            Role::Server,
-                            None,
-                        )
-                        .await,
-                        access_token,
-                        session,
+                    Box::pin(
+                        jmap.handle_websocket_stream(
+                            WebSocketStream::from_raw_socket(
+                                TokioIo::new(upgraded),
+                                Role::Server,
+                                None,
+                            )
+                            .await,
+                            access_token,
+                            session,
+                        ),
                     )
                     .await;
                 }
@@ -93,12 +104,6 @@ impl JMAP {
             }
         });
 
-        Ok(HttpResponse {
-            status: StatusCode::SWITCHING_PROTOCOLS,
-            content_type: "".into(),
-            content_disposition: "".into(),
-            cache_control: "".into(),
-            body: HttpResponseBody::WebsocketUpgrade(derived_key),
-        })
+        Ok(HttpResponse::new(StatusCode::SWITCHING_PROTOCOLS).with_websocket_upgrade(derived_key))
     }
 }

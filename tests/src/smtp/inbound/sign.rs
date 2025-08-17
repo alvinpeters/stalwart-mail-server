@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -16,12 +16,11 @@ use store::Stores;
 use utils::config::Config;
 
 use crate::smtp::{
-    build_smtp,
+    DnsCache, TempDir, TestSMTP,
     inbound::TestMessage,
     session::{TestSession, VerifyResponse},
-    TempDir, TestSMTP,
 };
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 
 pub const SIGNATURES: &str = "
 [signature.rsa]
@@ -76,13 +75,13 @@ set-body-length = false
 
 const CONFIG: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
 
 [directory."local"]
@@ -127,28 +126,24 @@ async fn sign_and_seal() {
     // Enable logging
     crate::enable_logging();
 
-
     let tmp_dir = TempDir::new("smtp_sign_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG.to_string() + SIGNATURES)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
-    let mut inner = Inner::default();
-
-    // Create temp dir for queue
-    let mut qr = inner.init_test_queue(&core);
+    let test = TestSMTP::from_core(core);
 
     // Add SPF, DKIM and DMARC records
-    core.smtp.resolvers.dns.txt_add(
+    test.server.txt_add(
         "mx.example.com",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 ip4:10.0.0.2 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.smtp.resolvers.dns.txt_add(
+    test.server.txt_add(
         "example.com",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.smtp.resolvers.dns.txt_add(
+    test.server.txt_add(
         "ed._domainkey.scamorza.org",
         DomainKey::parse(
             concat!(
@@ -160,7 +155,7 @@ async fn sign_and_seal() {
         .unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.smtp.resolvers.dns.txt_add(
+    test.server.txt_add(
         "rsa._domainkey.manchego.org",
         DomainKey::parse(
             concat!(
@@ -177,8 +172,9 @@ async fn sign_and_seal() {
     );
 
     // Test DKIM signing
-    let mut session = Session::test(build_smtp(core, inner));
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.eval_session_params().await;
     session.ehlo("mx.example.com").await;
     session

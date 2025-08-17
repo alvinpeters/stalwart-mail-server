@@ -1,13 +1,16 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use store::Store;
-use utils::config::{utils::AsKey, Config};
+use utils::config::{Config, utils::AsKey};
 
-use crate::{backend::internal::manage::ManageDirectory, Principal, Type};
+use crate::{
+    Principal, PrincipalData, ROLE_ADMIN, ROLE_USER, Type,
+    backend::internal::manage::ManageDirectory,
+};
 
 use super::{EmailType, MemoryDirectory};
 
@@ -25,26 +28,23 @@ impl MemoryDirectory {
             domains: Default::default(),
         };
 
-        for lookup_id in config
-            .sub_keys((prefix.as_str(), "principals"), ".name")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for lookup_id in config.sub_keys((prefix.as_str(), "principals"), ".name") {
             let lookup_id = lookup_id.as_str();
             let name = config
                 .value_require((prefix.as_str(), "principals", lookup_id, "name"))?
                 .to_string();
-            let typ = match config.value((prefix.as_str(), "principals", lookup_id, "class")) {
-                Some("individual") => Type::Individual,
-                Some("admin") => Type::Superuser,
-                Some("group") => Type::Group,
-                _ => Type::Individual,
-            };
+            let (typ, is_superuser) =
+                match config.value((prefix.as_str(), "principals", lookup_id, "class")) {
+                    Some("individual") => (Type::Individual, false),
+                    Some("admin") => (Type::Individual, true),
+                    Some("group") => (Type::Group, false),
+                    _ => (Type::Individual, false),
+                };
 
             // Obtain id
             let id = directory
                 .data_store
-                .get_or_create_account_id(&name)
+                .get_or_create_principal_id(&name, Type::Individual)
                 .await
                 .map_err(|err| {
                     config.new_build_error(
@@ -57,8 +57,18 @@ impl MemoryDirectory {
                 })
                 .ok()?;
 
+            // Create principal
+            let mut principal = Principal::new(id, typ);
+            let mut member_of = Vec::with_capacity(2);
+            principal
+                .data
+                .push(PrincipalData::Roles(vec![if is_superuser {
+                    ROLE_ADMIN
+                } else {
+                    ROLE_USER
+                }]));
+
             // Obtain group ids
-            let mut member_of = Vec::new();
             for group in config
                 .values((prefix.as_str(), "principals", lookup_id, "member-of"))
                 .map(|(_, s)| s.to_string())
@@ -67,7 +77,7 @@ impl MemoryDirectory {
                 member_of.push(
                     directory
                         .data_store
-                        .get_or_create_account_id(&group)
+                        .get_or_create_principal_id(&group, Type::Group)
                         .await
                         .map_err(|err| {
                             config.new_build_error(
@@ -81,9 +91,9 @@ impl MemoryDirectory {
                         .ok()?,
                 );
             }
+            principal.data.push(PrincipalData::MemberOf(member_of));
 
             // Parse email addresses
-            let mut emails = Vec::new();
             for (pos, (_, email)) in config
                 .values((prefix.as_str(), "principals", lookup_id, "email"))
                 .enumerate()
@@ -102,7 +112,7 @@ impl MemoryDirectory {
                     directory.domains.insert(domain.to_lowercase());
                 }
 
-                emails.push(email.to_lowercase());
+                principal.emails.push(email.to_lowercase());
             }
 
             // Parse mailing lists
@@ -119,23 +129,22 @@ impl MemoryDirectory {
                 }
             }
 
-            directory.principals.push(Principal {
-                name: name.clone(),
-                secrets: config
-                    .values((prefix.as_str(), "principals", lookup_id, "secret"))
-                    .map(|(_, v)| v.to_string())
-                    .collect(),
-                typ,
-                description: config
-                    .value((prefix.as_str(), "principals", lookup_id, "description"))
-                    .map(|v| v.to_string()),
-                quota: config
-                    .property((prefix.as_str(), "principals", lookup_id, "quota"))
-                    .unwrap_or(0),
-                member_of,
-                id,
-                emails,
-            });
+            principal.name = name.as_str().into();
+            for (_, secret) in config.values((prefix.as_str(), "principals", lookup_id, "secret")) {
+                principal.secrets.push(secret.into());
+            }
+            if let Some(description) =
+                config.value((prefix.as_str(), "principals", lookup_id, "description"))
+            {
+                principal.description = Some(description.into());
+            }
+            if let Some(quota) =
+                config.property::<u64>((prefix.as_str(), "principals", lookup_id, "quota"))
+            {
+                principal.quota = quota.into();
+            }
+
+            directory.principals.push(principal);
         }
 
         Some(directory)

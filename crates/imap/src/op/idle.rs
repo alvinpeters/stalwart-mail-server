@@ -1,37 +1,37 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
-
-use std::{sync::Arc, time::Instant};
-
-use ahash::AHashSet;
-use imap_proto::{
-    protocol::{
-        fetch,
-        list::{Attribute, ListItem},
-        status::Status,
-        Sequence,
-    },
-    receiver::Request,
-    Command, StatusResponse,
-};
-
-use common::listener::SessionStream;
-use jmap_proto::types::{collection::Collection, type_state::DataType};
-use store::query::log::Query;
-use tokio::io::AsyncReadExt;
-use trc::AddContext;
-use utils::map::bitmap::Bitmap;
 
 use crate::{
     core::{SelectedMailbox, Session, SessionData, State},
     op::ImapContext,
 };
+use ahash::AHashSet;
+use common::listener::SessionStream;
+use directory::Permission;
+use imap_proto::{
+    Command, StatusResponse,
+    protocol::{
+        Sequence, fetch,
+        list::{Attribute, ListItem},
+        status::Status,
+    },
+    receiver::Request,
+};
+use jmap_proto::types::{collection::SyncCollection, type_state::DataType};
+use std::{sync::Arc, time::Instant};
+use store::query::log::Query;
+use tokio::io::AsyncReadExt;
+use trc::AddContext;
+use utils::map::bitmap::Bitmap;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_idle(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapIdle)?;
+
         let op_start = Instant::now();
         let (data, mailbox, types) = match &self.state {
             State::Authenticated { data, .. } => {
@@ -49,7 +49,7 @@ impl<T: SessionStream> Session<T> {
 
         // Register with state manager
         let mut change_rx = self
-            .jmap
+            .server
             .subscribe_state_manager(data.account_id, types)
             .await
             .imap_ctx(&request.tag, trc::location!())?;
@@ -65,10 +65,10 @@ impl<T: SessionStream> Session<T> {
         );
 
         let op_start = Instant::now();
-        let mut buf = vec![0; 1024];
+        let mut buf = vec![0; 4];
         loop {
             tokio::select! {
-                result = tokio::time::timeout(self.jmap.core.imap.timeout_idle, self.stream_rx.read(&mut buf)) => {
+                result = tokio::time::timeout(self.server.core.imap.timeout_idle, self.stream_rx.read_exact(&mut buf)) => {
                     match result {
                         Ok(Ok(bytes_read)) => {
                             if bytes_read > 0 {
@@ -96,7 +96,7 @@ impl<T: SessionStream> Session<T> {
                         let mut has_mailbox_changes = false;
                         let mut has_email_changes = false;
 
-                        for (type_state, _) in state_change.types {
+                        for type_state in state_change.types {
                             match type_state {
                                 DataType::Email | DataType::EmailDelivery => {
                                     has_email_changes = true;
@@ -153,7 +153,7 @@ impl<T: SessionStream> SessionData<T> {
             // List added mailboxes
             for mailbox_name in changes.added {
                 ListItem {
-                    mailbox_name: mailbox_name.to_string(),
+                    mailbox_name,
                     attributes: vec![],
                     tags: vec![],
                 }
@@ -198,11 +198,12 @@ impl<T: SessionStream> SessionData<T> {
 
                 // Obtain changed messages
                 let changelog = self
-                    .jmap
-                    .changes_(
+                    .server
+                    .store()
+                    .changes(
                         mailbox.id.account_id,
-                        Collection::Email,
-                        modseq.map(Query::Since).unwrap_or(Query::All),
+                        SyncCollection::Email,
+                        Query::Since(modseq),
                     )
                     .await
                     .caused_by(trc::location!())?;
@@ -212,10 +213,12 @@ impl<T: SessionStream> SessionData<T> {
                         .changes
                         .into_iter()
                         .filter_map(|change| {
-                            state
-                                .id_to_imap
-                                .get(&((change.unwrap_id() & u32::MAX as u64) as u32))
-                                .map(|id| id.uid)
+                            change.try_unwrap_item_id().and_then(|item_id| {
+                                state
+                                    .id_to_imap
+                                    .get(&((item_id & u32::MAX as u64) as u32))
+                                    .map(|id| id.uid)
+                            })
                         })
                         .collect::<AHashSet<_>>()
                 };
@@ -225,7 +228,7 @@ impl<T: SessionStream> SessionData<T> {
                     return self
                         .fetch(
                             fetch::Arguments {
-                                tag: String::new(),
+                                tag: "".into(),
                                 sequence_set: Sequence::List {
                                     items: changed_ids
                                         .into_iter()

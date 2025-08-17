@@ -1,10 +1,10 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{fetch::FetchItem, Flag, ImapResponse, Sequence};
+use super::{Flag, ImapResponse, Sequence, fetch::FetchItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arguments {
@@ -28,7 +28,7 @@ pub struct Response<'x> {
     pub items: Vec<FetchItem<'x>>,
 }
 
-impl<'x> ImapResponse for Response<'x> {
+impl ImapResponse for Response<'_> {
     fn serialize(self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         for item in &self.items {

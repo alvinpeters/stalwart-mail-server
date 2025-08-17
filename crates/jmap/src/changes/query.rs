@@ -1,19 +1,34 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
 use jmap_proto::method::{
     changes::{self, ChangesRequest},
     query::{self, QueryRequest},
     query_changes::{AddedItem, QueryChangesRequest, QueryChangesResponse},
 };
+use std::future::Future;
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{
+    email::query::EmailQuery, mailbox::query::MailboxQuery, quota::query::QuotaQuery,
+    submission::query::EmailSubmissionQuery,
+};
 
-impl JMAP {
-    pub async fn query_changes(
+use super::get::ChangesLookup;
+
+pub trait QueryChanges: Sync + Send {
+    fn query_changes(
+        &self,
+        request: QueryChangesRequest,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<QueryChangesResponse>> + Send;
+}
+
+impl QueryChanges for Server {
+    async fn query_changes(
         &self,
         request: QueryChangesRequest,
         access_token: &AccessToken,
@@ -35,7 +50,7 @@ impl JMAP {
                         _ => {
                             return Err(trc::JmapEvent::UnknownMethod
                                 .into_err()
-                                .details("Unknown method"))
+                                .details("Unknown method"));
                         }
                     },
                 },
@@ -69,7 +84,7 @@ impl JMAP {
                 || query
                     .sort
                     .as_ref()
-                    .map_or(false, |sort| sort.iter().any(|s| !s.is_immutable()));
+                    .is_some_and(|sort| sort.iter().any(|s| !s.is_immutable()));
             let results = match request.arguments {
                 query::RequestArguments::Email(arguments) => {
                     self.email_query(query.with_arguments(arguments), access_token)

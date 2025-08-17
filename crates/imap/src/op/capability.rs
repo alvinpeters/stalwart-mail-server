@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,23 +8,27 @@ use std::time::Instant;
 
 use crate::core::Session;
 use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
+    Command, StatusResponse,
     protocol::{
-        capability::{Capability, Response},
         ImapResponse,
+        capability::{Capability, Response},
     },
     receiver::Request,
-    Command, StatusResponse,
 };
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_capability(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapCapability)?;
+
         let op_start = Instant::now();
         trc::event!(
             Imap(trc::ImapEvent::Capabilities),
             SpanId = self.session_id,
             Tls = self.is_tls,
-            Strict = !self.jmap.core.imap.allow_plain_auth,
+            Strict = !self.server.core.imap.allow_plain_auth,
             Elapsed = op_start.elapsed()
         );
 
@@ -35,7 +39,7 @@ impl<T: SessionStream> Session<T> {
                     Response {
                         capabilities: Capability::all_capabilities(
                             self.state.is_authenticated(),
-                            self.is_tls,
+                            !self.is_tls && self.instance.acceptor.is_tls(),
                         ),
                     }
                     .serialize(),
@@ -45,6 +49,9 @@ impl<T: SessionStream> Session<T> {
     }
 
     pub async fn handle_id(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapId)?;
+
         let op_start = Instant::now();
         trc::event!(
             Imap(trc::ImapEvent::Id),
@@ -57,9 +64,7 @@ impl<T: SessionStream> Session<T> {
                 .with_tag(request.tag)
                 .serialize(
                     concat!(
-                        "* ID (\"name\" \"Stalwart IMAP\" \"version\" \"",
-                        env!("CARGO_PKG_VERSION"),
-                        "\" \"vendor\" \"Stalwart Labs Ltd.\" ",
+                        "* ID (\"name\" \"Stalwart\" \"version\" \"1.0.0\" \"vendor\" \"Stalwart Labs LLC\" ",
                         "\"support-url\" \"https://stalw.art\")\r\n"
                     )
                     .as_bytes()

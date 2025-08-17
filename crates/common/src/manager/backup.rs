@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -15,17 +15,18 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use jmap_proto::types::{collection::Collection, property::Property};
 use store::{
+    BitmapKey, Deserialize, IndexKey, IterateParams, LogKey, SUBSPACE_BITMAP_ID,
+    SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT, SerializeInfallible, U32_LEN, U64_LEN, ValueKey,
     write::{
-        key::DeserializeBigEndian, AnyKey, BitmapClass, BitmapHash, BlobOp, DirectoryClass,
-        LookupClass, QueueClass, QueueEvent, TagValue, ValueClass,
+        AnyKey, BitmapClass, BitmapHash, BlobOp, DirectoryClass, InMemoryClass, QueueClass,
+        QueueEvent, TagValue, ValueClass, key::DeserializeBigEndian,
     },
-    BitmapKey, Deserialize, IndexKey, IterateParams, LogKey, Serialize, ValueKey,
-    SUBSPACE_BITMAP_ID, SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT, U32_LEN, U64_LEN,
 };
 
 use utils::{
-    codec::leb128::{Leb128Reader, Leb128_},
-    failed, BlobHash, UnwrapFailure, BLOB_HASH_LEN,
+    BLOB_HASH_LEN, BlobHash, UnwrapFailure,
+    codec::leb128::{Leb128_, Leb128Reader},
+    failed,
 };
 
 use crate::Core;
@@ -42,7 +43,7 @@ pub(super) enum Op {
     KeyValue((Vec<u8>, Vec<u8>)),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) enum Family {
     Property = 0,
     FtsIndex = 1,
@@ -61,30 +62,61 @@ pub(super) enum Family {
 
 type TaskHandle = (tokio::task::JoinHandle<()>, std::thread::JoinHandle<()>);
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BackupParams {
+    dest: PathBuf,
+    families: AHashSet<Family>,
+}
+
 impl Core {
-    pub async fn backup(&self, dest: PathBuf) {
-        if !dest.exists() {
-            std::fs::create_dir_all(&dest).failed("Failed to create backup directory");
-        } else if !dest.is_dir() {
-            eprintln!("Backup destination {dest:?} is not a directory.");
+    pub async fn backup(&self, params: BackupParams) {
+        if !params.dest.exists() {
+            std::fs::create_dir_all(&params.dest).failed("Failed to create backup directory");
+        } else if !params.dest.is_dir() {
+            eprintln!("Backup destination {:?} is not a directory.", params.dest);
             std::process::exit(1);
         }
 
         let mut sync_handles = Vec::new();
 
         for (async_handle, sync_handle) in [
-            self.backup_properties(&dest),
-            self.backup_fts_index(&dest),
-            self.backup_acl(&dest),
-            self.backup_blob(&dest),
-            self.backup_config(&dest),
-            self.backup_lookup(&dest),
-            self.backup_directory(&dest),
-            self.backup_queue(&dest),
-            self.backup_index(&dest),
-            self.backup_bitmaps(&dest),
-            self.backup_logs(&dest),
-        ] {
+            params
+                .has_family(Family::Property)
+                .then(|| self.backup_properties(&params.dest)),
+            params
+                .has_family(Family::FtsIndex)
+                .then(|| self.backup_fts_index(&params.dest)),
+            params
+                .has_family(Family::Acl)
+                .then(|| self.backup_acl(&params.dest)),
+            params
+                .has_family(Family::Blob)
+                .then(|| self.backup_blob(&params.dest)),
+            params
+                .has_family(Family::Config)
+                .then(|| self.backup_config(&params.dest)),
+            params
+                .has_family(Family::LookupValue)
+                .then(|| self.backup_lookup(&params.dest)),
+            params
+                .has_family(Family::Directory)
+                .then(|| self.backup_directory(&params.dest)),
+            params
+                .has_family(Family::Queue)
+                .then(|| self.backup_queue(&params.dest)),
+            params
+                .has_family(Family::Index)
+                .then(|| self.backup_index(&params.dest)),
+            params
+                .has_family(Family::Bitmap)
+                .then(|| self.backup_bitmaps(&params.dest)),
+            params
+                .has_family(Family::Log)
+                .then(|| self.backup_logs(&params.dest)),
+        ]
+        .into_iter()
+        .flatten()
+        {
             async_handle.await.failed("Task failed");
             sync_handles.push(sync_handle);
         }
@@ -434,8 +466,8 @@ impl Core {
                                 .failed("Failed to send key value");
                         } else {
                             eprintln!(
-                            "Warning: blob hash {hash:?} does not exist in blob store. Skipping."
-                        );
+                                "Warning: blob hash {hash:?} does not exist in blob store. Skipping."
+                            );
                         }
                     }
                 }
@@ -507,13 +539,13 @@ impl Core {
                                 account_id: 0,
                                 collection: 0,
                                 document_id: 0,
-                                class: ValueClass::Lookup(LookupClass::Key(vec![0])),
+                                class: ValueClass::InMemory(InMemoryClass::Key(vec![0])),
                             },
                             ValueKey {
                                 account_id: u32::MAX,
                                 collection: u8::MAX,
                                 document_id: u32::MAX,
-                                class: ValueClass::Lookup(LookupClass::Key(vec![
+                                class: ValueClass::InMemory(InMemoryClass::Key(vec![
                                     u8::MAX,
                                     u8::MAX,
                                     u8::MAX,
@@ -547,13 +579,13 @@ impl Core {
                                 account_id: 0,
                                 collection: 0,
                                 document_id: 0,
-                                class: ValueClass::Lookup(LookupClass::Counter(vec![0])),
+                                class: ValueClass::InMemory(InMemoryClass::Counter(vec![0])),
                             },
                             ValueKey {
                                 account_id: u32::MAX,
                                 collection: u8::MAX,
                                 document_id: u32::MAX,
-                                class: ValueClass::Lookup(LookupClass::Counter(vec![
+                                class: ValueClass::InMemory(InMemoryClass::Counter(vec![
                                     u8::MAX,
                                     u8::MAX,
                                     u8::MAX,
@@ -580,9 +612,9 @@ impl Core {
 
                 for key in counters {
                     let value = store
-                        .get_counter(ValueKey::from(ValueClass::Lookup(LookupClass::Counter(
-                            key.clone(),
-                        ))))
+                        .get_counter(ValueKey::from(ValueClass::InMemory(
+                            InMemoryClass::Counter(key.clone()),
+                        )))
                         .await
                         .failed("Failed to get counter");
 
@@ -719,6 +751,7 @@ impl Core {
                                 class: ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
                                     due: 0,
                                     queue_id: 0,
+                                    queue_name: [0; 8],
                                 })),
                             },
                             ValueKey {
@@ -728,6 +761,7 @@ impl Core {
                                 class: ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
                                     due: u64::MAX,
                                     queue_id: u64::MAX,
+                                    queue_name: [u8::MAX; 8],
                                 })),
                             },
                         ),
@@ -832,7 +866,7 @@ impl Core {
                     .send(Op::Family(Family::Bitmap))
                     .failed("Failed to send family");
 
-                let mut bitmaps: AHashMap<(u32, u8), AHashSet<BitmapClass<u32>>> = AHashMap::new();
+                let mut bitmaps: AHashMap<(u32, u8), AHashSet<BitmapClass>> = AHashMap::new();
 
                 for subspace in [
                     SUBSPACE_BITMAP_ID,
@@ -1130,6 +1164,59 @@ impl DeserializeBytes for &[u8] {
         self.read_leb128::<U>()
             .map(|(v, _)| v)
             .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))
+    }
+}
+
+impl BackupParams {
+    pub fn new(dest: PathBuf) -> Self {
+        let mut params = Self {
+            dest,
+            families: AHashSet::new(),
+        };
+
+        if let Ok(families) = std::env::var("EXPORT_TYPES") {
+            params.parse_families(&families);
+        }
+
+        params
+    }
+
+    fn parse_families(&mut self, families: &str) {
+        for family in families.split(',') {
+            let family = family.trim();
+            match Family::parse(family) {
+                Ok(family) => {
+                    self.families.insert(family);
+                }
+                Err(err) => {
+                    eprintln!("Backup failed: {err}.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    fn has_family(&self, family: Family) -> bool {
+        self.families.is_empty() || self.families.contains(&family)
+    }
+}
+
+impl Family {
+    pub fn parse(family: &str) -> Result<Self, String> {
+        match family {
+            "property" => Ok(Family::Property),
+            "fts_index" => Ok(Family::FtsIndex),
+            "acl" => Ok(Family::Acl),
+            "blob" => Ok(Family::Blob),
+            "config" => Ok(Family::Config),
+            "lookup" => Ok(Family::LookupValue),
+            "directory" => Ok(Family::Directory),
+            "queue" => Ok(Family::Queue),
+            "index" => Ok(Family::Index),
+            "bitmap" => Ok(Family::Bitmap),
+            "log" => Ok(Family::Log),
+            _ => Err(format!("Unknown family {}", family)),
+        }
     }
 }
 

@@ -1,25 +1,27 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{borrow::Cow, cmp::Ordering, fmt::Display};
+use std::{cmp::Ordering, fmt::Display};
 
+use compact_str::{CompactString, ToCompactString, format_compact};
 use hyper::StatusCode;
 use trc::EvalEvent;
 
-use crate::Core;
+use crate::Server;
 
 use super::{
-    functions::{ResolveVariable, FUNCTIONS},
+    BinaryOperator, Constant, Expression, ExpressionItem, Setting, StringCow, UnaryOperator,
+    Variable,
+    functions::{FUNCTIONS, ResolveVariable},
     if_block::IfBlock,
-    BinaryOperator, Constant, Expression, ExpressionItem, UnaryOperator, Variable,
 };
 
-impl Core {
+impl Server {
     pub async fn eval_if<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
-        &self,
+        &'x self,
         if_block: &'x IfBlock,
         resolver: &'x V,
         session_id: u64,
@@ -35,7 +37,16 @@ impl Core {
             return None;
         }
 
-        match if_block.eval(resolver, self, session_id).await {
+        match (EvalContext {
+            resolver,
+            core: self,
+            expr: if_block,
+            captures: Vec::new(),
+            session_id,
+        })
+        .eval()
+        .await
+        {
             Ok(result) => {
                 trc::event!(
                     Eval(EvalEvent::Result),
@@ -72,7 +83,7 @@ impl Core {
     }
 
     pub async fn eval_expr<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
-        &self,
+        &'x self,
         expr: &'x Expression,
         resolver: &'x V,
         expr_id: &str,
@@ -82,12 +93,21 @@ impl Core {
             return None;
         }
 
-        match expr.eval(resolver, self, &mut Vec::new(), session_id).await {
+        match (EvalContext {
+            resolver,
+            core: self,
+            expr,
+            captures: &mut Vec::new(),
+            session_id,
+        })
+        .eval()
+        .await
+        {
             Ok(result) => {
                 trc::event!(
                     Eval(EvalEvent::Result),
                     SpanId = session_id,
-                    Id = expr_id.to_string(),
+                    Id = expr_id.to_compact_string(),
                     Result = format!("{result:?}"),
                 );
 
@@ -97,7 +117,7 @@ impl Core {
                         trc::event!(
                             Eval(EvalEvent::Error),
                             SpanId = session_id,
-                            Id = expr_id.to_string(),
+                            Id = expr_id.to_compact_string(),
                             Details = "Failed to convert result",
                         );
 
@@ -109,7 +129,7 @@ impl Core {
                 trc::event!(
                     Eval(EvalEvent::Error),
                     SpanId = session_id,
-                    Id = expr_id.to_string(),
+                    Id = expr_id.to_compact_string(),
                     CausedBy = err,
                 );
 
@@ -119,63 +139,97 @@ impl Core {
     }
 }
 
-impl IfBlock {
-    pub async fn eval<'x, V: ResolveVariable>(
-        &'x self,
-        resolver: &'x V,
-        core: &Core,
-        session_id: u64,
-    ) -> trc::Result<Variable<'x>> {
-        let mut captures = Vec::new();
+struct EvalContext<'x, V: ResolveVariable, T, C> {
+    resolver: &'x V,
+    core: &'x Server,
+    expr: &'x T,
+    captures: C,
+    session_id: u64,
+}
 
-        for if_then in &self.if_then {
-            if if_then
-                .expr
-                .eval(resolver, core, &mut captures, session_id)
-                .await?
-                .to_bool()
+impl<'x, V: ResolveVariable> EvalContext<'x, V, IfBlock, Vec<CompactString>> {
+    async fn eval(&mut self) -> trc::Result<Variable<'x>> {
+        for if_then in &self.expr.if_then {
+            if (EvalContext {
+                resolver: self.resolver,
+                core: self.core,
+                expr: &if_then.expr,
+                captures: &mut self.captures,
+                session_id: self.session_id,
+            })
+            .eval()
+            .await?
+            .to_bool()
             {
-                return if_then
-                    .then
-                    .eval(resolver, core, &mut captures, session_id)
-                    .await;
+                return (EvalContext {
+                    resolver: self.resolver,
+                    core: self.core,
+                    expr: &if_then.then,
+                    captures: &mut self.captures,
+                    session_id: self.session_id,
+                })
+                .eval()
+                .await;
             }
         }
 
-        self.default
-            .eval(resolver, core, &mut captures, session_id)
-            .await
+        (EvalContext {
+            resolver: self.resolver,
+            core: self.core,
+            expr: &self.expr.default,
+            captures: &mut self.captures,
+            session_id: self.session_id,
+        })
+        .eval()
+        .await
     }
 }
 
-impl Expression {
-    async fn eval<'x, 'y, V: ResolveVariable>(
-        &'x self,
-        resolver: &'x V,
-        core: &Core,
-        captures: &'y mut Vec<String>,
-        session_id: u64,
-    ) -> trc::Result<Variable<'x>> {
+impl<'x, V: ResolveVariable> EvalContext<'x, V, Expression, &mut Vec<CompactString>> {
+    async fn eval(&mut self) -> trc::Result<Variable<'x>> {
         let mut stack = Vec::new();
-        let mut exprs = self.items.iter();
+        let mut exprs = self.expr.items.iter();
 
         while let Some(expr) = exprs.next() {
             match expr {
                 ExpressionItem::Variable(v) => {
-                    stack.push(resolver.resolve_variable(*v));
+                    stack.push(self.resolver.resolve_variable(*v));
+                }
+                ExpressionItem::Global(v) => {
+                    stack.push(self.resolver.resolve_global(v));
                 }
                 ExpressionItem::Constant(val) => {
                     stack.push(Variable::from(val));
                 }
                 ExpressionItem::Capture(v) => {
-                    stack.push(Variable::String(Cow::Owned(
-                        captures
+                    stack.push(Variable::String(StringCow::Owned(
+                        self.captures
                             .get(*v as usize)
                             .map(|v| v.as_str())
                             .unwrap_or_default()
-                            .to_string(),
+                            .to_compact_string(),
                     )));
                 }
+                ExpressionItem::Setting(setting) => match setting {
+                    Setting::Hostname => {
+                        stack.push(self.core.core.network.server_name.as_str().into())
+                    }
+                    Setting::ReportDomain => {
+                        stack.push(self.core.core.network.report_domain.as_str().into())
+                    }
+                    Setting::NodeId => stack.push(self.core.core.network.node_id.into()),
+                    Setting::Other(key) => stack.push(
+                        self.core
+                            .core
+                            .storage
+                            .config
+                            .get(key)
+                            .await?
+                            .unwrap_or_default()
+                            .to_compact_string()
+                            .into(),
+                    ),
+                },
                 ExpressionItem::UnaryOperator(op) => {
                     let value = stack.pop().unwrap_or_default();
                     stack.push(match op {
@@ -213,14 +267,18 @@ impl Expression {
                     let result = if let Some((_, fnc, _)) = FUNCTIONS.get(*id as usize) {
                         (fnc)(arguments)
                     } else {
-                        core.eval_fnc(*id - FUNCTIONS.len() as u32, arguments, session_id)
-                            .await?
+                        Box::pin(self.core.eval_fnc(
+                            *id - FUNCTIONS.len() as u32,
+                            arguments,
+                            self.session_id,
+                        ))
+                        .await?
                     };
 
                     stack.push(result);
                 }
                 ExpressionItem::JmpIf { val, pos } => {
-                    if stack.last().map_or(false, |v| v.to_bool()) == *val {
+                    if stack.last().is_some_and(|v| v.to_bool()) == *val {
                         for _ in 0..*pos {
                             exprs.next();
                         }
@@ -244,23 +302,26 @@ impl Expression {
                     stack.push(Variable::Array(items));
                 }
                 ExpressionItem::Regex(regex) => {
-                    captures.clear();
+                    self.captures.clear();
                     let value = stack.pop().unwrap_or_default().into_string();
 
                     if let Some(captures_) = regex.captures(value.as_ref()) {
                         for capture in captures_.iter() {
-                            captures.push(capture.map_or("", |m| m.as_str()).to_string());
+                            self.captures
+                                .push(capture.map_or("", |m| m.as_str()).to_compact_string());
                         }
                     }
 
-                    stack.push(Variable::Integer(!captures.is_empty() as i64));
+                    stack.push(Variable::Integer(!self.captures.is_empty() as i64));
                 }
             }
         }
 
         Ok(stack.pop().unwrap_or_default())
     }
+}
 
+impl Expression {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -288,14 +349,14 @@ impl<'x> Variable<'x> {
             }
             (Variable::String(a), b) => {
                 if !a.is_empty() {
-                    Variable::String(format!("{}{}", a, b).into())
+                    Variable::String(StringCow::Owned(format_compact!("{}{}", a, b)))
                 } else {
                     b
                 }
             }
             (a, Variable::String(b)) => {
                 if !b.is_empty() {
-                    Variable::String(format!("{}{}", a, b).into())
+                    Variable::String(StringCow::Owned(format_compact!("{}{}", a, b)))
                 } else {
                     a
                 }
@@ -395,9 +456,9 @@ impl<'x> Variable<'x> {
     pub fn parse_number(&self) -> Variable<'static> {
         match self {
             Variable::String(s) if !s.is_empty() => {
-                if let Ok(n) = s.parse::<i64>() {
+                if let Ok(n) = s.as_str().parse::<i64>() {
                     Variable::Integer(n)
-                } else if let Ok(n) = s.parse::<f64>() {
+                } else if let Ok(n) = s.as_str().parse::<f64>() {
                     Variable::Float(n)
                 } else {
                     Variable::Integer(0)
@@ -421,7 +482,7 @@ impl<'x> Variable<'x> {
 
     pub fn to_ref<'y: 'x>(&'y self) -> Variable<'x> {
         match self {
-            Variable::String(s) => Variable::String(Cow::Borrowed(s.as_ref())),
+            Variable::String(s) => Variable::String(StringCow::Borrowed(s.as_str())),
             Variable::Integer(n) => Variable::Integer(*n),
             Variable::Float(n) => Variable::Float(*n),
             Variable::Array(l) => Variable::Array(l.iter().map(|v| v.to_ref()).collect::<Vec<_>>()),
@@ -437,48 +498,48 @@ impl<'x> Variable<'x> {
         }
     }
 
-    pub fn to_string(&self) -> Cow<'_, str> {
+    pub fn to_string(&self) -> StringCow {
         match self {
-            Variable::String(s) => Cow::Borrowed(s.as_ref()),
-            Variable::Integer(n) => Cow::Owned(n.to_string()),
-            Variable::Float(n) => Cow::Owned(n.to_string()),
+            Variable::String(s) => StringCow::Borrowed(s.as_str()),
+            Variable::Integer(n) => StringCow::Owned(n.to_compact_string()),
+            Variable::Float(n) => StringCow::Owned(n.to_compact_string()),
             Variable::Array(l) => {
-                let mut result = String::with_capacity(self.len() * 10);
+                let mut result = CompactString::with_capacity(self.len() * 10);
                 for item in l {
                     if !result.is_empty() {
                         result.push_str("\r\n");
                     }
                     match item {
-                        Variable::String(v) => result.push_str(v),
-                        Variable::Integer(v) => result.push_str(&v.to_string()),
-                        Variable::Float(v) => result.push_str(&v.to_string()),
+                        Variable::String(v) => result.push_str(v.as_str()),
+                        Variable::Integer(v) => result.push_str(&v.to_compact_string()),
+                        Variable::Float(v) => result.push_str(&v.to_compact_string()),
                         Variable::Array(_) => {}
                     }
                 }
-                Cow::Owned(result)
+                StringCow::Owned(result)
             }
         }
     }
 
-    pub fn into_string(self) -> Cow<'x, str> {
+    pub fn into_string(self) -> StringCow<'x> {
         match self {
             Variable::String(s) => s,
-            Variable::Integer(n) => Cow::Owned(n.to_string()),
-            Variable::Float(n) => Cow::Owned(n.to_string()),
+            Variable::Integer(n) => StringCow::Owned(n.to_compact_string()),
+            Variable::Float(n) => StringCow::Owned(n.to_compact_string()),
             Variable::Array(l) => {
-                let mut result = String::with_capacity(l.len() * 10);
+                let mut result = CompactString::with_capacity(l.len() * 10);
                 for item in l {
                     if !result.is_empty() {
                         result.push_str("\r\n");
                     }
                     match item {
                         Variable::String(v) => result.push_str(v.as_ref()),
-                        Variable::Integer(v) => result.push_str(&v.to_string()),
-                        Variable::Float(v) => result.push_str(&v.to_string()),
+                        Variable::Integer(v) => result.push_str(&v.to_compact_string()),
+                        Variable::Float(v) => result.push_str(&v.to_compact_string()),
                         Variable::Array(_) => {}
                     }
                 }
-                Cow::Owned(result)
+                StringCow::Owned(result)
             }
         }
     }
@@ -487,7 +548,7 @@ impl<'x> Variable<'x> {
         match self {
             Variable::Integer(n) => Some(*n),
             Variable::Float(n) => Some(*n as i64),
-            Variable::String(s) if !s.is_empty() => s.parse::<i64>().ok(),
+            Variable::String(s) if !s.is_empty() => s.as_str().parse::<i64>().ok(),
             _ => None,
         }
     }
@@ -496,7 +557,7 @@ impl<'x> Variable<'x> {
         match self {
             Variable::Integer(n) => Some(*n as usize),
             Variable::Float(n) => Some(*n as usize),
-            Variable::String(s) if !s.is_empty() => s.parse::<usize>().ok(),
+            Variable::String(s) if !s.is_empty() => s.as_str().parse::<usize>().ok(),
             _ => None,
         }
     }
@@ -541,7 +602,7 @@ impl<'x> Variable<'x> {
 
     pub fn into_owned(self) -> Variable<'static> {
         match self {
-            Variable::String(s) => Variable::String(Cow::Owned(s.into_owned())),
+            Variable::String(s) => Variable::String(StringCow::Owned(s.into_owned())),
             Variable::Integer(n) => Variable::Integer(n),
             Variable::Float(n) => Variable::Float(n),
             Variable::Array(l) => Variable::Array(l.into_iter().map(|v| v.into_owned()).collect()),
@@ -557,7 +618,7 @@ impl PartialEq for Variable<'_> {
             (Self::Integer(a), Self::Float(b)) | (Self::Float(b), Self::Integer(a)) => {
                 *a as f64 == *b
             }
-            (Self::String(a), Self::String(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a.as_str() == b.as_str(),
             (Self::String(_), Self::Integer(_) | Self::Float(_)) => &self.parse_number() == other,
             (Self::Integer(_) | Self::Float(_), Self::String(_)) => self == &other.parse_number(),
             (Self::Array(a), Self::Array(b)) => a == b,
@@ -576,7 +637,7 @@ impl PartialOrd for Variable<'_> {
             (Self::Float(a), Self::Float(b)) => a.partial_cmp(b),
             (Self::Integer(a), Self::Float(b)) => (*a as f64).partial_cmp(b),
             (Self::Float(a), Self::Integer(b)) => a.partial_cmp(&(*b as f64)),
-            (Self::String(a), Self::String(b)) => a.partial_cmp(b),
+            (Self::String(a), Self::String(b)) => a.as_str().partial_cmp(b.as_str()),
             (Self::String(_), Self::Integer(_) | Self::Float(_)) => {
                 self.parse_number().partial_cmp(other)
             }
@@ -620,7 +681,22 @@ impl<'x> From<&'x Constant> for Variable<'x> {
         match value {
             Constant::Integer(i) => Variable::Integer(*i),
             Constant::Float(f) => Variable::Float(*f),
-            Constant::String(s) => Variable::String(s.as_str().into()),
+            Constant::String(s) => Variable::String(StringCow::Borrowed(s.as_str())),
+        }
+    }
+}
+
+impl<'x> TryFrom<Variable<'x>> for CompactString {
+    type Error = ();
+
+    fn try_from(value: Variable<'x>) -> Result<Self, Self::Error> {
+        if let Variable::String(s) = value {
+            Ok(match s {
+                StringCow::Borrowed(v) => v.into(),
+                StringCow::Owned(v) => v,
+            })
+        } else {
+            Err(())
         }
     }
 }
@@ -630,7 +706,10 @@ impl<'x> TryFrom<Variable<'x>> for String {
 
     fn try_from(value: Variable<'x>) -> Result<Self, Self::Error> {
         if let Variable::String(s) = value {
-            Ok(s.into_owned())
+            Ok(match s {
+                StringCow::Borrowed(v) => v.to_string(),
+                StringCow::Owned(v) => v.into_string(),
+            })
         } else {
             Err(())
         }

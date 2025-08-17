@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,14 +8,15 @@ use std::borrow::Cow;
 use std::iter::Peekable;
 use std::vec::IntoIter;
 
-use mail_parser::decoders::charsets::map::charset_decoder;
+use compact_str::ToCompactString;
 use mail_parser::decoders::charsets::DecoderFnc;
+use mail_parser::decoders::charsets::map::charset_decoder;
 
+use crate::Command;
 use crate::protocol::search::{self, Filter};
 use crate::protocol::search::{ModSeqEntry, ResultOption};
 use crate::protocol::{Flag, ProtocolVersion};
-use crate::receiver::{bad, Request, Token};
-use crate::Command;
+use crate::receiver::{Request, Token, bad};
 
 use super::{parse_date, parse_number, parse_sequence_set};
 
@@ -37,14 +38,14 @@ impl Request<Command> {
                     tokens.next();
                     is_esearch = true;
                     result_options = parse_result_options(&mut tokens)
-                        .map_err(|v| bad(self.tag.to_string(), v))?;
+                        .map_err(|v| bad(self.tag.to_compact_string(), v))?;
                 }
                 Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"charset") => {
                     tokens.next();
                     decoder = charset_decoder(
                         &tokens
                             .next()
-                            .ok_or_else(|| bad(self.tag.to_string(), "Missing charset."))?
+                            .ok_or_else(|| bad(self.tag.to_compact_string(), "Missing charset."))?
                             .unwrap_bytes(),
                     );
                 }
@@ -52,11 +53,14 @@ impl Request<Command> {
             }
         }
 
-        let filter =
-            parse_filters(&mut tokens, decoder).map_err(|v| bad(self.tag.to_string(), v))?;
+        let filter = parse_filters(&mut tokens, decoder)
+            .map_err(|v| bad(self.tag.to_compact_string(), v))?;
 
         match filter.len() {
-            0 => Err(bad(self.tag.to_string(), "No filters found in command.")),
+            0 => Err(bad(
+                self.tag.to_compact_string(),
+                "No filters found in command.",
+            )),
             _ => Ok(search::Arguments {
                 tag: self.tag,
                 result_options,
@@ -74,7 +78,7 @@ pub fn parse_result_options(
     let mut result_options = Vec::new();
     if tokens
         .next()
-        .map_or(true, |token| !token.is_parenthesis_open())
+        .is_none_or(|token| !token.is_parenthesis_open())
     {
         return Err(Cow::from("Invalid result option, expected parenthesis."));
     }
@@ -105,236 +109,344 @@ pub fn parse_filters(
         let mut found_parenthesis = false;
         match token {
             Token::Argument(value) => {
-                if value.eq_ignore_ascii_case(b"ALL") {
-                    filters.push(Filter::All);
-                } else if value.eq_ignore_ascii_case(b"ANSWERED") {
-                    filters.push(Filter::Answered);
-                } else if value.eq_ignore_ascii_case(b"BCC") {
-                    filters.push(Filter::Bcc(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"BEFORE") {
-                    filters.push(Filter::Before(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"BODY") {
-                    filters.push(Filter::Body(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"CC") {
-                    filters.push(Filter::Cc(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"DELETED") {
-                    filters.push(Filter::Deleted);
-                } else if value.eq_ignore_ascii_case(b"DRAFT") {
-                    filters.push(Filter::Draft);
-                } else if value.eq_ignore_ascii_case(b"FLAGGED") {
-                    filters.push(Filter::Flagged);
-                } else if value.eq_ignore_ascii_case(b"FROM") {
-                    filters.push(Filter::From(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"HEADER") {
-                    filters.push(Filter::Header(
-                        decode_argument(tokens, decoder)?,
-                        decode_argument(tokens, decoder)?,
-                    ));
-                } else if value.eq_ignore_ascii_case(b"KEYWORD") {
-                    filters.push(Filter::Keyword(Flag::parse_imap(
-                        tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected keyword"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"LARGER") {
-                    filters.push(Filter::Larger(parse_number::<u32>(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected integer"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"ON") {
-                    filters.push(Filter::On(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SEEN") {
-                    filters.push(Filter::Seen);
-                } else if value.eq_ignore_ascii_case(b"SENTBEFORE") {
-                    filters.push(Filter::SentBefore(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SENTON") {
-                    filters.push(Filter::SentOn(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SENTSINCE") {
-                    filters.push(Filter::SentSince(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SINCE") {
-                    filters.push(Filter::Since(parse_date(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected date"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SMALLER") {
-                    filters.push(Filter::Smaller(parse_number::<u32>(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected integer"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"SUBJECT") {
-                    filters.push(Filter::Subject(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"TEXT") {
-                    filters.push(Filter::Text(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"TO") {
-                    filters.push(Filter::To(decode_argument(tokens, decoder)?));
-                } else if value.eq_ignore_ascii_case(b"UID") {
-                    filters.push(Filter::Sequence(
-                        parse_sequence_set(
+                hashify::fnc_map_ignore_case!(value.as_slice(),
+                    "ALL" => {
+                        filters.push(Filter::All);
+
+                    },
+                    "ANSWERED" => {
+                        filters.push(Filter::Answered);
+
+                    },
+                    "BCC" => {
+                        filters.push(Filter::Bcc(decode_argument(tokens, decoder)?));
+
+                    },
+                    "BEFORE" => {
+                        filters.push(Filter::Before(parse_date(
                             &tokens
                                 .next()
-                                .ok_or_else(|| Cow::from("Missing sequence set."))?
+                                .ok_or_else(|| Cow::from("Expected date"))?
                                 .unwrap_bytes(),
-                        )?,
-                        true,
-                    ));
-                } else if value.eq_ignore_ascii_case(b"UNANSWERED") {
-                    filters.push(Filter::Unanswered);
-                } else if value.eq_ignore_ascii_case(b"UNDELETED") {
-                    filters.push(Filter::Undeleted);
-                } else if value.eq_ignore_ascii_case(b"UNDRAFT") {
-                    filters.push(Filter::Undraft);
-                } else if value.eq_ignore_ascii_case(b"UNFLAGGED") {
-                    filters.push(Filter::Unflagged);
-                } else if value.eq_ignore_ascii_case(b"UNKEYWORD") {
-                    filters.push(Filter::Unkeyword(Flag::parse_imap(
-                        tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected keyword"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"UNSEEN") {
-                    filters.push(Filter::Unseen);
-                } else if value.eq_ignore_ascii_case(b"OLDER") {
-                    filters.push(Filter::Older(parse_number::<u32>(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected integer"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"YOUNGER") {
-                    filters.push(Filter::Younger(parse_number::<u32>(
-                        &tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected integer"))?
-                            .unwrap_bytes(),
-                    )?));
-                } else if value.eq_ignore_ascii_case(b"OLD") {
-                    filters.push(Filter::Old);
-                } else if value.eq_ignore_ascii_case(b"NEW") {
-                    filters.push(Filter::New);
-                } else if value.eq_ignore_ascii_case(b"RECENT") {
-                    filters.push(Filter::Recent);
-                } else if value.eq_ignore_ascii_case(b"MODSEQ") {
-                    let param = tokens
-                        .next()
-                        .ok_or_else(|| Cow::from("Missing MODSEQ parameters."))?
-                        .unwrap_bytes();
-                    if param.is_empty() || param.iter().any(|ch| !ch.is_ascii_digit()) {
-                        if param.len() <= 7 || !param.starts_with(b"/flags/") {
-                            return Err(format!(
-                                "Unsupported MODSEQ parameter '{}'.",
-                                String::from_utf8_lossy(&param)
-                            )
-                            .into());
-                        }
-                        let flag = Flag::parse_imap((param[7..]).to_vec())?;
-                        let mod_seq_entry = match tokens.next() {
-                            Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"all") => {
-                                ModSeqEntry::All(flag)
-                            }
-                            Some(Token::Argument(value))
-                                if value.eq_ignore_ascii_case(b"shared") =>
-                            {
-                                ModSeqEntry::Shared(flag)
-                            }
-                            Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"priv") => {
-                                ModSeqEntry::Private(flag)
-                            }
-                            Some(token) => {
-                                return Err(
-                                    format!("Unsupported MODSEQ parameter '{}'.", token).into()
-                                );
-                            }
-                            None => {
-                                return Err("Missing MODSEQ entry-type-req parameter.".into());
-                            }
-                        };
-                        filters.push(Filter::ModSeq((
-                            parse_number::<u64>(
+                        )?));
+
+                    },
+                    "BODY" => {
+                        filters.push(Filter::Body(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "CC" => {
+                        filters.push(Filter::Cc(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "DELETED" => {
+                        filters.push(Filter::Deleted);
+
+
+                    },
+                    "DRAFT" => {
+                        filters.push(Filter::Draft);
+
+
+                    },
+                    "FLAGGED" => {
+                        filters.push(Filter::Flagged);
+
+
+                    },
+                    "FROM" => {
+                        filters.push(Filter::From(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "HEADER" => {
+                        filters.push(Filter::Header(
+                            decode_argument(tokens, decoder)?,
+                            decode_argument(tokens, decoder)?,
+                        ));
+
+
+                    },
+                    "KEYWORD" => {
+                        filters.push(Filter::Keyword(Flag::parse_imap(
+                            tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected keyword"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "LARGER" => {
+                        filters.push(Filter::Larger(parse_number::<u32>(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected integer"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "ON" => {
+                        filters.push(Filter::On(parse_date(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected date"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SEEN" => {
+                        filters.push(Filter::Seen);
+
+
+                    },
+                    "SENTBEFORE" => {
+                        filters.push(Filter::SentBefore(parse_date(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected date"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SENTON" => {
+                        filters.push(Filter::SentOn(parse_date(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected date"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SENTSINCE" => {
+                        filters.push(Filter::SentSince(parse_date(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected date"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SINCE" => {
+                        filters.push(Filter::Since(parse_date(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected date"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SMALLER" => {
+                        filters.push(Filter::Smaller(parse_number::<u32>(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected integer"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "SUBJECT" => {
+                        filters.push(Filter::Subject(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "TEXT" => {
+                        filters.push(Filter::Text(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "TO" => {
+                        filters.push(Filter::To(decode_argument(tokens, decoder)?));
+
+
+                    },
+                    "UID" => {
+                        filters.push(Filter::Sequence(
+                            parse_sequence_set(
                                 &tokens
                                     .next()
-                                    .ok_or_else(|| {
-                                        Cow::from("Missing MODSEQ mod-sequence-valzer parameter.")
-                                    })?
+                                    .ok_or_else(|| Cow::from("Missing sequence set."))?
                                     .unwrap_bytes(),
                             )?,
-                            mod_seq_entry,
-                        )));
-                    } else {
-                        filters.push(Filter::ModSeq((
-                            parse_number::<u64>(&param)?,
-                            ModSeqEntry::None,
-                        )));
-                    }
-                } else if value.eq_ignore_ascii_case(b"EMAILID") {
-                    filters.push(Filter::EmailId(
-                        tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected an EMAILID value."))?
-                            .unwrap_string()?,
-                    ));
-                } else if value.eq_ignore_ascii_case(b"THREADID") {
-                    filters.push(Filter::ThreadId(
-                        tokens
-                            .next()
-                            .ok_or_else(|| Cow::from("Expected an THREADID value."))?
-                            .unwrap_string()?,
-                    ));
-                } else if value.eq_ignore_ascii_case(b"OR") {
-                    if filters_stack.len() > 10 {
-                        return Err(Cow::from("Too many nested filters"));
-                    }
+                            true,
+                        ));
 
-                    filters_stack.push((filters, operator, filters_len));
-                    filters_len = 0;
-                    filters = Vec::with_capacity(2);
-                    operator = Filter::Or;
-                    continue;
-                } else if value.eq_ignore_ascii_case(b"NOT") {
-                    if filters_stack.len() > 10 {
-                        return Err(Cow::from("Too many nested filters"));
-                    }
 
-                    filters_stack.push((filters, operator, filters_len));
-                    filters_len = 0;
-                    filters = Vec::with_capacity(1);
-                    operator = Filter::Not;
-                    continue;
-                } else {
-                    filters.push(Filter::Sequence(parse_sequence_set(&value)?, false));
-                }
+                    },
+                    "UNANSWERED" => {
+                        filters.push(Filter::Unanswered);
+
+
+                    },
+                    "UNDELETED" => {
+                        filters.push(Filter::Undeleted);
+
+
+                    },
+                    "UNDRAFT" => {
+                        filters.push(Filter::Undraft);
+
+
+                    },
+                    "UNFLAGGED" => {
+                        filters.push(Filter::Unflagged);
+
+
+                    },
+                    "UNKEYWORD" => {
+                        filters.push(Filter::Unkeyword(Flag::parse_imap(
+                            tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected keyword"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "UNSEEN" => {
+                        filters.push(Filter::Unseen);
+
+
+                    },
+                    "OLDER" => {
+                        filters.push(Filter::Older(parse_number::<u32>(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected integer"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "YOUNGER" => {
+                        filters.push(Filter::Younger(parse_number::<u32>(
+                            &tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected integer"))?
+                                .unwrap_bytes(),
+                        )?));
+
+
+                    },
+                    "OLD" => {
+                        filters.push(Filter::Old);
+
+                    },
+                    "NEW" => {
+                        filters.push(Filter::New);
+
+                    },
+                    "RECENT" => {
+                        filters.push(Filter::Recent);
+
+                    },
+                    "MODSEQ" => {
+                        let param = tokens
+                            .next()
+                            .ok_or_else(|| Cow::from("Missing MODSEQ parameters."))?
+                            .unwrap_bytes();
+                        if param.is_empty() || param.iter().any(|ch| !ch.is_ascii_digit()) {
+                            if param.len() <= 7 || !param.starts_with(b"/flags/") {
+                                return Err(format!(
+                                    "Unsupported MODSEQ parameter '{}'.",
+                                    String::from_utf8_lossy(&param)
+                                )
+                                .into());
+                            }
+                            let flag = Flag::parse_imap((param[7..]).to_vec())?;
+                            let mod_seq_entry = match tokens.next() {
+                                Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"all") => {
+                                    ModSeqEntry::All(flag)
+                                }
+                                Some(Token::Argument(value))
+                                    if value.eq_ignore_ascii_case(b"shared") =>
+                                {
+                                    ModSeqEntry::Shared(flag)
+                                }
+                                Some(Token::Argument(value)) if value.eq_ignore_ascii_case(b"priv") => {
+                                    ModSeqEntry::Private(flag)
+                                }
+                                Some(token) => {
+                                    return Err(
+                                        format!("Unsupported MODSEQ parameter '{}'.", token).into()
+                                    );
+                                }
+                                None => {
+                                    return Err("Missing MODSEQ entry-type-req parameter.".into());
+                                }
+                            };
+                            filters.push(Filter::ModSeq((
+                                parse_number::<u64>(
+                                    &tokens
+                                        .next()
+                                        .ok_or_else(|| {
+                                            Cow::from("Missing MODSEQ mod-sequence-valzer parameter.")
+                                        })?
+                                        .unwrap_bytes(),
+                                )?,
+                                mod_seq_entry,
+                            )));
+                        } else {
+                            filters.push(Filter::ModSeq((
+                                parse_number::<u64>(&param)?,
+                                ModSeqEntry::None,
+                            )));
+                        }
+
+                    },
+                    "EMAILID" => {
+                        filters.push(Filter::EmailId(
+                            tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected an EMAILID value."))?
+                                .unwrap_string()?,
+                        ));
+
+                    },
+                    "THREADID" => {
+                        filters.push(Filter::ThreadId(
+                            tokens
+                                .next()
+                                .ok_or_else(|| Cow::from("Expected an THREADID value."))?
+                                .unwrap_string()?,
+                        ));
+
+                    },
+                    "OR" => {
+                        if filters_stack.len() > 10 {
+                            return Err(Cow::from("Too many nested filters"));
+                        }
+
+                        filters_stack.push((filters, operator, filters_len));
+                        filters_len = 0;
+                        filters = Vec::with_capacity(2);
+                        operator = Filter::Or;
+                        continue;
+                    },
+                    "NOT" => {
+                        if filters_stack.len() > 10 {
+                            return Err(Cow::from("Too many nested filters"));
+                        }
+
+                        filters_stack.push((filters, operator, filters_len));
+                        filters_len = 0;
+                        filters = Vec::with_capacity(1);
+                        operator = Filter::Not;
+                        continue;
+                    },
+                    _ => {
+                        filters.push(Filter::Sequence(parse_sequence_set(&value)?, false));
+                    }
+                );
 
                 filters_len += 1;
             }
@@ -400,28 +512,28 @@ pub fn decode_argument(
     if let Some(decoder) = decoder {
         Ok(decoder(&argument))
     } else {
-        Ok(String::from_utf8(argument.to_vec())
-            .map_err(|_| Cow::from("Invalid UTF-8 argument."))?)
+        Ok(String::from_utf8(argument).map_err(|_| Cow::from("Invalid UTF-8 argument."))?)
     }
 }
 
 impl ResultOption {
     pub fn parse(value: &[u8]) -> super::Result<Self> {
-        if value.eq_ignore_ascii_case(b"min") {
-            Ok(Self::Min)
-        } else if value.eq_ignore_ascii_case(b"max") {
-            Ok(Self::Max)
-        } else if value.eq_ignore_ascii_case(b"all") {
-            Ok(Self::All)
-        } else if value.eq_ignore_ascii_case(b"count") {
-            Ok(Self::Count)
-        } else if value.eq_ignore_ascii_case(b"save") {
-            Ok(Self::Save)
-        } else if value.eq_ignore_ascii_case(b"context") {
-            Ok(Self::Context)
-        } else {
-            Err(format!("Invalid result option {:?}", String::from_utf8_lossy(value)).into())
-        }
+        hashify::tiny_map_ignore_case!(
+            value,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "all" => Self::All,
+            "count" => Self::Count,
+            "save" => Self::Save,
+            "context" => Self::Context,
+        )
+        .ok_or_else(|| {
+            format!(
+                "Invalid result option '{}'.",
+                String::from_utf8_lossy(value)
+            )
+            .into()
+        })
     }
 }
 
@@ -429,8 +541,8 @@ impl ResultOption {
 mod tests {
     use crate::{
         protocol::{
-            search::{self, Filter, ModSeqEntry, ResultOption},
             Flag, ProtocolVersion, Sequence,
+            search::{self, Filter, ModSeqEntry, ResultOption},
         },
         receiver::Receiver,
     };
@@ -444,13 +556,13 @@ mod tests {
                 b"A282 SEARCH RETURN (MIN COUNT) FLAGGED SINCE 1-Feb-1994 NOT FROM \"Smith\"\r\n"
                     .to_vec(),
                 search::Arguments {
-                    tag: "A282".to_string(),
+                    tag: "A282".into(),
                     result_options: vec![ResultOption::Min, ResultOption::Count],
                     filter: vec![
                         Filter::Flagged,
                         Filter::Since(760060800),
                         Filter::Not,
-                        Filter::From("Smith".to_string()),
+                        Filter::From("Smith".into()),
                         Filter::End,
                     ],
                     is_esearch: true,
@@ -460,13 +572,13 @@ mod tests {
             (
                 b"A283 SEARCH RETURN () FLAGGED SINCE 1-Feb-1994 NOT FROM \"Smith\"\r\n".to_vec(),
                 search::Arguments {
-                    tag: "A283".to_string(),
+                    tag: "A283".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Flagged,
                         Filter::Since(760060800),
                         Filter::Not,
-                        Filter::From("Smith".to_string()),
+                        Filter::From("Smith".into()),
                         Filter::End,
                     ],
                     is_esearch: true,
@@ -476,7 +588,7 @@ mod tests {
             (
                 b"A301 SEARCH $ SMALLER 4096\r\n".to_vec(),
                 search::Arguments {
-                    tag: "A301".to_string(),
+                    tag: "A301".into(),
                     result_options: vec![],
                     filter: vec![Filter::seq_saved_search(), Filter::Smaller(4096)],
                     is_esearch: true,
@@ -488,7 +600,7 @@ mod tests {
                     .as_bytes()
                     .to_vec(),
                 search::Arguments {
-                    tag: "P283".to_string(),
+                    tag: "P283".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Or,
@@ -503,7 +615,7 @@ mod tests {
                             false,
                         ),
                         Filter::End,
-                        Filter::Text("мать".to_string()),
+                        Filter::Text("мать".into()),
                     ],
                     is_esearch: true,
                     sort: None,
@@ -512,7 +624,7 @@ mod tests {
             (
                 b"F282 SEARCH RETURN (SAVE) KEYWORD $Junk\r\n".to_vec(),
                 search::Arguments {
-                    tag: "F282".to_string(),
+                    tag: "F282".into(),
                     result_options: vec![ResultOption::Save],
                     filter: vec![Filter::Keyword(Flag::Junk)],
                     is_esearch: true,
@@ -527,17 +639,17 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "F282".to_string(),
+                    tag: "F282".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Or,
                         Filter::Or,
-                        Filter::From("hello@world.com".to_string()),
-                        Filter::To("test@example.com".to_string()),
+                        Filter::From("hello@world.com".into()),
+                        Filter::To("test@example.com".into()),
                         Filter::End,
                         Filter::Or,
-                        Filter::Bcc("jane@foobar.com".to_string()),
-                        Filter::Cc("john@doe.com".to_string()),
+                        Filter::Bcc("jane@foobar.com".into()),
+                        Filter::Cc("john@doe.com".into()),
                         Filter::End,
                         Filter::End,
                     ],
@@ -553,14 +665,14 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "abc".to_string(),
+                    tag: "abc".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Or,
                         Filter::Smaller(10000),
                         Filter::Or,
-                        Filter::Header("Subject".to_string(), "ravioli festival".to_string()),
-                        Filter::Header("From".to_string(), "dr. ravioli".to_string()),
+                        Filter::Header("Subject".into(), "ravioli festival".into()),
+                        Filter::Header("From".into(), "dr. ravioli".into()),
                         Filter::End,
                         Filter::End,
                     ],
@@ -576,16 +688,16 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "abc".to_string(),
+                    tag: "abc".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Deleted,
                         Filter::Seen,
                         Filter::Answered,
                         Filter::Not,
-                        Filter::From("john".to_string()),
-                        Filter::To("jane".to_string()),
-                        Filter::Bcc("bill".to_string()),
+                        Filter::From("john".into()),
+                        Filter::To("jane".into()),
+                        Filter::Bcc("bill".into()),
                         Filter::End,
                         Filter::Sequence(
                             Sequence::List {
@@ -618,7 +730,7 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "abc".to_string(),
+                    tag: "abc".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::seq_range(None, None),
@@ -652,14 +764,14 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "abc".to_string(),
+                    tag: "abc".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Not,
-                        Filter::From("john".to_string()),
+                        Filter::From("john".into()),
                         Filter::Or,
-                        Filter::To("jane".to_string()),
-                        Filter::Cc("bill".to_string()),
+                        Filter::To("jane".into()),
+                        Filter::Cc("bill".into()),
                         Filter::End,
                         Filter::End,
                         Filter::Or,
@@ -674,7 +786,7 @@ mod tests {
                         Filter::End,
                         Filter::End,
                         Filter::End,
-                        Filter::Keyword(Flag::Keyword("tps report".to_string())),
+                        Filter::Keyword(Flag::Keyword("tps report".into())),
                     ],
                     is_esearch: true,
                     sort: None,
@@ -687,9 +799,9 @@ mod tests {
                 ]
                 .concat(),
                 search::Arguments {
-                    tag: "B283".to_string(),
+                    tag: "B283".into(),
                     result_options: vec![ResultOption::Save, ResultOption::Min, ResultOption::Max],
-                    filter: vec![Filter::Text("Привет, мир".to_string())],
+                    filter: vec![Filter::Text("Привет, мир".into())],
                     is_esearch: true,
                     sort: None,
                 },
@@ -697,9 +809,9 @@ mod tests {
             (
                 b"B283 SEARCH CHARSET BIG5 FROM \"\xa7A\xa6n\xa1A\xa5@\xac\xc9\"\r\n".to_vec(),
                 search::Arguments {
-                    tag: "B283".to_string(),
+                    tag: "B283".into(),
                     result_options: vec![],
-                    filter: vec![Filter::From("你好，世界".to_string())],
+                    filter: vec![Filter::From("你好，世界".into())],
                     is_esearch: true,
                     sort: None,
                 },
@@ -707,7 +819,7 @@ mod tests {
             (
                 b"a SEARCH MODSEQ \"/flags/\\draft\" all 620162338\r\n".to_vec(),
                 search::Arguments {
-                    tag: "a".to_string(),
+                    tag: "a".into(),
                     result_options: vec![],
                     filter: vec![Filter::ModSeq((620162338, ModSeqEntry::All(Flag::Draft)))],
                     is_esearch: true,
@@ -717,7 +829,7 @@ mod tests {
             (
                 b"t SEARCH OR NOT MODSEQ 720162338 LARGER 50000\r\n".to_vec(),
                 search::Arguments {
-                    tag: "t".to_string(),
+                    tag: "t".into(),
                     result_options: vec![],
                     filter: vec![
                         Filter::Or,
@@ -734,7 +846,7 @@ mod tests {
             (
                 b"5 UID SEARCH BEFORE 1-Dec-2023\r\n".to_vec(),
                 search::Arguments {
-                    tag: "5".to_string(),
+                    tag: "5".into(),
                     result_options: vec![],
                     filter: vec![Filter::Before(1701388800)],
                     is_esearch: true,

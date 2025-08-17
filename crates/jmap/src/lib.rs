@@ -1,58 +1,28 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{
-    collections::hash_map::RandomState,
-    fmt::Display,
-    sync::{atomic::AtomicU8, Arc},
-    time::Duration,
-};
+#![warn(clippy::large_futures)]
 
-use auth::{rate_limit::ConcurrencyLimiters, AccessToken};
-use common::{manager::webadmin::WebAdminManager, Core, DeliveryEvent, SharedCore};
-use dashmap::DashMap;
-use directory::QueryBy;
-use email::cache::Threads;
+use common::Server;
 use jmap_proto::{
     method::{
         query::{QueryRequest, QueryResponse},
         set::{SetRequest, SetResponse},
     },
-    types::{collection::Collection, property::Property},
+    types::{collection::Collection, state::State},
 };
-use services::{
-    delivery::spawn_delivery_manager,
-    housekeeper::{self, init_housekeeper, spawn_housekeeper},
-    index::spawn_index_task,
-    state::{self, init_state_manager, spawn_state_manager},
-};
-
-use smtp::core::SMTP;
+use std::{fmt::Display, future::Future};
 use store::{
-    dispatch::DocumentSet,
     fts::FtsFilter,
-    query::{sort::Pagination, Comparator, Filter, ResultSet, SortedResultSet},
+    query::{Comparator, Filter, ResultSet, SortedResultSet, sort::Pagination},
     roaring::RoaringBitmap,
-    write::{
-        key::DeserializeBigEndian, AssignedIds, BatchBuilder, BitmapClass, DirectoryClass,
-        TagValue, ValueClass,
-    },
-    BitmapKey, Deserialize, IterateParams, ValueKey, U32_LEN,
 };
-use tokio::sync::{mpsc, Notify};
 use trc::AddContext;
-use utils::{
-    config::Config,
-    lru_cache::{LruCache, LruCached},
-    map::ttl_dashmap::{TtlDashMap, TtlMap},
-    snowflake::SnowflakeIdGenerator,
-};
 
 pub mod api;
-pub mod auth;
 pub mod blob;
 pub mod changes;
 pub mod email;
@@ -61,312 +31,25 @@ pub mod mailbox;
 pub mod principal;
 pub mod push;
 pub mod quota;
-pub mod services;
 pub mod sieve;
 pub mod submission;
 pub mod thread;
 pub mod vacation;
 pub mod websocket;
 
-pub const LONG_SLUMBER: Duration = Duration::from_secs(60 * 60 * 24);
-
-#[derive(Clone)]
-pub struct JMAP {
-    pub core: Arc<Core>,
-    pub shared_core: SharedCore,
-    pub inner: Arc<Inner>,
-    pub smtp: SMTP,
-}
-
-#[derive(Clone)]
-pub struct JmapInstance {
-    pub core: SharedCore,
-    pub jmap_inner: Arc<Inner>,
-    pub smtp_inner: Arc<smtp::core::Inner>,
-}
-
-pub struct Inner {
-    pub sessions: TtlDashMap<String, u32>,
-    pub access_tokens: TtlDashMap<u32, Arc<AccessToken>>,
-    pub snowflake_id: SnowflakeIdGenerator,
-    pub webadmin: WebAdminManager,
-    pub config_version: AtomicU8,
-
-    pub concurrency_limiter: DashMap<u32, Arc<ConcurrencyLimiters>>,
-
-    pub state_tx: mpsc::Sender<state::Event>,
-    pub housekeeper_tx: mpsc::Sender<housekeeper::Event>,
-    pub index_tx: Arc<Notify>,
-
-    pub cache_threads: LruCache<u32, Arc<Threads>>,
-}
-
-impl JMAP {
-    pub async fn init(
-        config: &mut Config,
-        delivery_rx: mpsc::Receiver<DeliveryEvent>,
-        core: SharedCore,
-        smtp_inner: Arc<smtp::core::Inner>,
-    ) -> JmapInstance {
-        // Init state manager and housekeeper
-        let (state_tx, state_rx) = init_state_manager();
-        let (housekeeper_tx, housekeeper_rx) = init_housekeeper();
-        let index_tx = Arc::new(Notify::new());
-        let shard_amount = config
-            .property::<u64>("cache.shard")
-            .unwrap_or(32)
-            .next_power_of_two() as usize;
-        let capacity = config.property("cache.capacity").unwrap_or(100);
-
-        let inner = Inner {
-            webadmin: WebAdminManager::new(),
-            sessions: TtlDashMap::with_capacity(capacity, shard_amount),
-            access_tokens: TtlDashMap::with_capacity(capacity, shard_amount),
-            snowflake_id: config
-                .property::<u64>("cluster.node-id")
-                .map(SnowflakeIdGenerator::with_node_id)
-                .unwrap_or_default(),
-            concurrency_limiter: DashMap::with_capacity_and_hasher_and_shard_amount(
-                capacity,
-                RandomState::default(),
-                shard_amount,
-            ),
-            state_tx,
-            housekeeper_tx,
-            index_tx: index_tx.clone(),
-            cache_threads: LruCache::with_capacity(
-                config.property("cache.thread.size").unwrap_or(2048),
-            ),
-            config_version: 0.into(),
-        };
-
-        // Unpack webadmin
-        if let Err(err) = inner.webadmin.unpack(&core.load().storage.blob).await {
-            trc::event!(
-                Resource(trc::ResourceEvent::Error),
-                Reason = err,
-                Details = "Failed to unpack webadmin bundle"
-            );
-        }
-
-        let jmap_instance = JmapInstance {
-            core,
-            jmap_inner: Arc::new(inner),
-            smtp_inner,
-        };
-
-        // Spawn delivery manager
-        spawn_delivery_manager(jmap_instance.clone(), delivery_rx);
-
-        // Spawn state manager
-        spawn_state_manager(jmap_instance.clone(), state_rx);
-
-        // Spawn housekeeper
-        spawn_housekeeper(jmap_instance.clone(), housekeeper_rx);
-
-        // Spawn index task
-        spawn_index_task(jmap_instance.clone(), index_tx);
-
-        jmap_instance
-    }
-
-    pub async fn get_property<U>(
-        &self,
-        account_id: u32,
-        collection: Collection,
-        document_id: u32,
-        property: impl AsRef<Property>,
-    ) -> trc::Result<Option<U>>
-    where
-        U: Deserialize + 'static,
-    {
-        let property = property.as_ref();
-
-        self.core
-            .storage
-            .data
-            .get_value::<U>(ValueKey {
-                account_id,
-                collection: collection.into(),
-                document_id,
-                class: ValueClass::Property(property.into()),
-            })
-            .await
-            .add_context(|err| {
-                err.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(collection)
-                    .document_id(document_id)
-                    .id(property.to_string())
-            })
-    }
-
-    pub async fn get_properties<U, I, P>(
-        &self,
-        account_id: u32,
-        collection: Collection,
-        iterate: &I,
-        property: P,
-    ) -> trc::Result<Vec<(u32, U)>>
-    where
-        I: DocumentSet + Send + Sync,
-        P: AsRef<Property>,
-        U: Deserialize + 'static,
-    {
-        let property: u8 = property.as_ref().into();
-        let collection: u8 = collection.into();
-        let expected_results = iterate.len();
-        let mut results = Vec::with_capacity(expected_results);
-
-        self.core
-            .storage
-            .data
-            .iterate(
-                IterateParams::new(
-                    ValueKey {
-                        account_id,
-                        collection,
-                        document_id: iterate.min(),
-                        class: ValueClass::Property(property),
-                    },
-                    ValueKey {
-                        account_id,
-                        collection,
-                        document_id: iterate.max(),
-                        class: ValueClass::Property(property),
-                    },
-                ),
-                |key, value| {
-                    let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
-                    if iterate.contains(document_id) {
-                        results.push((document_id, U::deserialize(value)?));
-                        Ok(expected_results == 0 || results.len() < expected_results)
-                    } else {
-                        Ok(true)
-                    }
-                },
-            )
-            .await
-            .add_context(|err| {
-                err.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(collection)
-                    .id(property.to_string())
-            })
-            .map(|_| results)
-    }
-
-    pub async fn get_document_ids(
-        &self,
-        account_id: u32,
-        collection: Collection,
-    ) -> trc::Result<Option<RoaringBitmap>> {
-        self.core
-            .storage
-            .data
-            .get_bitmap(BitmapKey::document_ids(account_id, collection))
-            .await
-            .add_context(|err| {
-                err.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(collection)
-            })
-    }
-
-    pub async fn get_tag(
-        &self,
-        account_id: u32,
-        collection: Collection,
-        property: impl AsRef<Property>,
-        value: impl Into<TagValue<u32>>,
-    ) -> trc::Result<Option<RoaringBitmap>> {
-        let property = property.as_ref();
-        self.core
-            .storage
-            .data
-            .get_bitmap(BitmapKey {
-                account_id,
-                collection: collection.into(),
-                class: BitmapClass::Tag {
-                    field: property.into(),
-                    value: value.into(),
-                },
-                document_id: 0,
-            })
-            .await
-            .add_context(|err| {
-                err.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(collection)
-                    .id(property.to_string())
-            })
-    }
-
-    pub async fn prepare_set_response<T>(
+impl JmapMethods for Server {
+    async fn prepare_set_response<T: Sync + Send>(
         &self,
         request: &SetRequest<T>,
-        collection: Collection,
+        asserted_state: State,
     ) -> trc::Result<SetResponse> {
         Ok(
-            SetResponse::from_request(request, self.core.jmap.set_max_objects)?.with_state(
-                self.assert_state(
-                    request.account_id.document_id(),
-                    collection,
-                    &request.if_in_state,
-                )
-                .await?,
-            ),
+            SetResponse::from_request(request, self.core.jmap.set_max_objects)?
+                .with_state(asserted_state),
         )
     }
 
-    pub async fn get_quota(&self, access_token: &AccessToken, account_id: u32) -> trc::Result<i64> {
-        Ok(if access_token.primary_id == account_id {
-            access_token.quota as i64
-        } else {
-            self.core
-                .storage
-                .directory
-                .query(QueryBy::Id(account_id), false)
-                .await
-                .add_context(|err| err.caused_by(trc::location!()).account_id(account_id))?
-                .map(|p| p.quota as i64)
-                .unwrap_or_default()
-        })
-    }
-
-    pub async fn get_used_quota(&self, account_id: u32) -> trc::Result<i64> {
-        self.core
-            .storage
-            .data
-            .get_counter(DirectoryClass::UsedQuota(account_id))
-            .await
-            .add_context(|err| err.caused_by(trc::location!()).account_id(account_id))
-    }
-
-    pub async fn has_available_quota(
-        &self,
-        account_id: u32,
-        account_quota: i64,
-        item_size: i64,
-    ) -> trc::Result<()> {
-        if account_quota == 0 {
-            return Ok(());
-        }
-        self.get_used_quota(account_id)
-            .await
-            .and_then(|used_quota| {
-                if used_quota + item_size <= account_quota {
-                    Ok(())
-                } else {
-                    Err(trc::LimitEvent::Quota
-                        .into_err()
-                        .ctx(trc::Key::Limit, account_quota as u64)
-                        .ctx(trc::Key::Size, used_quota as u64))
-                }
-            })
-    }
-
-    pub async fn filter(
+    async fn filter(
         &self,
         account_id: u32,
         collection: Collection,
@@ -384,7 +67,7 @@ impl JMAP {
             })
     }
 
-    pub async fn fts_filter<T: Into<u8> + Display + Clone + std::fmt::Debug>(
+    async fn fts_filter<T: Into<u8> + Display + Clone + std::fmt::Debug + Sync + Send>(
         &self,
         account_id: u32,
         collection: Collection,
@@ -402,9 +85,10 @@ impl JMAP {
             })
     }
 
-    pub async fn build_query_response<T>(
+    async fn build_query_response<T: Sync + Send>(
         &self,
         result_set: &ResultSet,
+        query_state: State,
         request: &QueryRequest<T>,
     ) -> trc::Result<(QueryResponse, Option<Pagination>)> {
         let total = result_set.results.len() as usize;
@@ -424,9 +108,7 @@ impl JMAP {
         Ok((
             QueryResponse {
                 account_id: request.account_id,
-                query_state: self
-                    .get_state(result_set.account_id, result_set.collection)
-                    .await?,
+                query_state,
                 can_calculate_changes: true,
                 position: 0,
                 ids: vec![],
@@ -451,11 +133,11 @@ impl JMAP {
         ))
     }
 
-    pub async fn sort(
+    async fn sort(
         &self,
         result_set: ResultSet,
         comparators: Vec<Comparator>,
-        paginate: Pagination,
+        paginate: Pagination<'_>,
         mut response: QueryResponse,
     ) -> trc::Result<QueryResponse> {
         // Sort results
@@ -476,44 +158,43 @@ impl JMAP {
 
         Ok(response)
     }
-
-    pub async fn write_batch(&self, batch: BatchBuilder) -> trc::Result<AssignedIds> {
-        self.core
-            .storage
-            .data
-            .write(batch.build())
-            .await
-            .caused_by(trc::location!())
-    }
-
-    pub async fn write_batch_expect_id(&self, batch: BatchBuilder) -> trc::Result<u32> {
-        self.write_batch(batch)
-            .await
-            .and_then(|ids| ids.last_document_id().caused_by(trc::location!()))
-    }
 }
 
-impl Inner {
-    pub fn increment_config_version(&self) {
-        self.config_version
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
+pub trait JmapMethods: Sync + Send {
+    fn prepare_set_response<T: Sync + Send>(
+        &self,
+        request: &SetRequest<T>,
+        asserted_state: State,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
 
-impl From<JmapInstance> for JMAP {
-    fn from(value: JmapInstance) -> Self {
-        let shared_core = value.core.clone();
-        let core = value.core.load_full();
-        JMAP {
-            smtp: SMTP {
-                core: core.clone(),
-                inner: value.smtp_inner,
-            },
-            core,
-            shared_core,
-            inner: value.jmap_inner,
-        }
-    }
+    fn filter(
+        &self,
+        account_id: u32,
+        collection: Collection,
+        filters: Vec<Filter>,
+    ) -> impl Future<Output = trc::Result<ResultSet>> + Send;
+
+    fn fts_filter<T: Into<u8> + Display + Clone + std::fmt::Debug + Sync + Send>(
+        &self,
+        account_id: u32,
+        collection: Collection,
+        filters: Vec<FtsFilter<T>>,
+    ) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+
+    fn build_query_response<T: Sync + Send>(
+        &self,
+        result_set: &ResultSet,
+        query_state: State,
+        request: &QueryRequest<T>,
+    ) -> impl Future<Output = trc::Result<(QueryResponse, Option<Pagination>)>> + Send;
+
+    fn sort(
+        &self,
+        result_set: ResultSet,
+        comparators: Vec<Comparator>,
+        paginate: Pagination,
+        response: QueryResponse,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
 }
 
 trait UpdateResults: Sized {

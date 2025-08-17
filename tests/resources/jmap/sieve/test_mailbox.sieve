@@ -1,13 +1,13 @@
-require ["fileinto", "mailbox", "mailboxid", "special-use", "ihave", "imap4flags"];
+require ["fileinto", "mailbox", "mailboxid", "special-use", "ihave", "imap4flags", "vnd.stalwart.expressions"];
 
 # SpecialUse extension tests
 if not specialuse_exists ["inbox", "trash"] {
-    error "Special-use mailboxes INBOX or TRASH do not exist.";
+    error "Special-use mailboxes INBOX or TRASH do not exist (lowercase).";
 }
 
 if not anyof(specialuse_exists "Inbox" "inbox",
              specialuse_exists "Deleted Items" "trash") {
-    error "Special-use mailboxes INBOX or TRASH do not exist.";
+    error "Special-use mailboxes INBOX or TRASH do not exist (mixed-case).";
 }
 
 if specialuse_exists "dingleberry" {
@@ -37,8 +37,8 @@ if not mailboxexists ["Drafts", "Sent Items"] {
 }
 
 # File into new mailboxes using flags
-fileinto :create "Inbox /  Folder  ";
-fileinto :flags ["$important", "$seen"] :create "My/Nested/Mailbox/with/multiple/levels";
+fileinto :create "INBOX /  Folder  ";
+fileinto :flags ["$important", "\\Seen"] :create "My/Nested/Mailbox/with/multiple/levels";
 
 # Make sure all mailboxes were created
 if not mailboxexists "Inbox/Folder" {
@@ -61,3 +61,6 @@ if not mailboxexists "My" {
     error "'My' not found.";
 }
 
+if eval "llm_prompt('echo-test', 'hello world', 0.5) != 'hello world'" {
+    error "llm_prompt is unavailable.";
+}

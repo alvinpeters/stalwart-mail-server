@@ -1,38 +1,43 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{sync::Arc, time::Instant};
-
+use super::{FromModSeq, ToModSeq};
+use crate::{
+    core::{ImapId, SavedSearch, SelectedMailbox, Session, SessionData},
+    spawn_op,
+};
 use common::listener::SessionStream;
+use directory::Permission;
+use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use imap_proto::{
+    Command, StatusResponse,
     protocol::{
-        search::{self, Arguments, Filter, Response, ResultOption},
         Sequence,
+        search::{self, Arguments, Filter, Response, ResultOption},
     },
     receiver::Request,
-    Command, StatusResponse,
 };
-use jmap_proto::types::{collection::Collection, id::Id, keyword::Keyword, property::Property};
+use jmap_proto::types::{
+    collection::{Collection, SyncCollection},
+    id::Id,
+    keyword::Keyword,
+    property::Property,
+};
 use mail_parser::HeaderName;
 use nlp::language::Language;
+use std::{sync::Arc, time::Instant};
 use store::{
+    SerializeInfallible,
     fts::{Field, FilterGroup, FtsFilter, IntoFilterGroup},
-    query::{self, log::Query, sort::Pagination, ResultSet},
+    query::{self, ResultSet, log::Query, sort::Pagination},
     roaring::RoaringBitmap,
     write::now,
 };
 use tokio::sync::watch;
 use trc::AddContext;
-
-use crate::{
-    core::{ImapId, MailboxState, SavedSearch, SelectedMailbox, Session, SessionData},
-    spawn_op,
-};
-
-use super::{FromModSeq, ToModSeq};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_search(
@@ -43,8 +48,14 @@ impl<T: SessionStream> Session<T> {
     ) -> trc::Result<()> {
         let op_start = Instant::now();
         let mut arguments = if !is_sort {
+            // Validate access
+            self.assert_has_permission(Permission::ImapSearch)?;
+
             request.parse_search(self.version)
         } else {
+            // Validate access
+            self.assert_has_permission(Permission::ImapSort)?;
+
             request.parse_sort()
         }?;
 
@@ -135,7 +146,7 @@ impl<T: SessionStream> SessionData<T> {
         let mut imap_ids = Vec::with_capacity(results_len);
         let is_sort = if let Some(sort) = arguments.sort {
             mailbox.map_search_results(
-                self.jmap
+                self.server
                     .core
                     .storage
                     .data
@@ -252,16 +263,17 @@ impl<T: SessionStream> SessionData<T> {
     ) -> trc::Result<(ResultSet, bool)> {
         // Obtain message ids
         let mut filters = Vec::with_capacity(imap_filter.len() + 1);
-        let message_ids = self
-            .jmap
-            .get_tag(
-                mailbox.id.account_id,
-                Collection::Email,
-                Property::MailboxIds,
-                mailbox.id.mailbox_id,
-            )
-            .await?
-            .unwrap_or_default();
+        let cache = self
+            .server
+            .get_cached_messages(mailbox.id.account_id)
+            .await
+            .caused_by(trc::location!())?;
+        let message_ids = RoaringBitmap::from_iter(
+            cache
+                .in_mailbox(mailbox.id.mailbox_id)
+                .map(|m| m.document_id),
+        );
+
         filters.push(query::Filter::is_in_set(message_ids.clone()));
 
         // Convert query
@@ -283,7 +295,7 @@ impl<T: SessionStream> SessionData<T> {
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Body,
                                     text,
-                                    self.jmap.core.jmap.default_language,
+                                    self.server.core.jmap.default_language,
                                 ));
                             }
                             search::Filter::Cc(text) => {
@@ -343,45 +355,45 @@ impl<T: SessionStream> SessionData<T> {
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Header(HeaderName::Subject),
                                     text,
-                                    self.jmap.core.jmap.default_language,
+                                    self.server.core.jmap.default_language,
                                 ));
                             }
                             search::Filter::Text(text) => {
                                 fts_filters.push(FtsFilter::Or);
                                 fts_filters.push(FtsFilter::has_text(
                                     Field::Header(HeaderName::From),
-                                    &text,
+                                    text.as_str(),
                                     Language::None,
                                 ));
                                 fts_filters.push(FtsFilter::has_text(
                                     Field::Header(HeaderName::To),
-                                    &text,
+                                    text.as_str(),
                                     Language::None,
                                 ));
                                 fts_filters.push(FtsFilter::has_text(
                                     Field::Header(HeaderName::Cc),
-                                    &text,
+                                    text.as_str(),
                                     Language::None,
                                 ));
                                 fts_filters.push(FtsFilter::has_text(
                                     Field::Header(HeaderName::Bcc),
-                                    &text,
+                                    text.as_str(),
                                     Language::None,
                                 ));
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Header(HeaderName::Subject),
-                                    &text,
-                                    self.jmap.core.jmap.default_language,
+                                    text.as_str(),
+                                    self.server.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Body,
-                                    &text,
-                                    self.jmap.core.jmap.default_language,
+                                    text.as_str(),
+                                    self.server.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Attachment,
                                     text,
-                                    self.jmap.core.jmap.default_language,
+                                    self.server.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::End);
                             }
@@ -409,8 +421,9 @@ impl<T: SessionStream> SessionData<T> {
                     }
 
                     filters.push(query::Filter::is_in_set(
-                        self.jmap
-                            .fts_filter(mailbox.id.account_id, Collection::Email, fts_filters)
+                        self.server
+                            .fts_store()
+                            .query(mailbox.id.account_id, Collection::Email, fts_filters)
                             .await?,
                     ));
                 }
@@ -443,121 +456,132 @@ impl<T: SessionStream> SessionData<T> {
                         filters.push(query::Filter::is_in_set(message_ids.clone()));
                     }
                     search::Filter::Answered => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Answered,
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .with_keyword(&Keyword::Answered)
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Before(date) => {
-                        filters.push(query::Filter::lt(Property::ReceivedAt, date as u64));
+                        filters.push(query::Filter::lt(
+                            Property::ReceivedAt,
+                            (date as u64).serialize(),
+                        ));
                     }
                     search::Filter::Deleted => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Deleted,
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache.with_keyword(&Keyword::Deleted).map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Draft => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Draft,
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache.with_keyword(&Keyword::Draft).map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Flagged => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Flagged,
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache.with_keyword(&Keyword::Flagged).map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Keyword(keyword) => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::from(keyword),
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .with_keyword(&Keyword::from(keyword))
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Larger(size) => {
-                        filters.push(query::Filter::gt(Property::Size, size));
+                        filters.push(query::Filter::gt(Property::Size, size.serialize()));
                     }
                     search::Filter::On(date) => {
                         filters.push(query::Filter::And);
-                        filters.push(query::Filter::ge(Property::ReceivedAt, date as u64));
+                        filters.push(query::Filter::ge(
+                            Property::ReceivedAt,
+                            (date as u64).serialize(),
+                        ));
                         filters.push(query::Filter::lt(
                             Property::ReceivedAt,
-                            (date + 86400) as u64,
+                            ((date + 86400) as u64).serialize(),
                         ));
                         filters.push(query::Filter::End);
                     }
                     search::Filter::Seen => {
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Seen,
-                        ));
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache.with_keyword(&Keyword::Seen).map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::SentBefore(date) => {
-                        filters.push(query::Filter::lt(Property::SentAt, date as u64));
+                        filters.push(query::Filter::lt(
+                            Property::SentAt,
+                            (date as u64).serialize(),
+                        ));
                     }
                     search::Filter::SentOn(date) => {
                         filters.push(query::Filter::And);
-                        filters.push(query::Filter::ge(Property::SentAt, date as u64));
-                        filters.push(query::Filter::lt(Property::SentAt, (date + 86400) as u64));
+                        filters.push(query::Filter::ge(
+                            Property::SentAt,
+                            (date as u64).serialize(),
+                        ));
+                        filters.push(query::Filter::lt(
+                            Property::SentAt,
+                            ((date + 86400) as u64).serialize(),
+                        ));
                         filters.push(query::Filter::End);
                     }
                     search::Filter::SentSince(date) => {
-                        filters.push(query::Filter::ge(Property::SentAt, date as u64));
+                        filters.push(query::Filter::ge(
+                            Property::SentAt,
+                            (date as u64).serialize(),
+                        ));
                     }
                     search::Filter::Since(date) => {
-                        filters.push(query::Filter::ge(Property::ReceivedAt, date as u64));
+                        filters.push(query::Filter::ge(
+                            Property::ReceivedAt,
+                            (date as u64).serialize(),
+                        ));
                     }
                     search::Filter::Smaller(size) => {
-                        filters.push(query::Filter::lt(Property::Size, size));
+                        filters.push(query::Filter::lt(Property::Size, size.serialize()));
                     }
                     search::Filter::Unanswered => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Answered,
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .without_keyword(&Keyword::Answered)
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Undeleted => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Deleted,
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .without_keyword(&Keyword::Deleted)
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Undraft => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Draft,
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .without_keyword(&Keyword::Draft)
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Unflagged => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Flagged,
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .without_keyword(&Keyword::Flagged)
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Unkeyword(keyword) => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::from(keyword),
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache
+                                .without_keyword(&Keyword::from(keyword))
+                                .map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::Unseen => {
-                        filters.push(query::Filter::Not);
-                        filters.push(query::Filter::is_in_bitmap(
-                            Property::Keywords,
-                            Keyword::Seen,
-                        ));
-                        filters.push(query::Filter::End);
+                        filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                            cache.without_keyword(&Keyword::Seen).map(|m| m.document_id),
+                        )));
                     }
                     search::Filter::And => {
                         filters.push(query::Filter::And);
@@ -593,28 +617,31 @@ impl<T: SessionStream> SessionData<T> {
                     search::Filter::Older(secs) => {
                         filters.push(query::Filter::le(
                             Property::ReceivedAt,
-                            now().saturating_sub(secs as u64),
+                            now().saturating_sub(secs as u64).serialize(),
                         ));
                     }
                     search::Filter::Younger(secs) => {
                         filters.push(query::Filter::ge(
                             Property::ReceivedAt,
-                            now().saturating_sub(secs as u64),
+                            now().saturating_sub(secs as u64).serialize(),
                         ));
                     }
                     search::Filter::ModSeq((modseq, _)) => {
                         let mut set = RoaringBitmap::new();
-                        for change in self
-                            .jmap
-                            .changes_(
+                        for id in self
+                            .server
+                            .store()
+                            .changes(
                                 mailbox.id.account_id,
-                                Collection::Email,
+                                SyncCollection::Email,
                                 Query::from_modseq(modseq),
                             )
                             .await?
                             .changes
+                            .into_iter()
+                            .filter_map(|change| change.try_unwrap_item_id())
                         {
-                            let id = (change.unwrap_id() & u32::MAX as u64) as u32;
+                            let id = (id & u32::MAX as u64) as u32;
                             if message_ids.contains(id) {
                                 set.insert(id);
                             }
@@ -635,10 +662,9 @@ impl<T: SessionStream> SessionData<T> {
                     }
                     search::Filter::ThreadId(id) => {
                         if let Some(id) = Id::from_bytes(id.as_bytes()) {
-                            filters.push(query::Filter::is_in_bitmap(
-                                Property::ThreadId,
-                                id.document_id(),
-                            ));
+                            filters.push(query::Filter::is_in_set(RoaringBitmap::from_iter(
+                                cache.in_thread(id.document_id()).map(|m| m.document_id),
+                            )));
                         } else {
                             return Err(trc::ImapEvent::Error
                                 .into_err()
@@ -651,7 +677,8 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Run query
-        self.jmap
+        self.server
+            .store()
             .filter(mailbox.id.account_id, Collection::Email, filters)
             .await
             .map(|res| (res, include_highest_modseq))
@@ -727,23 +754,6 @@ impl SelectedMailbox {
                     r.push(*imap_id)
                 }
             }
-        }
-    }
-}
-
-impl MailboxState {
-    pub fn map_result_id(&self, document_id: u32, is_uid: bool) -> Option<(u32, ImapId)> {
-        if let Some(imap_id) = self.id_to_imap.get(&document_id) {
-            Some((if is_uid { imap_id.uid } else { imap_id.seqnum }, *imap_id))
-        } else if is_uid {
-            self.next_state.as_ref().and_then(|s| {
-                s.next_state
-                    .id_to_imap
-                    .get(&document_id)
-                    .map(|imap_id| (imap_id.uid, *imap_id))
-            })
-        } else {
-            None
         }
     }
 }

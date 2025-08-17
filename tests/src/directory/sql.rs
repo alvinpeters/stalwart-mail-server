@@ -1,14 +1,21 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::{backend::internal::manage::ManageDirectory, Principal, QueryBy, Type};
+use directory::{
+    QueryParams, ROLE_USER, Type,
+    backend::{RcptType, internal::manage::ManageDirectory},
+};
 use mail_send::Credentials;
-use store::{LookupStore, Store};
 
-use crate::directory::{map_account_ids, DirectoryTest};
+#[allow(unused_imports)]
+use store::{InMemoryStore, Store};
+
+use crate::directory::{
+    DirectoryTest, IntoTestPrincipal, TestPrincipal, map_account_id, map_account_ids,
+};
 
 use super::DirectoryStore;
 
@@ -30,15 +37,19 @@ async fn sql_directory() {
         println!("Testing SQL directory {:?}", directory_id);
         let handle = config.directories.directories.remove(directory_id).unwrap();
         let store = DirectoryStore {
-            store: config.stores.lookup_stores.remove(directory_id).unwrap(),
+            store: config.stores.stores.remove(directory_id).unwrap(),
         };
-        let base_store = config.stores.stores.get(directory_id).unwrap();
-        let core = config.core;
+        let base_store = &store.store;
+        let core = config.server;
 
         // Create tables
+        base_store.destroy().await;
         store.create_test_directory().await;
 
         // Create test users
+        store
+            .create_test_user("admin", "very_secret", "Administrator")
+            .await;
         store.create_test_user("john", "12345", "John Doe").await;
         store.create_test_user("jane", "abcde", "Jane Doe").await;
         store
@@ -102,82 +113,121 @@ async fn sql_directory() {
         assert_eq!(
             handle
                 .query(
-                    QueryBy::Credentials(&Credentials::Plain {
-                        username: "john".to_string(),
-                        secret: "12345".to_string()
-                    }),
-                    true
+                    QueryParams::credentials(&Credentials::Plain {
+                        username: "john".into(),
+                        secret: "12345".into()
+                    })
+                    .with_return_member_of(true)
                 )
                 .await
                 .unwrap()
-                .unwrap(),
-            Principal {
-                id: base_store.get_account_id("john").await.unwrap().unwrap(),
-                name: "john".to_string(),
-                description: "John Doe".to_string().into(),
-                secrets: vec!["12345".to_string()],
+                .unwrap()
+                .into_test(),
+            TestPrincipal {
+                id: base_store.get_principal_id("john").await.unwrap().unwrap(),
+                name: "john".into(),
+                description: Some("John Doe".into()),
+                secrets: vec!["12345".into()],
                 typ: Type::Individual,
-                member_of: map_account_ids(base_store, vec!["sales"]).await,
+                member_of: map_account_ids(base_store, vec!["sales"])
+                    .await
+                    .into_iter()
+                    .map(|v| v.to_string())
+                    .collect(),
                 emails: vec![
-                    "john@example.org".to_string(),
-                    "jdoe@example.org".to_string(),
-                    "john.doe@example.org".to_string()
+                    "john@example.org".into(),
+                    "jdoe@example.org".into(),
+                    "john.doe@example.org".into()
                 ],
+                roles: vec![ROLE_USER.to_string()],
                 ..Default::default()
             }
         );
         assert_eq!(
             handle
                 .query(
-                    QueryBy::Credentials(&Credentials::Plain {
-                        username: "bill".to_string(),
-                        secret: "password".to_string()
-                    }),
-                    true
+                    QueryParams::credentials(&Credentials::Plain {
+                        username: "bill".into(),
+                        secret: "password".into()
+                    })
+                    .with_return_member_of(true)
                 )
                 .await
                 .unwrap()
-                .unwrap(),
-            Principal {
-                id: base_store.get_account_id("bill").await.unwrap().unwrap(),
-                name: "bill".to_string(),
-                description: "Bill Foobar".to_string().into(),
+                .unwrap()
+                .into_test(),
+            TestPrincipal {
+                id: base_store.get_principal_id("bill").await.unwrap().unwrap(),
+                name: "bill".into(),
+                description: Some("Bill Foobar".into()),
                 secrets: vec![
-                    "$2y$05$bvIG6Nmid91Mu9RcmmWZfO5HJIMCT8riNW0hEp8f6/FuA2/mHZFpe".to_string()
+                    "$2y$05$bvIG6Nmid91Mu9RcmmWZfO5HJIMCT8riNW0hEp8f6/FuA2/mHZFpe".into()
                 ],
                 typ: Type::Individual,
                 quota: 500000,
-                emails: vec!["bill@example.org".to_string(),],
+                emails: vec!["bill@example.org".into(),],
+                roles: vec![ROLE_USER.to_string()],
                 ..Default::default()
             }
         );
-        assert!(handle
-            .query(
-                QueryBy::Credentials(&Credentials::Plain {
-                    username: "bill".to_string(),
-                    secret: "invalid".to_string()
-                }),
-                true
-            )
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            handle
+                .query(
+                    QueryParams::credentials(&Credentials::Plain {
+                        username: "admin".into(),
+                        secret: "very_secret".into()
+                    })
+                    .with_return_member_of(true)
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .into_test(),
+            TestPrincipal {
+                id: base_store.get_principal_id("admin").await.unwrap().unwrap(),
+                name: "admin".into(),
+                description: Some("Administrator".into()),
+                secrets: vec!["very_secret".into()],
+                typ: Type::Individual,
+                roles: vec![ROLE_USER.to_string()],
+                ..Default::default()
+            }
+        );
+        assert!(
+            handle
+                .query(
+                    QueryParams::credentials(&Credentials::Plain {
+                        username: "bill".into(),
+                        secret: "invalid".into()
+                    })
+                    .with_return_member_of(true)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Get user by name
         assert_eq!(
             handle
-                .query(QueryBy::Name("jane"), true)
+                .query(QueryParams::name("jane").with_return_member_of(true))
                 .await
                 .unwrap()
-                .unwrap(),
-            Principal {
-                id: base_store.get_account_id("jane").await.unwrap().unwrap(),
-                name: "jane".to_string(),
-                description: "Jane Doe".to_string().into(),
+                .unwrap()
+                .into_test(),
+            TestPrincipal {
+                id: base_store.get_principal_id("jane").await.unwrap().unwrap(),
+                name: "jane".into(),
+                description: Some("Jane Doe".into()),
                 typ: Type::Individual,
-                secrets: vec!["abcde".to_string()],
-                member_of: map_account_ids(base_store, vec!["sales", "support"]).await,
-                emails: vec!["jane@example.org".to_string(),],
+                secrets: vec!["abcde".into()],
+                member_of: map_account_ids(base_store, vec!["sales", "support"])
+                    .await
+                    .into_iter()
+                    .map(|v| v.to_string())
+                    .collect(),
+                emails: vec!["jane@example.org".into(),],
+                roles: vec![ROLE_USER.to_string()],
                 ..Default::default()
             }
         );
@@ -185,55 +235,45 @@ async fn sql_directory() {
         // Get group by name
         assert_eq!(
             handle
-                .query(QueryBy::Name("sales"), true)
+                .query(QueryParams::name("sales").with_return_member_of(true))
                 .await
                 .unwrap()
-                .unwrap(),
-            Principal {
-                id: base_store.get_account_id("sales").await.unwrap().unwrap(),
-                name: "sales".to_string(),
-                description: "Sales Team".to_string().into(),
+                .unwrap()
+                .into_test(),
+            TestPrincipal {
+                id: base_store.get_principal_id("sales").await.unwrap().unwrap(),
+                name: "sales".into(),
+                description: Some("Sales Team".into()),
                 typ: Type::Group,
+                roles: vec![ROLE_USER.to_string()],
                 ..Default::default()
             }
         );
 
         // Ids by email
         assert_eq!(
-            core.email_to_ids(&handle, "jane@example.org", 0)
+            core.email_to_id(&handle, "jane@example.org", 0)
                 .await
                 .unwrap(),
-            map_account_ids(base_store, vec!["jane"]).await
+            Some(map_account_id(base_store, "jane").await)
         );
         assert_eq!(
-            core.email_to_ids(&handle, "info@example.org", 0)
+            core.email_to_id(&handle, "jane+alias@example.org", 0)
                 .await
                 .unwrap(),
-            map_account_ids(base_store, vec!["bill", "jane", "john"]).await
+            Some(map_account_id(base_store, "jane").await)
         );
         assert_eq!(
-            core.email_to_ids(&handle, "jane+alias@example.org", 0)
+            core.email_to_id(&handle, "unknown@example.org", 0)
                 .await
                 .unwrap(),
-            map_account_ids(base_store, vec!["jane"]).await
+            None
         );
         assert_eq!(
-            core.email_to_ids(&handle, "info+alias@example.org", 0)
+            core.email_to_id(&handle, "anything@catchall.org", 0)
                 .await
                 .unwrap(),
-            map_account_ids(base_store, vec!["bill", "jane", "john"]).await
-        );
-        assert_eq!(
-            core.email_to_ids(&handle, "unknown@example.org", 0)
-                .await
-                .unwrap(),
-            Vec::<u32>::new()
-        );
-        assert_eq!(
-            core.email_to_ids(&handle, "anything@catchall.org", 0)
-                .await
-                .unwrap(),
-            map_account_ids(base_store, vec!["robert"]).await
+            Some(map_account_id(base_store, "robert").await)
         );
 
         // Domain validation
@@ -241,21 +281,36 @@ async fn sql_directory() {
         assert!(!handle.is_local_domain("other.org").await.unwrap());
 
         // RCPT TO
-        assert!(core.rcpt(&handle, "jane@example.org", 0).await.unwrap());
-        assert!(core.rcpt(&handle, "info@example.org", 0).await.unwrap());
-        assert!(core
-            .rcpt(&handle, "jane+alias@example.org", 0)
-            .await
-            .unwrap());
-        assert!(core
-            .rcpt(&handle, "info+alias@example.org", 0)
-            .await
-            .unwrap());
-        assert!(core
-            .rcpt(&handle, "random_user@catchall.org", 0)
-            .await
-            .unwrap());
-        assert!(!core.rcpt(&handle, "invalid@example.org", 0).await.unwrap());
+        assert_eq!(
+            core.rcpt(&handle, "jane@example.org", 0).await.unwrap(),
+            RcptType::Mailbox
+        );
+        assert_eq!(
+            core.rcpt(&handle, "info@example.org", 0).await.unwrap(),
+            RcptType::Mailbox
+        );
+        assert_eq!(
+            core.rcpt(&handle, "jane+alias@example.org", 0)
+                .await
+                .unwrap(),
+            RcptType::Mailbox
+        );
+        assert_eq!(
+            core.rcpt(&handle, "info+alias@example.org", 0)
+                .await
+                .unwrap(),
+            RcptType::Mailbox
+        );
+        assert_eq!(
+            core.rcpt(&handle, "random_user@catchall.org", 0)
+                .await
+                .unwrap(),
+            RcptType::Mailbox
+        );
+        assert_eq!(
+            core.rcpt(&handle, "invalid@example.org", 0).await.unwrap(),
+            RcptType::Invalid
+        );
 
         // VRFY
         assert_eq!(
@@ -264,7 +319,10 @@ async fn sql_directory() {
         );
         assert_eq!(
             core.vrfy(&handle, "john", 0).await.unwrap(),
-            vec!["john@example.org".to_string()]
+            vec![
+                "john.doe@example.org".to_string(),
+                "john@example.org".to_string(),
+            ]
         );
         assert_eq!(
             core.vrfy(&handle, "jane+alias@example", 0).await.unwrap(),
@@ -279,19 +337,19 @@ async fn sql_directory() {
             Vec::<String>::new()
         );
 
-        // EXPN
-        assert_eq!(
+        // EXPN (now handled by the internal store)
+        /*assert_eq!(
             core.expn(&handle, "info@example.org", 0).await.unwrap(),
             vec![
-                "bill@example.org".to_string(),
-                "jane@example.org".to_string(),
-                "john@example.org".to_string()
+                "bill@example.org".into(),
+                "jane@example.org".into(),
+                "john@example.org".into()
             ]
         );
         assert_eq!(
             core.expn(&handle, "john@example.org", 0).await.unwrap(),
             Vec::<String>::new()
-        );
+        );*/
     }
 }
 
@@ -300,7 +358,7 @@ impl DirectoryStore {
         // Create tables
         for table in ["accounts", "group_members", "emails"] {
             self.store
-                .query::<usize>(&format!("DROP TABLE IF EXISTS {table}"), vec![])
+                .sql_query::<usize>(&format!("DROP TABLE IF EXISTS {table}"), vec![])
                 .await
                 .unwrap();
         }
@@ -323,11 +381,11 @@ impl DirectoryStore {
             let query = if self.is_mysql() {
                 query.replace("TEXT", "VARCHAR(255)")
             } else {
-                query.to_string()
+                query.into()
             };
 
             self.store
-                .query::<usize>(&query, vec![])
+                .sql_query::<usize>(&query, vec![])
                 .await
                 .unwrap_or_else(|_| panic!("failed for {query}"));
         }
@@ -340,21 +398,29 @@ impl DirectoryStore {
             "individual"
         };
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     concat!(
                         "INSERT INTO accounts (name, secret, description, ",
-                        "type, active) VALUES ($1, $2, $3, $4, true) ON CONFLICT (name) DO NOTHING"
+                        "type, active) VALUES ($1, $2, $3, $4, true) ",
+                        "ON CONFLICT (name) ",
+                        "DO UPDATE SET secret = $2, description = $3, type = $4, active = true"
                     )
                 } else if self.is_mysql() {
                     concat!(
-                        "INSERT IGNORE INTO accounts (name, secret, description, ",
-                        "type, active) VALUES (?, ?, ?, ?, true)"
+                        "INSERT INTO accounts (name, secret, description, ",
+                        "type, active) VALUES (?, ?, ?, ?, true) ",
+                        "ON DUPLICATE KEY UPDATE ",
+                        "secret = VALUES(secret), description = VALUES(description), ",
+                        "type = VALUES(type), active = true"
                     )
                 } else {
                     concat!(
-                        "INSERT OR IGNORE INTO accounts (name, secret, description, ",
-                        "type, active) VALUES (?, ?, ?, ?, true)"
+                        "INSERT INTO accounts (name, secret, description, ",
+                        "type, active) VALUES (?, ?, ?, ?, true) ",
+                        "ON CONFLICT(name) DO UPDATE SET ",
+                        "secret = excluded.secret, description = excluded.description, ",
+                        "type = excluded.type, active = true"
                     )
                 },
                 vec![
@@ -375,7 +441,7 @@ impl DirectoryStore {
 
     pub async fn create_test_group(&self, login: &str, name: &str) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     concat!(
                         "INSERT INTO accounts (name, description, ",
@@ -405,7 +471,7 @@ impl DirectoryStore {
 
     pub async fn link_test_address(&self, login: &str, address: &str, typ: &str) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     "INSERT INTO emails (name, address, type) VALUES ($1, $2, $3) ON CONFLICT (name, address) DO NOTHING"
                 } else if self.is_mysql() {
@@ -421,7 +487,7 @@ impl DirectoryStore {
 
     pub async fn set_test_quota(&self, login: &str, quota: u32) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     "UPDATE accounts SET quota = $1 where name = $2"
                 } else {
@@ -435,7 +501,7 @@ impl DirectoryStore {
 
     pub async fn add_to_group(&self, login: &str, group: &str) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     "INSERT INTO group_members (name, member_of) VALUES ($1, $2)"
                 } else {
@@ -449,7 +515,7 @@ impl DirectoryStore {
 
     pub async fn remove_from_group(&self, login: &str, group: &str) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     "DELETE FROM group_members WHERE name = $1 AND member_of = $2"
                 } else {
@@ -463,7 +529,7 @@ impl DirectoryStore {
 
     pub async fn remove_test_alias(&self, login: &str, alias: &str) {
         self.store
-            .query::<usize>(
+            .sql_query::<usize>(
                 if self.is_postgresql() {
                     "DELETE FROM emails WHERE name = $1 AND address = $2"
                 } else {
@@ -478,7 +544,7 @@ impl DirectoryStore {
     fn is_mysql(&self) -> bool {
         #[cfg(feature = "mysql")]
         {
-            matches!(self.store, LookupStore::Store(Store::MySQL(_)))
+            matches!(self.store, Store::MySQL(_))
         }
         #[cfg(not(feature = "mysql"))]
         {
@@ -489,7 +555,7 @@ impl DirectoryStore {
     fn is_postgresql(&self) -> bool {
         #[cfg(feature = "postgres")]
         {
-            matches!(self.store, LookupStore::Store(Store::PostgreSQL(_)))
+            matches!(self.store, Store::PostgreSQL(_))
         }
         #[cfg(not(feature = "postgres"))]
         {
@@ -501,7 +567,7 @@ impl DirectoryStore {
     fn is_sqlite(&self) -> bool {
         #[cfg(feature = "sqlite")]
         {
-            matches!(self.store, LookupStore::Store(Store::SQLite(_)))
+            matches!(self.store, Store::SQLite(_))
         }
         #[cfg(not(feature = "sqlite"))]
         {

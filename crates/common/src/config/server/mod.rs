@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -17,24 +17,24 @@ pub mod listener;
 pub mod tls;
 
 #[derive(Default)]
-pub struct Servers {
-    pub servers: Vec<Server>,
+pub struct Listeners {
+    pub servers: Vec<Listener>,
     pub tcp_acceptors: AHashMap<String, TcpAcceptor>,
     pub span_id_gen: Arc<SnowflakeIdGenerator>,
 }
 
 #[derive(Debug, Default)]
-pub struct Server {
+pub struct Listener {
     pub id: String,
     pub protocol: ServerProtocol,
-    pub listeners: Vec<Listener>,
+    pub listeners: Vec<TcpListener>,
     pub proxy_networks: Vec<IpAddrMask>,
     pub max_connections: u64,
     pub span_id_gen: Arc<SnowflakeIdGenerator>,
 }
 
 #[derive(Debug)]
-pub struct Listener {
+pub struct TcpListener {
     pub socket: TcpSocket,
     pub addr: SocketAddr,
     pub backlog: Option<u32>,
@@ -45,7 +45,7 @@ pub struct Listener {
     pub nodelay: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum ServerProtocol {
     #[default]
     Smtp,

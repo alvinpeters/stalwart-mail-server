@@ -1,12 +1,12 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::ipc::{bitset::Bitset, USIZE_BITS, USIZE_BITS_MASK};
+use crate::ipc::{USIZE_BITS, USIZE_BITS_MASK, bitset::Bitset};
 
 pub struct AtomicBitset<const N: usize>([AtomicUsize; N]);
 
@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     const TEST_SIZE: usize = 1000;
-    type TestBitset = AtomicBitset<{ (TEST_SIZE + USIZE_BITS - 1) / USIZE_BITS }>;
+    type TestBitset = AtomicBitset<{ TEST_SIZE.div_ceil(USIZE_BITS) }>;
     static BITSET: TestBitset = TestBitset::new();
 
     #[test]

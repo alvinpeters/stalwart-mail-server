@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,18 +7,20 @@
 use std::{fmt::Display, time::Duration};
 
 use deadpool::{
-    managed::{Manager, Pool},
     Runtime,
+    managed::{Manager, Pool},
 };
 use redis::{
+    Client, ProtocolVersion,
     cluster::{ClusterClient, ClusterClientBuilder},
-    Client,
 };
-use utils::config::{utils::AsKey, Config};
+use utils::config::{Config, utils::AsKey};
 
 pub mod lookup;
 pub mod pool;
+pub mod pubsub;
 
+#[derive(Debug)]
 pub struct RedisStore {
     pool: RedisPool,
 }
@@ -104,6 +106,13 @@ impl RedisStore {
                     if let Some(true) = config.property::<bool>((&prefix, "read-from-replicas")) {
                         builder = builder.read_from_replicas();
                     }
+                    if config
+                        .value((&prefix, "protocol-version"))
+                        .unwrap_or("resp2")
+                        == "resp3"
+                    {
+                        builder = builder.use_protocol(ProtocolVersion::RESP3);
+                    }
 
                     let client = builder
                         .build()
@@ -185,4 +194,13 @@ fn build_pool<M: Manager>(
 #[inline(always)]
 fn into_error(err: impl Display) -> trc::Error {
     trc::StoreEvent::RedisError.reason(err)
+}
+
+impl std::fmt::Debug for RedisPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(_) => f.debug_tuple("Single").finish(),
+            Self::Cluster(_) => f.debug_tuple("Cluster").finish(),
+        }
+    }
 }

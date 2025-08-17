@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -11,7 +11,7 @@ use utils::map::{
     vec_map::VecMap,
 };
 
-use super::{json::Parser, Ignore, JsonObjectParser, Token};
+use super::{Ignore, JsonObjectParser, Token, json::Parser};
 
 impl JsonObjectParser for u64 {
     fn parse(parser: &mut Parser<'_>) -> trc::Result<Self>
@@ -78,9 +78,7 @@ impl JsonObjectParser for String {
                             }
                             b'"' if !is_escaped => {
                                 parser.is_eof = true;
-                                return String::from_utf8(buf)
-                                    .map(Into::into)
-                                    .map_err(|_| parser.error_utf8());
+                                return String::from_utf8(buf).map_err(|_| parser.error_utf8());
                             }
                             _ => {
                                 if !is_escaped {

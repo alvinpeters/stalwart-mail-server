@@ -1,30 +1,29 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use crate::core::{Command, ResponseCode, Session, StatusResponse};
+use common::{listener::SessionStream, storage::index::ObjectIndexBuilder};
+use directory::Permission;
+use email::sieve::SieveScript;
 use imap_proto::receiver::Request;
-use jmap::sieve::set::{ObjectBlobId, SCHEMA};
-use jmap_proto::{
-    object::{index::ObjectIndexBuilder, Object},
-    types::{blob::BlobId, collection::Collection, property::Property, value::Value},
-};
+use jmap_proto::types::{collection::Collection, property::Property};
 use sieve::compiler::ErrorType;
+use std::time::Instant;
 use store::{
+    Serialize,
     query::Filter,
-    write::{assert::HashedValue, log::LogInsert, BatchBuilder, BlobOp, DirectoryClass},
-    BlobClass,
+    write::{Archiver, BatchBuilder},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use trc::AddContext;
 
-use crate::core::{Command, ResponseCode, Session, StatusResponse};
-
-impl<T: AsyncRead + AsyncWrite> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn handle_putscript(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
+        // Validate access
+        self.assert_has_permission(Permission::SievePutScript)?;
+
         let op_start = Instant::now();
         let mut tokens = request.tokens.into_iter();
         let name = tokens
@@ -48,25 +47,21 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
         let script_size = script_bytes.len() as i64;
 
         // Check quota
-        let access_token = self.state.access_token();
-        let account_id = access_token.primary_id();
-        self.jmap
-            .has_available_quota(
-                account_id,
-                access_token.quota as i64,
-                script_bytes.len() as i64,
-            )
+        let resource_token = self.state.access_token().as_resource_token();
+        let account_id = resource_token.account_id;
+        self.server
+            .has_available_quota(&resource_token, script_bytes.len() as u64)
             .await
             .caused_by(trc::location!())?;
 
         if self
-            .jmap
+            .server
             .get_document_ids(account_id, Collection::SieveScript)
             .await
             .caused_by(trc::location!())?
             .map(|ids| ids.len() as usize)
             .unwrap_or(0)
-            > self.jmap.core.jmap.sieve_max_scripts
+            > self.server.core.jmap.sieve_max_scripts
         {
             return Err(trc::ManageSieveEvent::Error
                 .into_err()
@@ -76,14 +71,19 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
 
         // Compile script
         match self
-            .jmap
+            .server
             .core
             .sieve
             .untrusted_compiler
             .compile(&script_bytes)
         {
             Ok(compiled_script) => {
-                script_bytes.extend(bincode::serialize(&compiled_script).unwrap_or_default());
+                script_bytes.extend(
+                    Archiver::new(compiled_script)
+                        .untrusted()
+                        .serialize()
+                        .caused_by(trc::location!())?,
+                );
             }
             Err(err) => {
                 return Err(if let ErrorType::ScriptTooLong = &err.error_type() {
@@ -102,14 +102,9 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
         // Validate name
         if let Some(document_id) = self.validate_name(account_id, &name).await? {
             // Obtain script values
-            let script = self
-                .jmap
-                .get_property::<HashedValue<Object<Value>>>(
-                    account_id,
-                    Collection::SieveScript,
-                    document_id,
-                    Property::Value,
-                )
+            let script_ = self
+                .server
+                .get_archive(account_id, Collection::SieveScript, document_id)
                 .await
                 .caused_by(trc::location!())?
                 .ok_or_else(|| {
@@ -118,27 +113,17 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
                         .details("Script not found")
                         .code(ResponseCode::NonExistent)
                 })?;
-            let prev_blob_id = script.inner.blob_id().ok_or_else(|| {
-                trc::ManageSieveEvent::Error
-                    .into_err()
-                    .details("Internal error while obtaining blobId")
-                    .code(ResponseCode::TryLater)
-            })?;
+            let script = script_
+                .to_unarchived::<SieveScript>()
+                .caused_by(trc::location!())?;
 
             // Write script blob
-            let blob_id = BlobId::new(
-                self.jmap
-                    .put_blob(account_id, &script_bytes, false)
-                    .await
-                    .caused_by(trc::location!())?
-                    .hash,
-                BlobClass::Linked {
-                    account_id,
-                    collection: Collection::SieveScript.into(),
-                    document_id,
-                },
-            )
-            .with_section_size(script_size as usize);
+            let blob_hash = self
+                .server
+                .put_blob(account_id, &script_bytes, false)
+                .await
+                .caused_by(trc::location!())?
+                .hash;
 
             // Write record
             let mut batch = BatchBuilder::new();
@@ -146,37 +131,22 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
                 .with_account_id(account_id)
                 .with_collection(Collection::SieveScript)
                 .update_document(document_id)
-                .clear(BlobOp::Link {
-                    hash: prev_blob_id.hash.clone(),
-                })
-                .set(
-                    BlobOp::Link {
-                        hash: blob_id.hash.clone(),
-                    },
-                    Vec::new(),
-                );
+                .custom(
+                    ObjectIndexBuilder::new()
+                        .with_changes(
+                            script
+                                .deserialize()
+                                .caused_by(trc::location!())?
+                                .with_size(script_size as u32)
+                                .with_blob_hash(blob_hash.clone()),
+                        )
+                        .with_current(script)
+                        .with_tenant_id(&resource_token),
+                )
+                .caused_by(trc::location!())?;
 
-            // Update quota
-            let prev_script_size = prev_blob_id.section.as_ref().unwrap().size as i64;
-            let update_quota = match script_size.cmp(&prev_script_size) {
-                std::cmp::Ordering::Greater => script_size - prev_script_size,
-                std::cmp::Ordering::Less => -prev_script_size + script_size,
-                std::cmp::Ordering::Equal => 0,
-            };
-            if update_quota != 0 {
-                batch.add(DirectoryClass::UsedQuota(account_id), update_quota);
-            }
-
-            batch.custom(
-                ObjectIndexBuilder::new(SCHEMA)
-                    .with_current(script)
-                    .with_changes(
-                        Object::with_capacity(1)
-                            .with_property(Property::BlobId, Value::BlobId(blob_id)),
-                    ),
-            );
-            self.jmap
-                .write_batch(batch)
+            self.server
+                .commit_batch(batch)
                 .await
                 .caused_by(trc::location!())?;
 
@@ -190,44 +160,37 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
             );
         } else {
             // Write script blob
-            let blob_id = BlobId::new(
-                self.jmap
-                    .put_blob(account_id, &script_bytes, false)
-                    .await?
-                    .hash,
-                BlobClass::Linked {
-                    account_id,
-                    collection: Collection::SieveScript.into(),
-                    document_id: 0,
-                },
-            )
-            .with_section_size(script_size as usize);
+            let blob_hash = self
+                .server
+                .put_blob(account_id, &script_bytes, false)
+                .await?
+                .hash;
 
             // Write record
             let mut batch = BatchBuilder::new();
+            let document_id = self
+                .server
+                .store()
+                .assign_document_ids(account_id, Collection::SieveScript, 1)
+                .await
+                .caused_by(trc::location!())?;
             batch
                 .with_account_id(account_id)
                 .with_collection(Collection::SieveScript)
-                .create_document()
-                .log(LogInsert())
-                .add(DirectoryClass::UsedQuota(account_id), script_size)
-                .set(
-                    BlobOp::Link {
-                        hash: blob_id.hash.clone(),
-                    },
-                    Vec::new(),
-                )
+                .create_document(document_id)
                 .custom(
-                    ObjectIndexBuilder::new(SCHEMA).with_changes(
-                        Object::with_capacity(3)
-                            .with_property(Property::Name, name.clone())
-                            .with_property(Property::IsActive, Value::Bool(false))
-                            .with_property(Property::BlobId, Value::BlobId(blob_id)),
-                    ),
-                );
-            let assigned_ids = self
-                .jmap
-                .write_batch(batch)
+                    ObjectIndexBuilder::<(), _>::new()
+                        .with_changes(
+                            SieveScript::new(name.clone(), blob_hash.clone())
+                                .with_is_active(false)
+                                .with_size(script_size as u32),
+                        )
+                        .with_tenant_id(&resource_token),
+                )
+                .caused_by(trc::location!())?;
+
+            self.server
+                .commit_batch(batch)
                 .await
                 .caused_by(trc::location!())?;
 
@@ -235,7 +198,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
                 ManageSieve(trc::ManageSieveEvent::CreateScript),
                 SpanId = self.session_id,
                 Id = name,
-                DocumentId = assigned_ids.last_document_id().ok(),
+                DocumentId = document_id,
                 Elapsed = op_start.elapsed()
             );
         }
@@ -248,7 +211,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
             Err(trc::ManageSieveEvent::Error
                 .into_err()
                 .details("Script name cannot be empty."))
-        } else if name.len() > self.jmap.core.jmap.sieve_max_script_name {
+        } else if name.len() > self.server.core.jmap.sieve_max_script_name {
             Err(trc::ManageSieveEvent::Error
                 .into_err()
                 .details("Script name is too long."))
@@ -258,11 +221,12 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
                 .details("The 'vacation' name is reserved, please use a different name."))
         } else {
             Ok(self
-                .jmap
+                .server
+                .store()
                 .filter(
                     account_id,
                     Collection::SieveScript,
-                    vec![Filter::eq(Property::Name, name)],
+                    vec![Filter::eq(Property::Name, name.to_lowercase().into_bytes())],
                 )
                 .await
                 .caused_by(trc::location!())?

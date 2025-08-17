@@ -1,88 +1,79 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess},
+    mailbox::{INBOX_ID, JUNK_ID},
+};
+use jmap_proto::types::{collection::Collection, id::Id};
 use std::time::Duration;
 
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::mailbox::{INBOX_ID, JUNK_ID};
-use jmap_proto::types::{collection::Collection, id::Id, property::Property};
-
+use super::JMAPTest;
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{assert_is_empty, mailbox::destroy_all_mailboxes},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf},
     net::TcpStream,
 };
-
-use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes};
-
-use super::JMAPTest;
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running message delivery tests...");
 
     // Create a domain name and a test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("jane@example.com", "abcdef", "Jane Smith")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("bill@example.com", "098765", "Bill Foobar")
-        .await;
-    let account_id_1 = Id::from(
-        server
-            .core
-            .storage
-            .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    let account_id_2 = Id::from(
-        server
-            .core
-            .storage
-            .data
-            .get_or_create_account_id("jane@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    let account_id_3 = Id::from(
-        server
-            .core
-            .storage
-            .data
-            .get_or_create_account_id("bill@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "john.doe@example.com", "alias")
-        .await;
+    let mut account_id_1 = String::new();
+    let mut account_id_2 = String::new();
+    let mut account_id_3 = String::new();
+
+    for (id, email, password, name, aliases) in [
+        (
+            &mut account_id_1,
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+            Some(&["jdoe@example.com", "john.doe@example.com"][..]),
+        ),
+        (
+            &mut account_id_2,
+            "jane@example.com",
+            "abcdef",
+            "Jane Smith",
+            None,
+        ),
+        (
+            &mut account_id_3,
+            "bill@example.com",
+            "098765",
+            "Bill Foobar",
+            None,
+        ),
+    ] {
+        *id = Id::from(
+            server
+                .core
+                .storage
+                .data
+                .create_test_user(email, password, name, aliases.unwrap_or(&[email][..]))
+                .await,
+        )
+        .to_string();
+    }
 
     // Create a mailing list
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "members@example.com", "list")
-        .await;
-    params
-        .directory
-        .link_test_address("jane@example.com", "members@example.com", "list")
-        .await;
-    params
-        .directory
-        .link_test_address("bill@example.com", "members@example.com", "list")
+    server
+        .core
+        .storage
+        .data
+        .create_test_list(
+            "members@example.com",
+            "Mailing List",
+            &["jdoe@example.com", "jane@example.com", "bill@example.com"],
+        )
         .await;
 
     // Delivering to individuals
@@ -107,6 +98,8 @@ pub async fn test(params: &mut JMAPTest) {
     let john_id = Id::from_bytes(account_id_1.as_bytes())
         .unwrap()
         .document_id();
+    let john_cache = server.get_cached_messages(john_id).await.unwrap();
+
     assert_eq!(
         server
             .get_document_ids(john_id, Collection::Email)
@@ -116,23 +109,8 @@ pub async fn test(params: &mut JMAPTest) {
             .len(),
         1
     );
-    assert_eq!(
-        server
-            .get_tag(john_id, Collection::Email, Property::MailboxIds, INBOX_ID)
-            .await
-            .unwrap()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        server
-            .get_tag(john_id, Collection::Email, Property::MailboxIds, JUNK_ID)
-            .await
-            .unwrap()
-            .map_or(0, |bm| bm.len()),
-        0
-    );
+    assert_eq!(john_cache.in_mailbox(INBOX_ID).count(), 1);
+    assert_eq!(john_cache.in_mailbox(JUNK_ID).count(), 0);
 
     // Delivering to individuals' aliases
     lmtp.ingest(
@@ -150,6 +128,7 @@ pub async fn test(params: &mut JMAPTest) {
         ),
     )
     .await;
+    let john_cache = server.get_cached_messages(john_id).await.unwrap();
 
     assert_eq!(
         server
@@ -160,24 +139,8 @@ pub async fn test(params: &mut JMAPTest) {
             .len(),
         2
     );
-    assert_eq!(
-        server
-            .get_tag(john_id, Collection::Email, Property::MailboxIds, INBOX_ID)
-            .await
-            .unwrap()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        server
-            .get_tag(john_id, Collection::Email, Property::MailboxIds, JUNK_ID)
-            .await
-            .unwrap()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(john_cache.in_mailbox(INBOX_ID).count(), 1);
+    assert_eq!(john_cache.in_mailbox(JUNK_ID).count(), 1);
 
     // EXPN and VRFY
     lmtp.expn("members@example.com", 2)
@@ -225,8 +188,11 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Removing members from the mailing list and chunked ingest
     params
-        .directory
-        .remove_test_alias("jdoe@example.com", "members@example.com")
+        .server
+        .core
+        .storage
+        .data
+        .remove_from_group("jdoe@example.com", "members@example.com")
         .await;
     lmtp.ingest_chunked(
         "bill@example.com",
@@ -485,6 +451,7 @@ impl SmtpConnection {
         //let c = println!("-> {:?}", text);
         self.writer.write_all(text.as_bytes()).await.unwrap();
         self.writer.write_all(b"\r\n").await.unwrap();
+        self.writer.flush().await.unwrap();
     }
 
     pub async fn send_raw(&mut self, text: &str) {

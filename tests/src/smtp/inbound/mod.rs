@@ -1,26 +1,29 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::time::Duration;
 
+use common::{
+    Server,
+    ipc::{DmarcEvent, QueueEvent, QueueEventStatus, ReportingEvent, TlsEvent},
+};
 use store::{
-    write::{key::DeserializeBigEndian, Bincode, QueueClass, QueueEvent, ReportEvent, ValueClass},
-    Deserialize, IterateParams, ValueKey, U64_LEN,
+    Deserialize, IterateParams, U64_LEN, ValueKey,
+    write::{
+        AlignedBytes, Archive, QueueClass, ReportEvent, ValueClass, key::DeserializeBigEndian,
+    },
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
-use smtp::{
-    core::SMTP,
-    queue::{self, spool::QueueEventLock, DeliveryAttempt, Message, OnHold, QueueId},
-    reporting::{self, DmarcEvent, TlsEvent},
-};
+use smtp::queue::{Message, MessageWrapper, QueueId, QueuedMessage};
 
 use super::{QueueReceiver, ReportReceiver};
 
 pub mod antispam;
+pub mod asn;
 pub mod auth;
 pub mod basic;
 pub mod data;
@@ -37,7 +40,7 @@ pub mod throttle;
 pub mod vrfy;
 
 impl QueueReceiver {
-    pub async fn read_event(&mut self) -> queue::Event {
+    pub async fn read_event(&mut self) -> QueueEvent {
         match tokio::time::timeout(Duration::from_millis(100), self.queue_rx.recv()).await {
             Ok(Some(event)) => event,
             Ok(None) => panic!("Channel closed."),
@@ -45,7 +48,7 @@ impl QueueReceiver {
         }
     }
 
-    pub async fn try_read_event(&mut self) -> Option<queue::Event> {
+    pub async fn try_read_event(&mut self) -> Option<QueueEvent> {
         match tokio::time::timeout(Duration::from_millis(100), self.queue_rx.recv()).await {
             Ok(Some(event)) => Some(event),
             Ok(None) => panic!("Channel closed."),
@@ -115,54 +118,63 @@ impl QueueReceiver {
         }
     }
 
-    pub async fn expect_message(&mut self) -> Message {
-        self.read_event().await.assert_reload();
+    pub async fn expect_message(&mut self) -> MessageWrapper {
+        self.read_event().await.assert_refresh();
         self.last_queued_message().await
     }
 
-    pub async fn consume_message(&mut self, core: &SMTP) -> Message {
-        self.read_event().await.assert_reload();
+    pub async fn consume_message(&mut self, server: &Server) -> MessageWrapper {
+        self.read_event().await.assert_refresh();
         let message = self.last_queued_message().await;
         message
             .clone()
-            .remove(core, self.last_queued_due().await)
+            .remove(server, self.last_queued_due().await.into())
             .await;
         message
     }
 
-    pub async fn expect_message_then_deliver(&mut self) -> DeliveryAttempt {
+    pub async fn expect_message_then_deliver(&mut self) -> QueuedMessage {
         let message = self.expect_message().await;
 
         self.delivery_attempt(message.queue_id).await
     }
 
-    pub async fn delivery_attempt(&mut self, queue_id: u64) -> DeliveryAttempt {
-        DeliveryAttempt::new(QueueEventLock {
+    pub async fn delivery_attempt(&mut self, queue_id: u64) -> QueuedMessage {
+        QueuedMessage {
             due: self.message_due(queue_id).await,
             queue_id,
-            lock_expiry: 0,
-        })
+            queue_name: Default::default(),
+        }
     }
 
-    pub async fn read_queued_events(&self) -> Vec<QueueEvent> {
+    pub async fn read_queued_events(&self) -> Vec<store::write::QueueEvent> {
         let mut events = Vec::new();
 
-        let from_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
-            due: 0,
-            queue_id: 0,
-        })));
-        let to_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
-            due: u64::MAX,
-            queue_id: u64::MAX,
-        })));
+        let from_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(
+            store::write::QueueEvent {
+                due: 0,
+                queue_id: 0,
+                queue_name: [0; 8],
+            },
+        )));
+        let to_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(
+            store::write::QueueEvent {
+                due: u64::MAX,
+                queue_id: u64::MAX,
+                queue_name: [u8::MAX; 8],
+            },
+        )));
 
         self.store
             .iterate(
                 IterateParams::new(from_key, to_key).ascending().no_values(),
                 |key, _| {
-                    events.push(QueueEvent {
+                    events.push(store::write::QueueEvent {
                         due: key.deserialize_be_u64(0)?,
                         queue_id: key.deserialize_be_u64(U64_LEN)?,
+                        queue_name: key[U64_LEN + 1..U64_LEN + 9]
+                            .try_into()
+                            .expect("Queue name must be 8 bytes"),
                     });
                     Ok(true)
                 },
@@ -173,7 +185,7 @@ impl QueueReceiver {
         events
     }
 
-    pub async fn read_queued_messages(&self) -> Vec<Message> {
+    pub async fn read_queued_messages(&self) -> Vec<MessageWrapper> {
         let from_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(0)));
         let to_key = ValueKey::from(ValueClass::Queue(QueueClass::Message(u64::MAX)));
         let mut messages = Vec::new();
@@ -182,9 +194,14 @@ impl QueueReceiver {
             .iterate(
                 IterateParams::new(from_key, to_key).descending(),
                 |key, value| {
-                    let value = Bincode::<Message>::deserialize(value)?;
-                    assert_eq!(key.deserialize_be_u64(0)?, value.inner.queue_id);
-                    messages.push(value.inner);
+                    messages.push(MessageWrapper {
+                        queue_id: key.deserialize_be_u64(0)?,
+                        queue_name: Default::default(),
+                        is_multi_queue: false,
+                        span_id: 0,
+                        message: <Archive<AlignedBytes> as Deserialize>::deserialize(value)?
+                            .deserialize::<Message>()?,
+                    });
                     Ok(true)
                 },
             )
@@ -234,7 +251,7 @@ impl QueueReceiver {
         events
     }
 
-    pub async fn last_queued_message(&self) -> Message {
+    pub async fn last_queued_message(&self) -> MessageWrapper {
         self.read_queued_messages()
             .await
             .into_iter()
@@ -261,16 +278,16 @@ impl QueueReceiver {
             .expect("No event found in queue for message")
     }
 
-    pub async fn clear_queue(&self, core: &SMTP) {
+    pub async fn clear_queue(&self, server: &Server) {
         for message in self.read_queued_messages().await {
             let due = self.message_due(message.queue_id).await;
-            message.remove(core, due).await;
+            message.remove(server, due.into()).await;
         }
     }
 }
 
 impl ReportReceiver {
-    pub async fn read_report(&mut self) -> reporting::Event {
+    pub async fn read_report(&mut self) -> ReportingEvent {
         match tokio::time::timeout(Duration::from_millis(100), self.report_rx.recv()).await {
             Ok(Some(event)) => event,
             Ok(None) => panic!("Channel closed."),
@@ -278,7 +295,7 @@ impl ReportReceiver {
         }
     }
 
-    pub async fn try_read_report(&mut self) -> Option<reporting::Event> {
+    pub async fn try_read_report(&mut self) -> Option<ReportingEvent> {
         match tokio::time::timeout(Duration::from_millis(100), self.report_rx.recv()).await {
             Ok(Some(event)) => Some(event),
             Ok(None) => panic!("Channel closed."),
@@ -295,21 +312,39 @@ impl ReportReceiver {
 }
 
 pub trait TestQueueEvent {
-    fn assert_reload(self);
-    fn unwrap_on_hold(self) -> OnHold<QueueEventLock>;
+    fn assert_refresh(self);
+    fn assert_done(self);
+    fn assert_refresh_or_done(self);
 }
 
-impl TestQueueEvent for queue::Event {
-    fn assert_reload(self) {
+impl TestQueueEvent for QueueEvent {
+    fn assert_refresh(self) {
         match self {
-            queue::Event::Reload => (),
+            QueueEvent::Refresh
+            | QueueEvent::WorkerDone {
+                status: QueueEventStatus::Deferred,
+                ..
+            } => (),
             e => panic!("Unexpected event: {e:?}"),
         }
     }
 
-    fn unwrap_on_hold(self) -> OnHold<QueueEventLock> {
+    fn assert_done(self) {
         match self {
-            queue::Event::OnHold(value) => value,
+            QueueEvent::WorkerDone {
+                status: QueueEventStatus::Completed,
+                ..
+            } => (),
+            e => panic!("Unexpected event: {e:?}"),
+        }
+    }
+
+    fn assert_refresh_or_done(self) {
+        match self {
+            QueueEvent::WorkerDone {
+                status: QueueEventStatus::Completed | QueueEventStatus::Deferred,
+                ..
+            } => (),
             e => panic!("Unexpected event: {e:?}"),
         }
     }
@@ -320,17 +355,17 @@ pub trait TestReportingEvent {
     fn unwrap_tls(self) -> Box<TlsEvent>;
 }
 
-impl TestReportingEvent for reporting::Event {
+impl TestReportingEvent for ReportingEvent {
     fn unwrap_dmarc(self) -> Box<DmarcEvent> {
         match self {
-            reporting::Event::Dmarc(event) => event,
+            ReportingEvent::Dmarc(event) => event,
             e => panic!("Unexpected event: {e:?}"),
         }
     }
 
     fn unwrap_tls(self) -> Box<TlsEvent> {
         match self {
-            reporting::Event::Tls(event) => event,
+            ReportingEvent::Tls(event) => event,
             e => panic!("Unexpected event: {e:?}"),
         }
     }
@@ -342,11 +377,11 @@ pub trait TestMessage {
     async fn read_lines(&self, core: &QueueReceiver) -> Vec<String>;
 }
 
-impl TestMessage for Message {
+impl TestMessage for MessageWrapper {
     async fn read_message(&self, core: &QueueReceiver) -> String {
         String::from_utf8(
             core.blob_store
-                .get_blob(self.blob_hash.as_slice(), 0..usize::MAX)
+                .get_blob(self.message.blob_hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()
                 .expect("Message blob not found"),

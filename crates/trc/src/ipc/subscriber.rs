@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -11,15 +11,15 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use crate::{Event, EventDetails, EventType, Level, TOTAL_EVENT_COUNT};
 
 use super::{
+    USIZE_BITS,
     bitset::Bitset,
     channel::ChannelError,
-    collector::{Collector, Update, COLLECTOR_UPDATES},
-    USIZE_BITS,
+    collector::{COLLECTOR_UPDATES, Collector, Update},
 };
 
 const MAX_BATCH_SIZE: usize = 32768;
 
-pub type Interests = Box<Bitset<{ (TOTAL_EVENT_COUNT + USIZE_BITS - 1) / USIZE_BITS }>>;
+pub type Interests = Box<Bitset<{ TOTAL_EVENT_COUNT.div_ceil(USIZE_BITS) }>>;
 pub type EventBatch = Vec<Arc<Event<EventDetails>>>;
 
 #[derive(Debug)]

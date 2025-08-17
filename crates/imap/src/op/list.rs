@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -11,16 +11,19 @@ use crate::{
     spawn_op,
 };
 use common::listener::SessionStream;
+
+use directory::Permission;
 use imap_proto::{
+    Command, StatusResponse,
     protocol::{
+        ImapResponse, ProtocolVersion,
         list::{
             self, Arguments, Attribute, ChildInfo, ListItem, ReturnOption, SelectionOption, Tag,
         },
-        ImapResponse, ProtocolVersion,
     },
     receiver::Request,
-    Command, StatusResponse,
 };
+use trc::StoreEvent;
 
 use super::ImapContext;
 
@@ -30,8 +33,14 @@ impl<T: SessionStream> Session<T> {
         let command = request.command;
         let is_lsub = command == Command::Lsub;
         let arguments = if !is_lsub {
+            // Validate access
+            self.assert_has_permission(Permission::ImapList)?;
+
             request.parse_list(self.version)
         } else {
+            // Validate access
+            self.assert_has_permission(Permission::ImapLsub)?;
+
             request.parse_lsub()
         }?;
 
@@ -49,7 +58,7 @@ impl<T: SessionStream> Session<T> {
                             is_rev2: self.version.is_rev2(),
                             is_lsub,
                             list_items: vec![ListItem {
-                                mailbox_name: String::new(),
+                                mailbox_name: "".into(),
                                 attributes: vec![Attribute::NoSelect],
                                 tags: vec![],
                             }],
@@ -166,10 +175,10 @@ impl<T: SessionStream> SessionData<T> {
             if let Some(prefix) = &account.prefix {
                 if !added_shared_folder {
                     if !filter_subscribed
-                        && matches_pattern(&patterns, &self.jmap.core.jmap.shared_folder)
+                        && matches_pattern(&patterns, &self.server.core.jmap.shared_folder)
                     {
                         list_items.push(ListItem {
-                            mailbox_name: self.jmap.core.jmap.shared_folder.clone(),
+                            mailbox_name: self.server.core.jmap.shared_folder.as_str().into(),
                             attributes: if include_children {
                                 vec![Attribute::HasChildren, Attribute::NoSelect]
                             } else {
@@ -195,7 +204,22 @@ impl<T: SessionStream> SessionData<T> {
 
             for (mailbox_name, mailbox_id) in &account.mailbox_names {
                 if matches_pattern(&patterns, mailbox_name) {
-                    let mailbox = account.mailbox_state.get(mailbox_id).unwrap();
+                    let mailbox = if let Some(mailbox) = account.mailbox_state.get(mailbox_id) {
+                        mailbox
+                    } else {
+                        trc::event!(
+                            Store(StoreEvent::UnexpectedError),
+                            Details = "IMAP mailbox no longer present in account state",
+                            Id = *mailbox_id,
+                            Details = account
+                                .mailbox_state
+                                .keys()
+                                .copied()
+                                .map(trc::Value::from)
+                                .collect::<Vec<_>>()
+                        );
+                        continue;
+                    };
                     let mut has_recursive_match = false;
                     if recursive_match {
                         let prefix = format!("{}/", mailbox_name);
@@ -246,7 +270,7 @@ impl<T: SessionStream> SessionData<T> {
         if let Some(include_status) = include_status {
             for list_item in &list_items {
                 match self
-                    .status(list_item.mailbox_name.to_string(), include_status)
+                    .status(list_item.mailbox_name.clone(), include_status)
                     .await
                     .imap_ctx(&tag, trc::location!())
                 {
@@ -309,7 +333,7 @@ pub fn matches_pattern(patterns: &[String], mailbox_name: &str) -> bool {
         'inner: while let Some((pos, &ch)) = pattern_bytes.next() {
             if ch == b'%' || ch == b'*' {
                 let mut end_pos = pos;
-                while let Some((_, &next_ch)) = pattern_bytes.peek() {
+                while let Some(&(_, &next_ch)) = pattern_bytes.peek() {
                     if next_ch == b'%' || next_ch == b'*' {
                         break;
                     } else {

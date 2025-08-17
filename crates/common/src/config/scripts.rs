@@ -1,23 +1,23 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{
-    collections::HashSet,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use ahash::AHashMap;
-use nlp::bayes::cache::BayesTokenCache;
-use parking_lot::RwLock;
-use sieve::{compiler::grammar::Capability, Compiler, Runtime, Sieve};
+use sieve::{Compiler, Runtime, Sieve, compiler::grammar::Capability};
 use store::Stores;
 use utils::config::Config;
 
-use crate::scripts::{functions::register_functions, plugins::RegisterSievePlugins};
+use crate::{
+    VERSION_PUBLIC,
+    scripts::{
+        functions::{register_functions_trusted, register_functions_untrusted},
+        plugins::RegisterSievePlugins,
+    },
+};
 
 use super::{if_block::IfBlock, smtp::SMTP_RCPT_TO_VARS, tokenizer::TokenMap};
 
@@ -29,23 +29,14 @@ pub struct Scripting {
     pub from_name: IfBlock,
     pub return_path: IfBlock,
     pub sign: IfBlock,
-    pub scripts: AHashMap<String, Arc<Sieve>>,
-}
-
-pub struct ScriptCache {
-    pub bayes_cache: BayesTokenCache,
-    pub remote_lists: RwLock<AHashMap<String, RemoteList>>,
-}
-
-#[derive(Clone)]
-pub struct RemoteList {
-    pub entries: HashSet<String>,
-    pub expires: Instant,
+    pub trusted_scripts: AHashMap<String, Arc<Sieve>>,
+    pub untrusted_scripts: AHashMap<String, Arc<Sieve>>,
 }
 
 impl Scripting {
     pub async fn parse(config: &mut Config, stores: &Stores) -> Self {
         // Parse untrusted compiler
+        let mut fnc_map_untrusted = register_functions_untrusted().register_plugins_untrusted();
         let untrusted_compiler = Compiler::new()
             .with_max_script_size(
                 config
@@ -96,10 +87,12 @@ impl Scripting {
                 config
                     .property("sieve.untrusted.limits.includes")
                     .unwrap_or(3),
-            );
+            )
+            .register_functions(&mut fnc_map_untrusted);
 
         // Parse untrusted runtime
         let untrusted_runtime = Runtime::new()
+            .with_functions(&mut fnc_map_untrusted)
             .with_max_nested_includes(
                 config
                     .property("sieve.untrusted.limits.nested-includes")
@@ -147,6 +140,7 @@ impl Scripting {
                     .unwrap_or(Duration::from_secs(7 * 86400))
                     .as_secs(),
             )
+            .with_capability(Capability::Expressions)
             .without_capabilities(
                 config
                     .values("sieve.untrusted.disable-capabilities")
@@ -191,13 +185,13 @@ impl Scripting {
                     .unwrap_or("Auto: ")
                     .to_string(),
             )
-            .with_env_variable("name", "Stalwart Mail Server")
-            .with_env_variable("version", env!("CARGO_PKG_VERSION"))
+            .with_env_variable("name", "Stalwart Server")
+            .with_env_variable("version", VERSION_PUBLIC)
             .with_env_variable("location", "MS")
             .with_env_variable("phase", "during");
 
         // Parse trusted compiler and runtime
-        let mut fnc_map = register_functions().register_plugins();
+        let mut fnc_map_trusted = register_functions_trusted().register_plugins_trusted();
 
         // Allocate compiler and runtime
         let trusted_compiler = Compiler::new()
@@ -214,7 +208,7 @@ impl Scripting {
                     .property_or_default("sieve.trusted.no-capability-check", "true")
                     .unwrap_or(true),
             )
-            .register_functions(&mut fnc_map);
+            .register_functions(&mut fnc_map_trusted);
 
         let mut trusted_runtime = Runtime::new()
             .without_capabilities([
@@ -238,8 +232,8 @@ impl Scripting {
             )
             .with_max_header_size(10240)
             .with_valid_notification_uri("mailto")
-            .with_valid_ext_lists(stores.lookup_stores.keys().map(|k| k.to_string()))
-            .with_functions(&mut fnc_map)
+            .with_valid_ext_lists(stores.in_memory_stores.keys().map(|k| k.to_string()))
+            .with_functions(&mut fnc_map_trusted)
             .with_max_redirects(
                 config
                     .property_or_default("sieve.trusted.limits.redirects", "3")
@@ -274,18 +268,14 @@ impl Scripting {
 
         let hostname = config
             .value("sieve.trusted.hostname")
-            .or_else(|| config.value("lookup.default.hostname"))
+            .or_else(|| config.value("server.hostname"))
             .unwrap_or("localhost")
             .to_string();
         trusted_runtime.set_local_hostname(hostname.clone());
 
-        // Parse scripts
-        let mut scripts = AHashMap::new();
-        for id in config
-            .sub_keys("sieve.trusted.scripts", ".contents")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        // Parse trusted scripts
+        let mut trusted_scripts = AHashMap::new();
+        for id in config.sub_keys("sieve.trusted.scripts", ".contents") {
             match trusted_compiler.compile(
                 config
                     .value(("sieve.trusted.scripts", id.as_str(), "contents"))
@@ -293,11 +283,30 @@ impl Scripting {
                     .as_bytes(),
             ) {
                 Ok(compiled) => {
-                    scripts.insert(id, compiled.into());
+                    trusted_scripts.insert(id, compiled.into());
                 }
                 Err(err) => config.new_build_error(
                     ("sieve.trusted.scripts", id.as_str(), "contents"),
-                    format!("Failed to compile Sieve script: {err}"),
+                    format!("Failed to compile trusted Sieve script: {err}"),
+                ),
+            }
+        }
+
+        // Parse untrusted scripts
+        let mut untrusted_scripts = AHashMap::new();
+        for id in config.sub_keys("sieve.untrusted.scripts", ".contents") {
+            match untrusted_compiler.compile(
+                config
+                    .value(("sieve.untrusted.scripts", id.as_str(), "contents"))
+                    .unwrap()
+                    .as_bytes(),
+            ) {
+                Ok(compiled) => {
+                    untrusted_scripts.insert(id, compiled.into());
+                }
+                Err(err) => config.new_build_error(
+                    ("sieve.untrusted.scripts", id.as_str(), "contents"),
+                    format!("Failed to compile untrusted Sieve script: {err}"),
                 ),
             }
         }
@@ -313,7 +322,7 @@ impl Scripting {
                     IfBlock::new::<()>(
                         "sieve.trusted.from-addr",
                         [],
-                        "'MAILER-DAEMON@' + key_get('default', 'domain')",
+                        "'MAILER-DAEMON@' + config_get('report.domain')",
                     )
                 }),
             from_name: IfBlock::try_parse(config, "sieve.trusted.from-name", &token_map)
@@ -328,32 +337,14 @@ impl Scripting {
                         "sieve.trusted.sign",
                         [],
                         concat!(
-                            "['rsa-' + key_get('default', 'domain'), ",
-                            "'ed25519-' + key_get('default', 'domain')]"
+                            "['rsa-' + config_get('report.domain'), ",
+                            "'ed25519-' + config_get('report.domain')]"
                         ),
                     )
                 },
             ),
-            scripts,
-        }
-    }
-}
-
-impl ScriptCache {
-    pub fn parse(config: &mut Config) -> Self {
-        ScriptCache {
-            bayes_cache: BayesTokenCache::new(
-                config
-                    .property_or_default("cache.bayes.capacity", "8192")
-                    .unwrap_or(8192),
-                config
-                    .property_or_default("cache.bayes.ttl.positive", "1h")
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-                config
-                    .property_or_default("cache.bayes.ttl.negative", "1h")
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-            ),
-            remote_lists: Default::default(),
+            untrusted_scripts,
+            trusted_scripts,
         }
     }
 }
@@ -367,7 +358,7 @@ impl Default for Scripting {
             from_addr: IfBlock::new::<()>(
                 "sieve.trusted.from-addr",
                 [],
-                "'MAILER-DAEMON@' + key_get('default', 'domain')",
+                "'MAILER-DAEMON@' + config_get('report.domain')",
             ),
             from_name: IfBlock::new::<()>("sieve.trusted.from-name", [], "'Mailer Daemon'"),
             return_path: IfBlock::empty("sieve.trusted.return-path"),
@@ -375,24 +366,12 @@ impl Default for Scripting {
                 "sieve.trusted.sign",
                 [],
                 concat!(
-                    "['rsa-' + key_get('default', 'domain'), ",
-                    "'ed25519-' + key_get('default', 'domain')]"
+                    "['rsa-' + config_get('report.domain'), ",
+                    "'ed25519-' + config_get('report.domain')]"
                 ),
             ),
-            scripts: AHashMap::new(),
-        }
-    }
-}
-
-impl Default for ScriptCache {
-    fn default() -> Self {
-        Self {
-            bayes_cache: BayesTokenCache::new(
-                8192,
-                Duration::from_secs(3600),
-                Duration::from_secs(3600),
-            ),
-            remote_lists: Default::default(),
+            untrusted_scripts: AHashMap::new(),
+            trusted_scripts: AHashMap::new(),
         }
     }
 }
@@ -407,7 +386,8 @@ impl Clone for Scripting {
             from_name: self.from_name.clone(),
             return_path: self.return_path.clone(),
             sign: self.sign.clone(),
-            scripts: self.scripts.clone(),
+            trusted_scripts: self.trusted_scripts.clone(),
+            untrusted_scripts: self.untrusted_scripts.clone(),
         }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,26 +8,27 @@ use std::time::Instant;
 
 use ahash::AHashMap;
 use common::{
+    DAEMON_NAME,
     config::smtp::session::{MTAHook, Stage},
     listener::SessionStream,
-    DAEMON_NAME,
 };
+
 use mail_auth::AuthenticatedMessage;
 use trc::MtaHookEvent;
 
 use crate::{
     core::Session,
     inbound::{
+        FilterResponse,
         hooks::{
             Address, Client, Context, Envelope, Message, Protocol, Request, Sasl, Server, Tls,
         },
         milter::Modification,
-        FilterResponse,
     },
     queue::QueueId,
 };
 
-use super::{client::send_mta_hook_request, Action, Queue, Response};
+use super::{Action, Queue, Response, client::send_mta_hook_request};
 
 impl<T: SessionStream> Session<T> {
     pub async fn run_mta_hooks(
@@ -36,7 +37,7 @@ impl<T: SessionStream> Session<T> {
         message: Option<&AuthenticatedMessage<'_>>,
         queue_id: Option<QueueId>,
     ) -> Result<Vec<Modification>, FilterResponse> {
-        let mta_hooks = &self.core.core.smtp.session.hooks;
+        let mta_hooks = &self.server.core.smtp.session.hooks;
         if mta_hooks.is_empty() {
             return Ok(Vec::new());
         }
@@ -45,8 +46,7 @@ impl<T: SessionStream> Session<T> {
         for mta_hook in mta_hooks {
             if !mta_hook.run_on_stage.contains(&stage)
                 || !self
-                    .core
-                    .core
+                    .server
                     .eval_if(&mta_hook.enable, self, self.data.session_id)
                     .await
                     .unwrap_or(false)
@@ -89,7 +89,7 @@ impl<T: SessionStream> Session<T> {
                             }
                             super::Modification::ReplaceContents { value } => {
                                 Modification::ReplaceBody {
-                                    value: value.into_bytes(),
+                                    value: value.as_bytes().to_vec(),
                                 }
                             }
                             super::Modification::AddHeader { name, value } => {
@@ -132,8 +132,8 @@ impl<T: SessionStream> Session<T> {
                         Action::Reject => FilterResponse::reject(),
                         Action::Quarantine => {
                             modifications.push(Modification::AddHeader {
-                                name: "X-Quarantine".to_string(),
-                                value: "true".to_string(),
+                                name: "X-Quarantine".into(),
+                                value: "true".into(),
                             });
                             FilterResponse::accept()
                         }
@@ -192,24 +192,24 @@ impl<T: SessionStream> Session<T> {
                         .as_ref()
                         .and_then(|ip_rev| ip_rev.ptr.as_ref())
                         .and_then(|ptrs| ptrs.first())
-                        .cloned(),
+                        .map(Into::into),
                     helo: (!self.data.helo_domain.is_empty())
                         .then(|| self.data.helo_domain.clone()),
                     active_connections: 1,
                 },
-                sasl: (!self.data.authenticated_as.is_empty()).then(|| Sasl {
-                    login: self.data.authenticated_as.clone(),
+                sasl: self.authenticated_as().map(|name| Sasl {
+                    login: name.into(),
                     method: None,
                 }),
                 tls: (!tls_version.is_empty()).then(|| Tls {
-                    version: tls_version.to_string(),
-                    cipher: tls_cipher.to_string(),
+                    version: tls_version.as_ref().into(),
+                    cipher: tls_cipher.as_ref().into(),
                     bits: None,
                     issuer: None,
                     subject: None,
                 }),
                 server: Server {
-                    name: DAEMON_NAME.to_string().into(),
+                    name: Some(DAEMON_NAME.into()),
                     port: self.data.local_port,
                     ip: self.data.local_ip.to_string().into(),
                 },

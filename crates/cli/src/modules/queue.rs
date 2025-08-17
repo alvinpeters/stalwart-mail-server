@@ -1,51 +1,48 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use super::{
-    cli::{Client, QueueCommands},
     List,
+    cli::{Client, QueueCommands},
 };
 use console::Term;
 use human_size::{Byte, SpecificSize};
 use mail_parser::DateTime;
-use prettytable::{format::Alignment, Attr, Cell, Row, Table};
+use prettytable::{Attr, Cell, Row, Table, format::Alignment};
 use reqwest::Method;
 use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Message {
+    pub id: u64,
     pub return_path: String,
-    pub domains: Vec<Domain>,
+    pub recipients: Vec<Recipient>,
     #[serde(deserialize_with = "deserialize_datetime")]
     pub created: DateTime,
     pub size: usize,
     #[serde(default)]
     pub priority: i16,
+    #[serde(default)]
     pub env_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct Domain {
-    pub name: String,
-    pub status: Status,
-    pub recipients: Vec<Recipient>,
-
-    pub retry_num: u32,
-    #[serde(deserialize_with = "deserialize_maybe_datetime")]
-    pub next_retry: Option<DateTime>,
-    #[serde(deserialize_with = "deserialize_maybe_datetime")]
-    pub next_notify: Option<DateTime>,
-    #[serde(deserialize_with = "deserialize_datetime")]
-    pub expires: DateTime,
+    pub blob_hash: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Recipient {
     pub address: String,
     pub status: Status,
+    pub queue: String,
+    pub retry_num: u32,
+    #[serde(deserialize_with = "deserialize_maybe_datetime", default)]
+    pub next_retry: Option<DateTime>,
+    #[serde(deserialize_with = "deserialize_maybe_datetime", default)]
+    pub next_notify: Option<DateTime>,
+    #[serde(deserialize_with = "deserialize_maybe_datetime", default)]
+    pub expires: Option<DateTime>,
+    #[serde(default)]
     pub orcpt: Option<String>,
 }
 
@@ -97,30 +94,29 @@ impl QueueCommands {
                         let mut rcpts = String::new();
                         let mut deliver_at = i64::MAX;
                         let mut deliver_pos = 0;
-                        for (pos, domain) in message.domains.iter().enumerate() {
-                            if let Some(next_retry) = &domain.next_retry {
+
+                        for (pos, rcpt) in message.recipients.iter().enumerate() {
+                            if let Some(next_retry) = &rcpt.next_retry {
                                 let ts = next_retry.to_timestamp();
                                 if ts < deliver_at {
                                     deliver_at = ts;
                                     deliver_pos = pos;
                                 }
                             }
-                            for rcpt in &domain.recipients {
-                                if !rcpts.is_empty() {
-                                    rcpts.push('\n');
-                                }
-                                rcpts.push_str(&rcpt.address);
-                                rcpts.push_str(" (");
-                                rcpts.push_str(rcpt.status.status_short());
-                                rcpts.push(')');
+                            if !rcpts.is_empty() {
+                                rcpts.push('\n');
                             }
+                            rcpts.push_str(&rcpt.address);
+                            rcpts.push_str(" (");
+                            rcpts.push_str(rcpt.status.status_short());
+                            rcpts.push(')');
                         }
 
                         let mut cells = Vec::new();
                         cells.push(Cell::new(&format!("{id:X}")));
                         cells.push(if deliver_at != i64::MAX {
                             Cell::new(
-                                &message.domains[deliver_pos]
+                                &message.recipients[deliver_pos]
                                     .next_retry
                                     .as_ref()
                                     .unwrap()
@@ -203,33 +199,32 @@ impl QueueCommands {
                                 Cell::new(&message.priority.to_string()),
                             ]));
                         }
-                        for domain in &message.domains {
-                            table.add_row(Row::new(vec![Cell::new_align(
-                                &domain.name,
-                                Alignment::RIGHT,
-                            )
-                            .with_style(Attr::Bold)
-                            .with_style(Attr::Italic(true))
-                            .with_hspan(2)]));
+                        for rcpt in &message.recipients {
+                            table.add_row(Row::new(vec![
+                                Cell::new_align(&rcpt.address, Alignment::RIGHT)
+                                    .with_style(Attr::Bold)
+                                    .with_style(Attr::Italic(true))
+                                    .with_hspan(2),
+                            ]));
                             table.add_row(Row::new(vec![
                                 Cell::new("Status").with_style(Attr::Bold),
-                                Cell::new(domain.status.status()),
+                                Cell::new(rcpt.status.status()),
                             ]));
                             table.add_row(Row::new(vec![
                                 Cell::new("Details").with_style(Attr::Bold),
-                                Cell::new(domain.status.details()),
+                                Cell::new(rcpt.status.details()),
                             ]));
                             table.add_row(Row::new(vec![
                                 Cell::new("Retry #").with_style(Attr::Bold),
-                                Cell::new(&domain.retry_num.to_string()),
+                                Cell::new(&rcpt.retry_num.to_string()),
                             ]));
-                            if let Some(dt) = &domain.next_retry {
+                            if let Some(dt) = &rcpt.next_retry {
                                 table.add_row(Row::new(vec![
                                     Cell::new("Delivery Due").with_style(Attr::Bold),
                                     Cell::new(&dt.to_rfc822()),
                                 ]));
                             }
-                            if let Some(dt) = &domain.next_notify {
+                            if let Some(dt) = &rcpt.next_notify {
                                 table.add_row(Row::new(vec![
                                     Cell::new("Notify at").with_style(Attr::Bold),
                                     Cell::new(&dt.to_rfc822()),
@@ -237,33 +232,17 @@ impl QueueCommands {
                             }
                             table.add_row(Row::new(vec![
                                 Cell::new("Expires").with_style(Attr::Bold),
-                                Cell::new(&domain.expires.to_rfc822()),
-                            ]));
-
-                            let mut rcpts = Table::new();
-                            rcpts.add_row(Row::new(vec![
-                                Cell::new("Address").with_style(Attr::Bold),
-                                Cell::new("Status").with_style(Attr::Bold),
-                                Cell::new("Details").with_style(Attr::Bold),
-                            ]));
-                            for rcpt in &domain.recipients {
-                                rcpts.add_row(Row::new(vec![
-                                    Cell::new(&rcpt.address),
-                                    Cell::new(rcpt.status.status()),
-                                    Cell::new(rcpt.status.details()),
-                                ]));
-                            }
-                            table.add_row(Row::new(vec![
-                                Cell::new("Recipients").with_style(Attr::Bold),
-                                Cell::from(&rcpts),
+                                if let Some(dt) = &rcpt.expires {
+                                    Cell::new(&dt.to_rfc822())
+                                } else {
+                                    Cell::new("N/A")
+                                },
                             ]));
                         }
                     } else {
-                        table.add_row(Row::new(vec![Cell::new_align(
-                            "-- Not found --",
-                            Alignment::CENTER,
-                        )
-                        .with_hspan(2)]));
+                        table.add_row(Row::new(vec![
+                            Cell::new_align("-- Not found --", Alignment::CENTER).with_hspan(2),
+                        ]));
                     }
 
                     eprintln!();

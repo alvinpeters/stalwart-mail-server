@@ -1,10 +1,11 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use argon2::Argon2;
+use compact_str::ToCompactString;
 use mail_builder::encoders::base64::base64_encode;
 use mail_parser::decoders::base64::base64_decode;
 use password_hash::PasswordHash;
@@ -18,11 +19,11 @@ use sha2::Sha512;
 use tokio::sync::oneshot;
 use totp_rs::TOTP;
 
-use crate::backend::internal::SpecialSecrets;
 use crate::Principal;
+use crate::backend::internal::SpecialSecrets;
 
-impl<T: serde::Serialize + serde::de::DeserializeOwned> Principal<T> {
-    pub async fn verify_secret(&self, mut code: &str) -> trc::Result<bool> {
+impl Principal {
+    pub async fn verify_secret(&self, mut code: &str, only_app_pass: bool) -> trc::Result<bool> {
         let mut totp_token = None;
         let mut is_totp_token_missing = false;
         let mut is_totp_required = false;
@@ -30,12 +31,8 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Principal<T> {
         let mut is_authenticated = false;
         let mut is_app_authenticated = false;
 
-        for secret in &self.secrets {
-            if secret.is_disabled() {
-                // Account is disabled, no need to check further
-
-                return Ok(false);
-            } else if secret.is_otp_auth() {
+        for secret in self.secrets.iter() {
+            if secret.is_otp_auth() {
                 if !is_totp_verified && !is_totp_token_missing {
                     is_totp_required = true;
 
@@ -61,7 +58,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Principal<T> {
                         .map_err(|err| {
                             trc::AuthEvent::Error
                                 .reason(err)
-                                .details(secret.to_string())
+                                .details(secret.to_compact_string())
                         })?
                         .check_current(totp_token)
                         .unwrap_or(false);
@@ -71,7 +68,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Principal<T> {
                     secret.strip_prefix("$app$").and_then(|s| s.split_once('$'))
                 {
                     is_app_authenticated = verify_secret_hash(app_secret, code).await?;
-                } else {
+                } else if !only_app_pass {
                     is_authenticated = verify_secret_hash(secret, code).await?;
                 }
             }
@@ -267,7 +264,9 @@ pub async fn verify_secret_hash(hashed_secret: &str, secret: &str) -> trc::Resul
                 .into_err()
                 .details(hashed_secret.to_string()))
         }
-    } else {
+    } else if !hashed_secret.is_empty() {
         Ok(hashed_secret == secret)
+    } else {
+        Ok(false)
     }
 }

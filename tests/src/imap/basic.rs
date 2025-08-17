@@ -1,10 +1,10 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use imap::op::authenticate::decode_challenge_oauth;
+use common::auth::sasl::sasl_decode_challenge_oauth;
 use imap_proto::ResponseType;
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
@@ -26,7 +26,7 @@ pub async fn test(imap: &mut ImapConnection, _imap_check: &mut ImapConnection) {
     imap.send("ID").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("* ID (\"name\" \"Stalwart IMAP\" \"version\" ");
+        .assert_contains("* ID (\"name\" \"Stalwart\" \"version\" ");
 
     // Login should be disabled
     imap.send("LOGIN jdoe@example.com secret").await;
@@ -44,7 +44,7 @@ fn decode_challenge() {
     assert!(
         Credentials::OAuthBearer {
             token: "vF9dft4qmTc2Nvb3RlckBhbHRhdmlzdGEuY29tCg==".to_string()
-        } == decode_challenge_oauth(
+        } == sasl_decode_challenge_oauth(
             &base64_decode(
                 concat!(
                     "bixhPXVzZXJAZXhhbXBsZS5jb20sAWhv",

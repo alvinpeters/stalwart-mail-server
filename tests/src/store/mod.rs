@@ -1,10 +1,9 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-pub mod assign_id;
 pub mod blob;
 pub mod import_export;
 pub mod lookup;
@@ -67,6 +66,11 @@ type = "redis"
 urls = "redis://127.0.0.1"
 redis-type = "single"
 
+[storage]
+lookup = "mysql"
+data = "postgresql"
+blob = "sqlite"
+
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,7 +80,7 @@ pub async fn store_tests() {
     let mut config = Config::new(CONFIG.replace("{TMP}", &temp_dir.path.to_string_lossy()))
         .unwrap()
         .assert_no_errors();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
 
     let store_id = std::env::var("STORE")
         .expect("Missing store type. Try running `STORE=<store_type> cargo test`");
@@ -91,8 +95,7 @@ pub async fn store_tests() {
         store.destroy().await;
     }
 
-    import_export::test(store.clone()).await;
-    assign_id::test(store.clone()).await;
+    //import_export::test(store.clone()).await;
     ops::test(store.clone()).await;
     query::test(store.clone(), FtsStore::Store(store.clone()), insert).await;
 

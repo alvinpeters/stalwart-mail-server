@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,12 +7,12 @@
 use mail_send::Credentials;
 use smtp_proto::{AUTH_CRAM_MD5, AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2};
 
-use crate::{IntoError, Principal, QueryBy};
+use crate::{IntoError, Principal, QueryBy, Type, backend::RcptType};
 
 use super::{ImapDirectory, ImapError};
 
 impl ImapDirectory {
-    pub async fn query(&self, query: QueryBy<'_>) -> trc::Result<Option<Principal<u32>>> {
+    pub async fn query(&self, query: QueryBy<'_>) -> trc::Result<Option<Principal>> {
         if let QueryBy::Credentials(credentials) = query {
             let mut client = self
                 .pool
@@ -48,7 +48,7 @@ impl ImapDirectory {
             match client.authenticate(mechanism, credentials).await {
                 Ok(_) => {
                     client.is_valid = false;
-                    Ok(Some(Principal::default()))
+                    Ok(Some(Principal::new(u32::MAX, Type::Individual)))
                 }
                 Err(err) => match &err {
                     ImapError::AuthenticationFailed => Ok(None),
@@ -60,11 +60,11 @@ impl ImapDirectory {
         }
     }
 
-    pub async fn email_to_ids(&self, _address: &str) -> trc::Result<Vec<u32>> {
+    pub async fn email_to_id(&self, _address: &str) -> trc::Result<Option<u32>> {
         Err(trc::StoreEvent::NotSupported.caused_by(trc::location!()))
     }
 
-    pub async fn rcpt(&self, _address: &str) -> trc::Result<bool> {
+    pub async fn rcpt(&self, _address: &str) -> trc::Result<RcptType> {
         Err(trc::StoreEvent::NotSupported.caused_by(trc::location!()))
     }
 

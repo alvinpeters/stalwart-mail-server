@@ -1,9 +1,10 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::dkim::Algorithm;
 use clap::{Parser, Subcommand, ValueEnum};
 use jmap_client::client::Credentials;
 use mail_parser::DateTime;
@@ -24,25 +25,33 @@ pub struct Cli {
     /// Connection timeout in seconds
     #[clap(short, long)]
     pub timeout: Option<u64>,
+    /// Do not ask for credentials
+    #[clap(short, long)]
+    pub anonymous: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
     /// Manage user accounts
-    #[clap(subcommand)]
-    Account(AccountCommands),
+    /* #[clap(subcommand)]
+        Account(AccountCommands),
 
-    /// Manage domains
-    #[clap(subcommand)]
-    Domain(DomainCommands),
+        /// Manage domains
+        #[clap(subcommand)]
+        Domain(DomainCommands),
 
-    /// Manage mailing lists
-    #[clap(subcommand)]
-    List(ListCommands),
+        /// Manage mailing lists
+        #[clap(subcommand)]
+        List(ListCommands),
 
-    /// Manage groups
+        /// Manage groups
+        #[clap(subcommand)]
+        Group(GroupCommands),
+    */
+
+    /// Manage DKIM signatures
     #[clap(subcommand)]
-    Group(GroupCommands),
+    Dkim(DkimCommands),
 
     /// Import JMAP accounts and Maildir/mbox mailboxes
     #[clap(subcommand)]
@@ -346,6 +355,27 @@ pub enum DomainCommands {
 }
 
 #[derive(Subcommand)]
+pub enum DkimCommands {
+    /// Create DKIM signature
+    Create {
+        /// Algorithm to use
+        algorithm: Algorithm,
+        /// Domain name for which to create
+        domain: String,
+        /// Id
+        signature_id: Option<String>,
+        /// Selector
+        selector: Option<String>,
+    },
+
+    /// Get DKIM public key
+    GetPublicKey {
+        /// Signature id
+        signature_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ImportCommands {
     /// Import messages and folders
     Messages {
@@ -422,6 +452,12 @@ pub enum ServerCommands {
     ListConfig {
         /// Prefix to filter configuration entries by
         prefix: Option<String>,
+    },
+
+    /// Perform Healthcheck
+    Healthcheck {
+        /// Status `ready` (default) or `live` to check for
+        check: Option<String>
     },
 }
 

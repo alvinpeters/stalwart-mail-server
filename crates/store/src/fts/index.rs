@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,28 +9,29 @@ use std::{borrow::Cow, fmt::Display};
 use ahash::AHashMap;
 use nlp::{
     language::{
+        Language,
         detect::{LanguageDetector, MIN_LANGUAGE_SCORE},
         stemmer::Stemmer,
-        Language,
     },
     tokenizers::word::WordTokenizer,
 };
+use trc::AddContext;
 
 use crate::{
+    IterateParams, SerializeInfallible, Store, U32_LEN, ValueKey,
     backend::MAX_TOKEN_LENGTH,
     dispatch::DocumentSet,
     write::{
-        hash::TokenType, key::DeserializeBigEndian, BatchBuilder, BitmapHash, MaybeDynamicId,
-        Operation, ValueClass, ValueOp,
+        BatchBuilder, BitmapHash, Operation, ValueClass, ValueOp, hash::TokenType,
+        key::DeserializeBigEndian,
     },
-    IterateParams, Serialize, Store, ValueKey, U32_LEN,
 };
 
-use super::{postings::Postings, Field};
+use super::{Field, postings::Postings};
 pub const TERM_INDEX_VERSION: u8 = 1;
 
 #[derive(Debug)]
-pub(crate) struct Text<'x, T: Into<u8> + Display + Clone + std::fmt::Debug> {
+pub(crate) struct Text<'x, T: Into<u8> + Display + std::fmt::Debug> {
     pub field: Field<T>,
     pub text: Cow<'x, str>,
     pub typ: Type,
@@ -44,7 +45,7 @@ pub(crate) enum Type {
 }
 
 #[derive(Debug)]
-pub struct FtsDocument<'x, T: Into<u8> + Display + Clone + std::fmt::Debug> {
+pub struct FtsDocument<'x, T: Into<u8> + Display + std::fmt::Debug> {
     pub(crate) parts: Vec<Text<'x, T>>,
     pub(crate) default_language: Language,
     pub(crate) account_id: u32,
@@ -52,7 +53,7 @@ pub struct FtsDocument<'x, T: Into<u8> + Display + Clone + std::fmt::Debug> {
     pub(crate) document_id: u32,
 }
 
-impl<'x, T: Into<u8> + Display + Clone + std::fmt::Debug> FtsDocument<'x, T> {
+impl<'x, T: Into<u8> + Display + std::fmt::Debug> FtsDocument<'x, T> {
     pub fn with_default_language(default_language: Language) -> FtsDocument<'x, T> {
         FtsDocument {
             parts: vec![],
@@ -106,7 +107,7 @@ impl<'x, T: Into<u8> + Display + Clone + std::fmt::Debug> FtsDocument<'x, T> {
     }
 }
 
-impl<T: Into<u8> + Display + Clone + std::fmt::Debug> From<Field<T>> for u8 {
+impl<T: Into<u8> + Display + std::fmt::Debug> From<Field<T>> for u8 {
     fn from(value: Field<T>) -> Self {
         match value {
             Field::Body => 0,
@@ -118,7 +119,7 @@ impl<T: Into<u8> + Display + Clone + std::fmt::Debug> From<Field<T>> for u8 {
 }
 
 impl Store {
-    pub async fn fts_index<T: Into<u8> + Display + Clone + std::fmt::Debug>(
+    pub async fn fts_index<T: Into<u8> + Display + std::fmt::Debug>(
         &self,
         document: FtsDocument<'_, T>,
     ) -> trc::Result<()> {
@@ -201,7 +202,10 @@ impl Store {
         for (hash, postings) in tokens.into_iter() {
             keys.push(Operation::Value {
                 class: ValueClass::FtsIndex(hash),
-                op: ValueOp::Set(postings.serialize().into()),
+                op: ValueOp::Set {
+                    value: postings.serialize(),
+                    version_offset: None,
+                },
             });
         }
 
@@ -213,19 +217,19 @@ impl Store {
             .update_document(document.document_id);
 
         for key in keys.into_iter() {
-            if batch.ops.len() >= 1000 {
-                self.write(batch.build()).await?;
+            if batch.is_large_batch() {
+                self.write(batch.build_all()).await?;
                 batch = BatchBuilder::new();
                 batch
                     .with_account_id(document.account_id)
                     .with_collection(document.collection)
                     .update_document(document.document_id);
             }
-            batch.ops.push(key);
+            batch.any_op(key);
         }
 
         if !batch.is_empty() {
-            self.write(batch.build()).await?;
+            self.write(batch.build_all()).await?;
         }
 
         Ok(())
@@ -238,7 +242,7 @@ impl Store {
         document_ids: &impl DocumentSet,
     ) -> trc::Result<()> {
         // Find keys to delete
-        let mut delete_keys: AHashMap<u32, Vec<ValueClass<MaybeDynamicId>>> = AHashMap::new();
+        let mut delete_keys: AHashMap<u32, Vec<ValueClass>> = AHashMap::new();
         self.iterate(
             IterateParams::new(
                 ValueKey {
@@ -294,7 +298,8 @@ impl Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         // Remove keys
         let mut batch = BatchBuilder::new();
@@ -306,15 +311,17 @@ impl Store {
             batch.update_document(document_id);
 
             for key in keys {
-                if batch.ops.len() >= 1000 {
-                    self.write(batch.build()).await?;
+                if batch.is_large_batch() {
+                    self.write(batch.build_all())
+                        .await
+                        .caused_by(trc::location!())?;
                     batch = BatchBuilder::new();
                     batch
                         .with_account_id(account_id)
                         .with_collection(collection)
                         .update_document(document_id);
                 }
-                batch.ops.push(Operation::Value {
+                batch.any_op(Operation::Value {
                     class: key,
                     op: ValueOp::Clear,
                 });
@@ -322,7 +329,9 @@ impl Store {
         }
 
         if !batch.is_empty() {
-            self.write(batch.build()).await?;
+            self.write(batch.build_all())
+                .await
+                .caused_by(trc::location!())?;
         }
 
         Ok(())

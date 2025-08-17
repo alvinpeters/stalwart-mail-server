@@ -1,27 +1,49 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use base64::{engine::general_purpose, Engine};
+use common::{
+    Server,
+    auth::AccessToken,
+    ipc::{EncryptionKeys, PushSubscription, StateEvent, UpdateSubscription},
+};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, RequestArguments},
-    object::Object,
-    types::{collection::Collection, property::Property, type_state::DataType, value::Value},
+    types::{
+        collection::Collection,
+        date::UTCDate,
+        property::Property,
+        value::{Object, Value},
+    },
 };
 use store::{
-    write::{now, ValueClass},
     BitmapKey, ValueKey,
+    write::{AlignedBytes, Archive, ValueClass, now},
 };
+use trc::{AddContext, ServerEvent};
 use utils::map::bitmap::Bitmap;
 
-use crate::{auth::AccessToken, services::state, JMAP};
+use std::future::Future;
 
-use super::{EncryptionKeys, PushSubscription, UpdateSubscription};
+pub trait PushSubscriptionFetch: Sync + Send {
+    fn push_subscription_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
 
-impl JMAP {
-    pub async fn push_subscription_get(
+    fn fetch_push_subscriptions(
+        &self,
+        account_id: u32,
+    ) -> impl Future<Output = trc::Result<StateEvent>> + Send;
+
+    fn update_push_subscriptions(&self, account_id: u32) -> impl Future<Output = bool> + Send;
+}
+
+impl PushSubscriptionFetch for Server {
+    async fn push_subscription_get(
         &self,
         mut request: GetRequest<RequestArguments>,
         access_token: &AccessToken,
@@ -62,13 +84,8 @@ impl JMAP {
                 response.not_found.push(id.into());
                 continue;
             }
-            let mut push = if let Some(push) = self
-                .get_property::<Object<Value>>(
-                    account_id,
-                    Collection::PushSubscription,
-                    document_id,
-                    Property::Value,
-                )
+            let push_ = if let Some(push) = self
+                .get_archive(account_id, Collection::PushSubscription, document_id)
                 .await?
             {
                 push
@@ -76,6 +93,9 @@ impl JMAP {
                 response.not_found.push(id.into());
                 continue;
             };
+            let push = push_
+                .unarchive::<email::push::PushSubscription>()
+                .caused_by(trc::location!())?;
             let mut result = Object::with_capacity(properties.len());
             for property in &properties {
                 match property {
@@ -87,8 +107,33 @@ impl JMAP {
                             "The 'url' and 'keys' properties are not readable".to_string(),
                         ));
                     }
+                    Property::DeviceClientId => {
+                        result.append(
+                            Property::DeviceClientId,
+                            Value::from(&push.device_client_id),
+                        );
+                    }
+                    Property::Types => {
+                        let mut types = Vec::new();
+                        for typ in Bitmap::from(&push.types).into_iter() {
+                            types.push(Value::Text(typ.to_string()));
+                        }
+                        result.append(Property::Types, Value::List(types));
+                    }
+                    Property::Expires => {
+                        if push.expires > 0 {
+                            result.append(
+                                Property::Expires,
+                                Value::Date(
+                                    UTCDate::from_timestamp(u64::from(push.expires) as i64),
+                                ),
+                            );
+                        } else {
+                            result.append(Property::Expires, Value::Null);
+                        }
+                    }
                     property => {
-                        result.append(property.clone(), push.remove(property));
+                        result.append(property.clone(), Value::Null);
                     }
                 }
             }
@@ -98,7 +143,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn fetch_push_subscriptions(&self, account_id: u32) -> trc::Result<state::Event> {
+    async fn fetch_push_subscriptions(&self, account_id: u32) -> trc::Result<StateEvent> {
         let mut subscriptions = Vec::new();
         let document_ids = self
             .core
@@ -114,11 +159,11 @@ impl JMAP {
         let current_time = now();
 
         for document_id in document_ids {
-            let mut subscription = self
+            let subscription = self
                 .core
                 .storage
                 .data
-                .get_value::<Object<Value>>(ValueKey {
+                .get_value::<Archive<AlignedBytes>>(ValueKey {
                     account_id,
                     collection: Collection::PushSubscription.into(),
                     document_id,
@@ -130,113 +175,69 @@ impl JMAP {
                         .into_err()
                         .caused_by(trc::location!())
                         .document_id(document_id)
-                })?;
-
-            let expires = subscription
-                .properties
-                .get(&Property::Expires)
-                .and_then(|p| p.as_date())
-                .ok_or_else(|| {
-                    trc::StoreEvent::UnexpectedError
-                        .caused_by(trc::location!())
-                        .document_id(document_id)
                 })?
-                .timestamp() as u64;
-            if expires > current_time {
-                let keys = if let Some((auth, p256dh)) = subscription
-                    .properties
-                    .remove(&Property::Keys)
-                    .and_then(|value| value.try_unwrap_object())
-                    .and_then(|mut obj| {
-                        (
-                            obj.properties
-                                .remove(&Property::Auth)
-                                .and_then(|value| value.try_unwrap_string())?,
-                            obj.properties
-                                .remove(&Property::P256dh)
-                                .and_then(|value| value.try_unwrap_string())?,
-                        )
-                            .into()
-                    }) {
-                    EncryptionKeys {
-                        p256dh: general_purpose::URL_SAFE
-                            .decode(&p256dh)
-                            .unwrap_or_default(),
-                        auth: general_purpose::URL_SAFE.decode(&auth).unwrap_or_default(),
-                    }
-                    .into()
-                } else {
-                    None
-                };
-                let verification_code = subscription
-                    .properties
-                    .remove(&Property::Value)
-                    .and_then(|p| p.try_unwrap_string())
-                    .ok_or_else(|| {
-                        trc::StoreEvent::UnexpectedError
-                            .caused_by(trc::location!())
-                            .document_id(document_id)
-                    })?;
-                let url = subscription
-                    .properties
-                    .remove(&Property::Url)
-                    .and_then(|p| p.try_unwrap_string())
-                    .ok_or_else(|| {
-                        trc::StoreEvent::UnexpectedError
-                            .caused_by(trc::location!())
-                            .document_id(document_id)
-                    })?;
+                .deserialize::<email::push::PushSubscription>()
+                .caused_by(trc::location!())?;
 
-                if subscription
-                    .properties
-                    .get(&Property::VerificationCode)
-                    .and_then(|p| p.as_string())
-                    .map_or(false, |v| v == verification_code)
-                {
-                    let types = if let Some(Value::List(value)) =
-                        subscription.properties.remove(&Property::Types)
-                    {
-                        if !value.is_empty() {
-                            let mut type_states = Bitmap::new();
-                            for type_state in value {
-                                if let Some(type_state) = type_state
-                                    .as_string()
-                                    .and_then(|type_state| DataType::try_from(type_state).ok())
-                                {
-                                    type_states.insert(type_state);
-                                }
-                            }
-                            type_states
-                        } else {
-                            Bitmap::all()
-                        }
-                    } else {
-                        Bitmap::all()
-                    };
-
+            if subscription.expires > current_time {
+                if subscription.verified {
                     // Add verified subscription
                     subscriptions.push(UpdateSubscription::Verified(PushSubscription {
                         id: document_id,
-                        url,
-                        expires,
-                        types,
-                        keys,
+                        url: subscription.url,
+                        expires: subscription.expires,
+                        types: subscription.types,
+                        keys: subscription.keys.map(|keys| EncryptionKeys {
+                            p256dh: keys.p256dh,
+                            auth: keys.auth,
+                        }),
                     }));
                 } else {
                     // Add unverified subscription
                     subscriptions.push(UpdateSubscription::Unverified {
                         id: document_id,
-                        url,
-                        code: verification_code,
-                        keys,
+                        url: subscription.url,
+                        code: subscription.verification_code,
+                        keys: subscription.keys.map(|keys| EncryptionKeys {
+                            p256dh: keys.p256dh,
+                            auth: keys.auth,
+                        }),
                     });
                 }
             }
         }
 
-        Ok(state::Event::UpdateSubscriptions {
+        Ok(StateEvent::UpdateSubscriptions {
             account_id,
             subscriptions,
         })
+    }
+
+    async fn update_push_subscriptions(&self, account_id: u32) -> bool {
+        let push_subs = match self.fetch_push_subscriptions(account_id).await {
+            Ok(push_subs) => push_subs,
+            Err(err) => {
+                trc::error!(
+                    err.account_id(account_id)
+                        .details("Failed to fetch push subscriptions")
+                );
+                return false;
+            }
+        };
+
+        let state_tx = self.inner.ipc.state_tx.clone();
+        for event in [StateEvent::UpdateSharedAccounts { account_id }, push_subs] {
+            if state_tx.send(event).await.is_err() {
+                trc::event!(
+                    Server(ServerEvent::ThreadError),
+                    Details = "Error sending state change.",
+                    CausedBy = trc::location!()
+                );
+
+                return false;
+            }
+        }
+
+        true
     }
 }

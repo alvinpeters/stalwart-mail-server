@@ -1,36 +1,49 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::sync::Arc;
 
+use common::{Server, auth::AccessToken};
+use directory::Permission;
 use jmap_proto::{
     error::set::SetError,
     method::upload::{
         BlobUploadRequest, BlobUploadResponse, BlobUploadResponseObject, DataSourceObject,
     },
     request::reference::MaybeReference,
-    types::{blob::BlobId, id::Id},
+    types::id::Id,
 };
-use store::{
-    write::{now, BatchBuilder, BlobOp},
-    BlobClass, Serialize,
-};
+
 use trc::AddContext;
-use utils::BlobHash;
 
-use crate::{auth::AccessToken, JMAP};
-
-use super::UploadResponse;
+use super::{UploadResponse, download::BlobDownload};
+use std::future::Future;
 
 #[cfg(feature = "test_mode")]
 pub static DISABLE_UPLOAD_QUOTA: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-impl JMAP {
-    pub async fn blob_upload_many(
+pub trait BlobUpload: Sync + Send {
+    fn blob_upload_many(
+        &self,
+        request: BlobUploadRequest,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<BlobUploadResponse>> + Send;
+
+    fn blob_upload(
+        &self,
+        account_id: Id,
+        content_type: &str,
+        data: &[u8],
+        access_token: Arc<AccessToken>,
+    ) -> impl Future<Output = trc::Result<UploadResponse>> + Send;
+}
+
+impl BlobUpload for Server {
+    async fn blob_upload_many(
         &self,
         request: BlobUploadRequest,
         access_token: &AccessToken,
@@ -149,7 +162,7 @@ impl JMAP {
                 && used.bytes + data.len() > self.core.jmap.upload_tmp_quota_size)
                 || (self.core.jmap.upload_tmp_quota_amount > 0
                     && used.count + 1 > self.core.jmap.upload_tmp_quota_amount))
-                && !access_token.is_super_user()
+                && !access_token.has_permission(Permission::UnlimitedUploads)
             {
                 response.not_created.append(
                     create_id,
@@ -176,7 +189,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn blob_upload(
+    async fn blob_upload(
         &self,
         account_id: Id,
         content_type: &str,
@@ -209,7 +222,7 @@ impl JMAP {
             && used.bytes + data.len() > self.core.jmap.upload_tmp_quota_size)
             || (self.core.jmap.upload_tmp_quota_amount > 0
                 && used.count + 1 > self.core.jmap.upload_tmp_quota_amount))
-            && !access_token.is_super_user()
+            && !access_token.has_permission(Permission::UnlimitedUploads)
         {
             let err = Err(trc::LimitEvent::BlobQuota
                 .into_err()
@@ -233,59 +246,6 @@ impl JMAP {
                 .caused_by(trc::location!())?,
             c_type: content_type.to_string(),
             size: data.len(),
-        })
-    }
-
-    #[allow(clippy::blocks_in_conditions)]
-    pub async fn put_blob(
-        &self,
-        account_id: u32,
-        data: &[u8],
-        set_quota: bool,
-    ) -> trc::Result<BlobId> {
-        // First reserve the hash
-        let hash = BlobHash::from(data);
-        let mut batch = BatchBuilder::new();
-        let until = now() + self.core.jmap.upload_tmp_ttl;
-
-        batch.with_account_id(account_id).set(
-            BlobOp::Reserve {
-                hash: hash.clone(),
-                until,
-            },
-            (if set_quota { data.len() as u32 } else { 0u32 }).serialize(),
-        );
-        self.write_batch(batch).await?;
-
-        if !self
-            .core
-            .storage
-            .data
-            .blob_exists(&hash)
-            .await
-            .caused_by(trc::location!())?
-        {
-            // Upload blob to store
-            self.core
-                .storage
-                .blob
-                .put_blob(hash.as_ref(), data)
-                .await
-                .caused_by(trc::location!())?;
-
-            // Commit blob
-            let mut batch = BatchBuilder::new();
-            batch.set(BlobOp::Commit { hash: hash.clone() }, Vec::new());
-            self.write_batch(batch).await?;
-        }
-
-        Ok(BlobId {
-            hash,
-            class: BlobClass::Reserved {
-                account_id,
-                expires: until,
-            },
-            section: None,
         })
     }
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,10 +7,14 @@
 use std::time::{Duration, Instant};
 
 use common::{
-    expr::{tokenizer::TokenMap, *},
     Core,
+    expr::{tokenizer::TokenMap, *},
 };
 
+use directory::{
+    QueryParams, Type,
+    backend::internal::{PrincipalField, PrincipalSet, PrincipalValue, manage::ManageDirectory},
+};
 use mail_auth::MX;
 use store::Stores;
 use utils::config::Config;
@@ -18,15 +22,11 @@ use utils::config::Config;
 use crate::{
     directory::DirectoryStore,
     smtp::{
-        build_smtp,
+        DnsCache, TempDir, TestSMTP,
         session::{TestSession, VerifyResponse},
-        TempDir,
     },
 };
-use smtp::{
-    core::{Inner, Session},
-    queue::RecipientDomain,
-};
+use smtp::{core::Session, queue::RecipientDomain};
 
 const CONFIG: &str = r#"
 [storage]
@@ -48,7 +48,6 @@ emails = "SELECT address FROM emails WHERE name = ? AND type != 'list' ORDER BY 
 verify = "SELECT address FROM emails WHERE address LIKE '%' || ? || '%' AND type = 'primary' ORDER BY address LIMIT 5"
 expand = "SELECT p.address FROM emails AS p JOIN emails AS l ON p.name = l.name WHERE p.type = 'primary' AND l.address = ? AND l.type = 'list' ORDER BY p.address LIMIT 50"
 domains = "SELECT 1 FROM emails WHERE address LIKE '%@' || ? LIMIT 1"
-is_ip_allowed = "SELECT addr FROM allowed_ips WHERE addr = ? LIMIT 1"
 
 [directory."sql"]
 type = "sql"
@@ -73,7 +72,7 @@ relay = false
 errors.wait = "5ms"
 
 [session.extensions]
-requiretls = [{if = "key_exists('sql/is_ip_allowed', remote_ip)", then = true},
+requiretls = [{if = "sql_query('sql', 'SELECT addr FROM allowed_ips WHERE addr = ? LIMIT 1', remote_ip)", then = true},
               {else = false}]
 expn = true
 vrfy = true
@@ -104,12 +103,17 @@ async fn lookup_sql() {
     // Parse settings
     let temp_dir = TempDir::new("smtp_lookup_tests", true);
     let mut config = Config::new(temp_dir.update_config(CONFIG)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
 
-    let inner = Inner::default();
     let core = Core::parse(&mut config, stores, Default::default()).await;
 
-    core.smtp.resolvers.dns.mx_add(
+    // Obtain directory handle
+    let handle = DirectoryStore {
+        store: core.storage.stores.get("sql").unwrap().clone(),
+    };
+    let test = TestSMTP::from_core(core);
+
+    test.server.mx_add(
         "test.org",
         vec![MX {
             exchanges: vec!["mx.foobar.org".to_string()],
@@ -117,11 +121,6 @@ async fn lookup_sql() {
         }],
         Instant::now() + Duration::from_secs(10),
     );
-
-    // Obtain directory handle
-    let handle = DirectoryStore {
-        store: core.storage.lookups.get("sql").unwrap().clone(),
-    };
 
     // Create tables
     handle.create_test_directory().await;
@@ -139,18 +138,6 @@ async fn lookup_sql() {
     handle
         .create_test_user_with_email("mike@foobar.net", "098765", "Mike")
         .await;
-    handle
-        .link_test_address("jane@foobar.org", "sales@foobar.org", "list")
-        .await;
-    handle
-        .link_test_address("john@foobar.org", "sales@foobar.org", "list")
-        .await;
-    handle
-        .link_test_address("bill@foobar.org", "sales@foobar.org", "list")
-        .await;
-    handle
-        .link_test_address("mike@foobar.net", "support@foobar.org", "list")
-        .await;
 
     for query in [
         "CREATE TABLE domains (name TEXT PRIMARY KEY, description TEXT);",
@@ -161,10 +148,57 @@ async fn lookup_sql() {
     ] {
         handle
             .store
-            .query::<usize>(query, Vec::new())
+            .sql_query::<usize>(query, Vec::new())
             .await
             .unwrap();
     }
+
+    // Create local domains
+    let internal_store = &test.server.core.storage.data;
+    for name in ["foobar.org", "foobar.net"] {
+        internal_store
+            .create_principal(
+                PrincipalSet::new(0, Type::Domain).with_field(PrincipalField::Name, name),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Create lists
+    internal_store
+        .create_principal(
+            PrincipalSet::new(0, Type::List)
+                .with_field(PrincipalField::Name, "support@foobar.org")
+                .with_field(PrincipalField::Emails, "support@foobar.org")
+                .with_field(
+                    PrincipalField::ExternalMembers,
+                    PrincipalValue::StringList(vec!["mike@foobar.net".to_string()]),
+                ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    internal_store
+        .create_principal(
+            PrincipalSet::new(0, Type::List)
+                .with_field(PrincipalField::Name, "sales@foobar.org")
+                .with_field(PrincipalField::Emails, "sales@foobar.org")
+                .with_field(
+                    PrincipalField::ExternalMembers,
+                    PrincipalValue::StringList(vec![
+                        "jane@foobar.org".to_string(),
+                        "john@foobar.org".to_string(),
+                        "bill@foobar.org".to_string(),
+                    ]),
+                ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     // Test expression functions
     let token_map = TokenMap::default().with_variables(&[
@@ -184,7 +218,8 @@ async fn lookup_sql() {
         let e =
             Expression::try_parse(&mut config, ("test", test_name, "expr"), &token_map).unwrap();
         assert_eq!(
-            core.eval_expr::<String, _>(&e, &RecipientDomain::new("test.org"), "text", 0)
+            test.server
+                .eval_expr::<String, _>(&e, &RecipientDomain::new("test.org"), "text", 0)
                 .await
                 .unwrap(),
             config.value(("test", test_name, "expect")).unwrap(),
@@ -193,7 +228,7 @@ async fn lookup_sql() {
         );
     }
 
-    let mut session = Session::test(build_smtp(core, inner));
+    let mut session = Session::test(test.server);
     session.data.remote_ip_str = "10.0.0.50".parse().unwrap();
     session.eval_session_params().await;
     session.stream.tls = true;
@@ -201,7 +236,7 @@ async fn lookup_sql() {
         .ehlo("mx.foobar.org")
         .await
         .assert_contains("REQUIRETLS");
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session
         .ehlo("mx1.foobar.org")
@@ -222,6 +257,9 @@ async fn lookup_sql() {
     session.rcpt_to("john@foobar.org", "250").await;
     session.rcpt_to("bill@foobar.org", "250").await;
 
+    // Lists
+    session.rcpt_to("sales@foobar.org", "250").await;
+
     // Test EXPN
     session
         .cmd("EXPN sales@foobar.org", "250")
@@ -236,6 +274,24 @@ async fn lookup_sql() {
     session.cmd("EXPN marketing@foobar.org", "550 5.1.2").await;
 
     // Test VRFY
+    session
+        .server
+        .core
+        .storage
+        .directory
+        .query(QueryParams::name("john@foobar.org").with_return_member_of(true))
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .server
+        .core
+        .storage
+        .directory
+        .query(QueryParams::name("jane@foobar.org").with_return_member_of(true))
+        .await
+        .unwrap()
+        .unwrap();
     session
         .cmd("VRFY john", "250")
         .await

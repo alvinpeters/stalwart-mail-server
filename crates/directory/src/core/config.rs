@@ -1,12 +1,12 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use deadpool::{
-    managed::{Manager, Pool},
     Runtime,
+    managed::{Manager, Pool},
 };
 use std::{sync::Arc, time::Duration};
 use store::{Store, Stores};
@@ -15,24 +15,25 @@ use utils::config::Config;
 use ahash::AHashMap;
 
 use crate::{
-    backend::{
-        imap::ImapDirectory, ldap::LdapDirectory, memory::MemoryDirectory, smtp::SmtpDirectory,
-        sql::SqlDirectory,
-    },
     Directories, Directory, DirectoryInner,
+    backend::{
+        imap::ImapDirectory, ldap::LdapDirectory, memory::MemoryDirectory, oidc::OpenIdDirectory,
+        smtp::SmtpDirectory, sql::SqlDirectory,
+    },
 };
 
 use super::cache::CachedDirectory;
 
 impl Directories {
-    pub async fn parse(config: &mut Config, stores: &Stores, data_store: Store) -> Self {
+    pub async fn parse(
+        config: &mut Config,
+        stores: &Stores,
+        data_store: Store,
+        is_enterprise: bool,
+    ) -> Self {
         let mut directories = AHashMap::new();
 
-        for id in config
-            .sub_keys("directory", ".type")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for id in config.sub_keys("directory", ".type") {
             // Parse directory
             let id = id.as_str();
             #[cfg(feature = "test_mode")]
@@ -44,9 +45,12 @@ impl Directories {
                     continue;
                 }
             }
-            let protocol = config.value_require(("directory", id, "type")).unwrap();
+            let protocol = config
+                .value_require(("directory", id, "type"))
+                .unwrap()
+                .to_string();
             let prefix = ("directory", id);
-            let store = match protocol {
+            let store = match protocol.as_str() {
                 "internal" => Some(DirectoryInner::Internal(
                     if let Some(store_id) = config.value_require(("directory", id, "store")) {
                         if let Some(data) = stores.stores.get(store_id) {
@@ -76,6 +80,8 @@ impl Directories {
                 "memory" => MemoryDirectory::from_config(config, prefix, data_store.clone())
                     .await
                     .map(DirectoryInner::Memory),
+                "oidc" => OpenIdDirectory::from_config(config, prefix, data_store.clone())
+                    .map(DirectoryInner::OpenId),
                 unknown => {
                     let err = format!("Unknown directory type: {unknown:?}");
                     config.new_parse_error(("directory", id, "type"), err);
@@ -85,6 +91,18 @@ impl Directories {
 
             // Build directory
             if let Some(store) = store {
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                if store.is_enterprise_directory() && !is_enterprise {
+                    let message =
+                        format!("Directory {protocol:?} is an Enterprise Edition feature");
+                    config.new_parse_error(("directory", id, "type"), message);
+                    continue;
+                }
+                // SPDX-SnippetEnd
+
                 let directory = Arc::new(Directory {
                     store,
                     cache: CachedDirectory::try_from_config(config, ("directory", id)),

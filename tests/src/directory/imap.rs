@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use common::listener::limiter::{ConcurrencyLimiter, InFlight};
-use directory::QueryBy;
+use directory::QueryParams;
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
 use tokio::{
@@ -61,7 +61,9 @@ async fn imap_directory() {
         assert_eq!(
             &LookupResult::from(
                 handle
-                    .query(QueryBy::Credentials(item.as_credentials()), true)
+                    .query(
+                        QueryParams::credentials(item.as_credentials()).with_return_member_of(true)
+                    )
                     .await
                     .unwrap()
                     .is_some()
@@ -81,7 +83,10 @@ async fn imap_directory() {
             tokio::spawn(async move {
                 LookupResult::from(
                     handle
-                        .query(QueryBy::Credentials(item.as_credentials()), true)
+                        .query(
+                            QueryParams::credentials(item.as_credentials())
+                                .with_return_member_of(true),
+                        )
                         .await
                         .unwrap()
                         .is_some(),
@@ -122,7 +127,7 @@ pub fn spawn_mock_imap_server(max_concurrency: u64) -> watch::Sender<bool> {
                             //println!("--- Accepted connection --- ");
                             let acceptor = acceptor.clone();
                             let in_flight = limited.is_allowed();
-                            tokio::spawn(accept_imap(stream, acceptor, in_flight));
+                            tokio::spawn(accept_imap(stream, acceptor, in_flight.into()));
                         }
                         Err(err) => {
                             panic!("Something went wrong: {err}" );
@@ -152,12 +157,7 @@ async fn accept_imap(stream: TcpStream, acceptor: Arc<TlsAcceptor>, in_flight: O
 
     let mut buf_u8 = vec![0u8; 1024];
 
-    loop {
-        let br = if let Ok(br) = stream.read(&mut buf_u8).await {
-            br
-        } else {
-            break;
-        };
+    while let Ok(br) = stream.read(&mut buf_u8).await {
         let buf = std::str::from_utf8(&buf_u8[0..br]).unwrap();
         let (op, buf) = buf.split_once(' ').unwrap();
 

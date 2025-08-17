@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -76,7 +76,7 @@ impl<'x> Tokenizer<'x> {
                     self.is_eof = true;
                     break;
                 }
-                b'-' if self.buf.last().map_or(false, |c| *c == b'[') => {
+                b'-' if self.buf.last().is_some_and(|c| *c == b'[') => {
                     self.buf.push(ch);
                 }
                 b':' if self.buf.contains(&b'.') => {
@@ -85,21 +85,28 @@ impl<'x> Tokenizer<'x> {
                 b']' if self.buf.contains(&b'[') => {
                     self.buf.push(b']');
                 }
-                b'*' if self.buf.last().map_or(false, |&c| c == b'[' || c == b'.') => {
+                b'*' if self.buf.last().is_some_and(|&c| c == b'[' || c == b'.') => {
                     self.buf.push(ch);
                 }
                 _ => {
                     let (prev_token, ch) = if ch == b'(' && self.buf.eq(b"matches") {
                         // Parse regular expressions
-                        let stop_ch = self.find_char(&[b'\"', b'\''])?;
+                        let stop_ch = self.find_char(b"\"'")?;
                         let regex_str = self.parse_string(stop_ch)?;
                         let regex = Regex::new(&regex_str).map_err(|e| {
                             format!("Invalid regular expression {:?}: {}", regex_str, e)
                         })?;
                         self.has_alpha = false;
                         self.buf.clear();
-                        self.find_char(&[b','])?;
+                        self.find_char(b",")?;
                         (Token::Regex(regex).into(), b'(')
+                    } else if ch == b'(' && self.buf.eq(b"config_get") {
+                        // Parse setting
+                        let stop_ch = self.find_char(b"\"'")?;
+                        let setting_str = self.parse_string(stop_ch)?;
+                        self.has_alpha = false;
+                        self.buf.clear();
+                        (Token::Setting(Setting::from(setting_str)).into(), b'(')
                     } else if !self.buf.is_empty() {
                         self.is_start = false;
                         (self.parse_buf()?.into(), ch)
@@ -226,7 +233,7 @@ impl<'x> Tokenizer<'x> {
         Err("Unexpected end of expression".to_string())
     }
 
-    fn parse_string(&mut self, stop_ch: u8) -> Result<String, String> {
+    fn parse_string(&mut self, stop_ch: u8) -> Result<CompactString, String> {
         let mut buf = Vec::with_capacity(16);
         let mut last_ch = 0;
         let mut found_end = false;
@@ -260,7 +267,7 @@ impl<'x> Tokenizer<'x> {
         }
 
         if found_end {
-            String::from_utf8(buf).map_err(|_| "Invalid UTF-8".to_string())
+            CompactString::from_utf8(buf).map_err(|_| "Invalid UTF-8".into())
         } else {
             Err("Unterminated string".to_string())
         }
@@ -297,8 +304,15 @@ impl<'x> Tokenizer<'x> {
                 }
             }
 
-            if let Some(regex_capture) = buf.strip_prefix('$').and_then(|v| v.parse::<u32>().ok()) {
-                Ok(Token::Capture(regex_capture))
+            if let Some(variable) = buf.strip_prefix('$').filter(|s| !s.is_empty()) {
+                if variable.chars().all(|c| c.is_ascii_digit()) {
+                    Ok(variable
+                        .parse::<u32>()
+                        .map(Token::Capture)
+                        .unwrap_or_else(|_| Token::Global(variable.into())))
+                } else {
+                    Ok(Token::Global(variable.into()))
+                }
             } else if let Some((idx, (name, _, num_args))) = FUNCTIONS
                 .iter()
                 .enumerate()
@@ -353,6 +367,14 @@ impl TokenMap {
             V_QUEUE_EXPIRES_IN,
             V_QUEUE_LAST_STATUS,
             V_QUEUE_LAST_ERROR,
+            V_QUEUE_NAME,
+            V_QUEUE_AGE,
+            V_ASN,
+            V_COUNTRY,
+            V_RECEIVED_FROM_IP,
+            V_RECEIVED_VIA_PORT,
+            V_SOURCE,
+            V_SIZE,
         ])
     }
 

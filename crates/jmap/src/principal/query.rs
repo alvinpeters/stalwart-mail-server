@@ -1,20 +1,30 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::QueryBy;
+use crate::JmapMethods;
+use common::Server;
+use directory::QueryParams;
+use http_proto::HttpSessionData;
 use jmap_proto::{
     method::query::{Filter, QueryRequest, QueryResponse, RequestArguments},
-    types::collection::Collection,
+    types::{collection::Collection, state::State},
 };
+use std::future::Future;
 use store::{query::ResultSet, roaring::RoaringBitmap};
 
-use crate::{api::http::HttpSessionData, JMAP};
+pub trait PrincipalQuery: Sync + Send {
+    fn principal_query(
+        &self,
+        request: QueryRequest<RequestArguments>,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
+}
 
-impl JMAP {
-    pub async fn principal_query(
+impl PrincipalQuery for Server {
+    async fn principal_query(
         &self,
         mut request: QueryRequest<RequestArguments>,
         session: &HttpSessionData,
@@ -34,12 +44,12 @@ impl JMAP {
                         .core
                         .storage
                         .directory
-                        .query(QueryBy::Name(name.as_str()), false)
+                        .query(QueryParams::name(name.as_str()).with_return_member_of(false))
                         .await?
                     {
-                        if is_set || result_set.results.contains(principal.id) {
+                        if is_set || result_set.results.contains(principal.id()) {
                             result_set.results =
-                                RoaringBitmap::from_sorted_iter([principal.id]).unwrap();
+                                RoaringBitmap::from_sorted_iter([principal.id()]).unwrap();
                         } else {
                             result_set.results = RoaringBitmap::new();
                         }
@@ -50,9 +60,8 @@ impl JMAP {
                 }
                 Filter::Email(email) => {
                     let mut ids = RoaringBitmap::new();
-                    for id in self
-                        .core
-                        .email_to_ids(&self.core.storage.directory, &email, session.session_id)
+                    if let Some(id) = self
+                        .email_to_id(&self.core.storage.directory, &email, session.session_id)
                         .await?
                     {
                         ids.insert(id);
@@ -68,7 +77,7 @@ impl JMAP {
                 other => {
                     return Err(trc::JmapEvent::UnsupportedFilter
                         .into_err()
-                        .details(other.to_string()))
+                        .details(other.to_string()));
                 }
             }
         }
@@ -80,7 +89,9 @@ impl JMAP {
                 .unwrap_or_default();
         }
 
-        let (response, paginate) = self.build_query_response(&result_set, &request).await?;
+        let (response, paginate) = self
+            .build_query_response(&result_set, State::Initial, &request)
+            .await?;
 
         if let Some(paginate) = paginate {
             self.sort(result_set, Vec::new(), paginate, response).await

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,27 +9,29 @@ use store::Stores;
 use utils::config::Config;
 
 use crate::{
-    smtp::{
-        build_smtp,
-        inbound::TestMessage,
-        session::{load_test_message, TestSession, VerifyResponse},
-        TempDir, TestSMTP,
-    },
     AssertConfig,
+    smtp::{
+        TempDir, TestSMTP,
+        inbound::TestMessage,
+        session::{TestSession, VerifyResponse, load_test_message},
+    },
 };
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 
 const CONFIG: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
 directory = "local"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
+
+[spam-filter]
+enable = false
 
 [directory."local"]
 type = "memory"
@@ -105,18 +107,17 @@ async fn data() {
     crate::enable_logging();
 
     // Create temp dir for queue
-    let mut inner = Inner::default();
     let tmp_dir = TempDir::new("smtp_data_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
     config.assert_no_errors();
-    let mut qr = inner.init_test_queue(&core);
 
     // Test queue message builder
-    let core = build_smtp(core, inner);
-    let mut session = Session::test(core.clone());
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server.clone());
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.test_builder().await;
 
@@ -127,12 +128,7 @@ async fn data() {
 
     // Send broken message
     session
-        .send_message(
-            "john@doe.org",
-            &["bill@foobar.org"],
-            "From: john",
-            "550 5.7.7",
-        )
+        .send_message("john@doe.org", &["bill@foobar.org"], "invalid", "550 5.7.7")
         .await;
 
     // Naive Loop detection
@@ -158,11 +154,11 @@ async fn data() {
     session.mail_from("john@doe.org", "250").await;
     session.rcpt_to("bill@foobar.org", "250").await;
     session.ingest(b"DATA\r\n").await.unwrap();
-    session.response().assert_code("451 4.4.5");
+    session.response().assert_code("452 4.4.5");
     session.rset().await;
 
     // Headers should be added to messages from 10.0.0.3
-    session.data.remote_ip_str = "10.0.0.3".to_string();
+    session.data.remote_ip_str = "10.0.0.3".into();
     session.eval_session_params().await;
     session
         .send_message("bill@doe.org", &["mike@test.com"], "test:no_msgid", "250")
@@ -182,7 +178,7 @@ async fn data() {
         .assert_contains("Received-SPF: ");
 
     // Only one message is allowed in the queue from john@doe.org
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.eval_session_params().await;
     session
         .send_message("john@doe.org", &["bill@foobar.org"], "test:no_dkim", "250")
@@ -197,7 +193,7 @@ async fn data() {
         .await;
 
     // Release quota
-    qr.clear_queue(&core).await;
+    qr.clear_queue(&test.server).await;
 
     // Only 1500 bytes are allowed in the queue to domain foobar.org
     session
@@ -236,10 +232,9 @@ async fn data() {
         .await;
 
     // Make sure store is empty
-    qr.clear_queue(&core).await;
-    core.core
-        .storage
-        .data
-        .assert_is_empty(core.core.storage.blob.clone())
+    qr.clear_queue(&test.server).await;
+    test.server
+        .store()
+        .assert_is_empty(test.server.blob_store().clone())
         .await;
 }

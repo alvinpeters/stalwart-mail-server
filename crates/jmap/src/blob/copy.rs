@@ -1,25 +1,36 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::copy::{CopyBlobRequest, CopyBlobResponse},
     types::blob::BlobId,
 };
+use trc::AddContext;
 
+use std::future::Future;
 use store::{
-    write::{now, BatchBuilder, BlobOp},
-    BlobClass, Serialize,
+    BlobClass, SerializeInfallible,
+    write::{BatchBuilder, BlobOp, now},
 };
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, JMAP};
+use super::download::BlobDownload;
 
-impl JMAP {
-    pub async fn blob_copy(
+pub trait BlobCopy: Sync + Send {
+    fn blob_copy(
+        &self,
+        request: CopyBlobRequest,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<CopyBlobResponse>> + Send;
+}
+
+impl BlobCopy for Server {
+    async fn blob_copy(
         &self,
         request: CopyBlobRequest,
         access_token: &AccessToken,
@@ -43,7 +54,10 @@ impl JMAP {
                     },
                     0u32.serialize(),
                 );
-                self.write_batch(batch).await?;
+                self.store()
+                    .write(batch.build_all())
+                    .await
+                    .caused_by(trc::location!())?;
                 let dest_blob_id = BlobId {
                     hash: blob_id.hash.clone(),
                     class: BlobClass::Reserved {

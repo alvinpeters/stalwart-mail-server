@@ -1,29 +1,36 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::sync::Arc;
-
+use common::Server;
+use email::sieve::SieveScript;
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, RequestArguments},
-    object::Object,
-    types::{collection::Collection, property::Property, value::Value},
+    types::{
+        blob::{BlobId, BlobSection},
+        collection::{Collection, SyncCollection},
+        property::Property,
+        value::{Object, Value},
+    },
 };
-use sieve::Sieve;
-use store::{
-    query::Filter,
-    write::{assert::HashedValue, BatchBuilder, Bincode, BlobOp},
-    BlobClass, Deserialize, Serialize,
-};
+use store::BlobClass;
+use trc::AddContext;
 
-use crate::{sieve::SeenIds, JMAP};
+use crate::changes::state::StateManager;
 
-use super::ActiveScript;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn sieve_script_get(
+pub trait SieveScriptGet: Sync + Send {
+    fn sieve_script_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+}
+
+impl SieveScriptGet for Server {
+    async fn sieve_script_get(
         &self,
         mut request: GetRequest<RequestArguments>,
     ) -> trc::Result<GetResponse> {
@@ -51,7 +58,7 @@ impl JMAP {
         let mut response = GetResponse {
             account_id: request.account_id.into(),
             state: self
-                .get_state(account_id, Collection::SieveScript)
+                .get_state(account_id, SyncCollection::SieveScript)
                 .await?
                 .into(),
             list: Vec::with_capacity(ids.len()),
@@ -65,44 +72,46 @@ impl JMAP {
                 response.not_found.push(id.into());
                 continue;
             }
-            let mut push = if let Some(push) = self
-                .get_property::<Object<Value>>(
-                    account_id,
-                    Collection::SieveScript,
-                    document_id,
-                    Property::Value,
-                )
+            let sieve_ = if let Some(sieve) = self
+                .get_archive(account_id, Collection::SieveScript, document_id)
                 .await?
             {
-                push
+                sieve
             } else {
                 response.not_found.push(id.into());
                 continue;
             };
+            let sieve = sieve_
+                .unarchive::<SieveScript>()
+                .caused_by(trc::location!())?;
             let mut result = Object::with_capacity(properties.len());
             for property in &properties {
                 match property {
                     Property::Id => {
                         result.append(Property::Id, Value::Id(id));
                     }
-                    Property::Name | Property::IsActive => {
-                        result.append(property.clone(), push.remove(property));
+                    Property::Name => {
+                        result.append(Property::Name, Value::from(&sieve.name));
+                    }
+                    Property::IsActive => {
+                        result.append(Property::IsActive, Value::Bool(sieve.is_active));
                     }
                     Property::BlobId => {
-                        result.append(
-                            Property::BlobId,
-                            match push.remove(&Property::BlobId) {
-                                Value::BlobId(mut blob_id) => {
-                                    blob_id.class = BlobClass::Linked {
-                                        account_id,
-                                        collection: Collection::SieveScript.into(),
-                                        document_id,
-                                    };
-                                    Value::BlobId(blob_id)
-                                }
-                                other => other,
+                        let blob_id = BlobId {
+                            hash: (&sieve.blob_hash).into(),
+                            class: BlobClass::Linked {
+                                account_id,
+                                collection: Collection::SieveScript.into(),
+                                document_id,
                             },
-                        );
+                            section: BlobSection {
+                                size: u32::from(sieve.size) as usize,
+                                ..Default::default()
+                            }
+                            .into(),
+                        };
+
+                        result.append(Property::BlobId, Value::BlobId(blob_id));
                     }
                     property => {
                         result.append(property.clone(), Value::Null);
@@ -113,180 +122,5 @@ impl JMAP {
         }
 
         Ok(response)
-    }
-
-    pub async fn sieve_script_get_active(
-        &self,
-        account_id: u32,
-    ) -> trc::Result<Option<ActiveScript>> {
-        // Find the currently active script
-        if let Some(document_id) = self
-            .filter(
-                account_id,
-                Collection::SieveScript,
-                vec![Filter::eq(Property::IsActive, 1u32)],
-            )
-            .await?
-            .results
-            .min()
-        {
-            let (script, mut script_object) =
-                self.sieve_script_compile(account_id, document_id).await?;
-            Ok(Some(ActiveScript {
-                document_id,
-                script: Arc::new(script),
-                script_name: script_object
-                    .properties
-                    .remove(&Property::Name)
-                    .and_then(|name| name.try_unwrap_string())
-                    .unwrap_or_else(|| account_id.to_string()),
-                seen_ids: self
-                    .get_property::<Bincode<SeenIds>>(
-                        account_id,
-                        Collection::SieveScript,
-                        document_id,
-                        Property::EmailIds,
-                    )
-                    .await?
-                    .map(|seen_ids| seen_ids.inner)
-                    .unwrap_or_default(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn sieve_script_get_by_name(
-        &self,
-        account_id: u32,
-        name: &str,
-    ) -> trc::Result<Option<Sieve>> {
-        // Find the script by name
-        if let Some(document_id) = self
-            .filter(
-                account_id,
-                Collection::SieveScript,
-                vec![Filter::eq(Property::Name, name)],
-            )
-            .await?
-            .results
-            .min()
-        {
-            self.sieve_script_compile(account_id, document_id)
-                .await
-                .map(|(sieve, _)| Some(sieve))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[allow(clippy::blocks_in_conditions)]
-    async fn sieve_script_compile(
-        &self,
-        account_id: u32,
-        document_id: u32,
-    ) -> trc::Result<(Sieve, Object<Value>)> {
-        // Obtain script object
-        let script_object = self
-            .get_property::<HashedValue<Object<Value>>>(
-                account_id,
-                Collection::SieveScript,
-                document_id,
-                Property::Value,
-            )
-            .await?
-            .ok_or_else(|| {
-                trc::StoreEvent::NotFound
-                    .into_err()
-                    .caused_by(trc::location!())
-                    .document_id(document_id)
-            })?;
-
-        // Obtain the sieve script length
-        let (script_offset, blob_id) = script_object
-            .inner
-            .properties
-            .get(&Property::BlobId)
-            .and_then(|v| v.as_blob_id())
-            .and_then(|v| (v.section.as_ref()?.size, v).into())
-            .ok_or_else(|| {
-                trc::StoreEvent::NotFound
-                    .into_err()
-                    .caused_by(trc::location!())
-                    .document_id(document_id)
-            })?;
-
-        // Obtain the sieve script blob
-        let script_bytes = self
-            .get_blob(&blob_id.hash, 0..usize::MAX)
-            .await?
-            .ok_or_else(|| {
-                trc::StoreEvent::NotFound
-                    .into_err()
-                    .caused_by(trc::location!())
-                    .document_id(document_id)
-            })?;
-
-        // Obtain the precompiled script
-        if let Some(sieve) = script_bytes
-            .get(script_offset..)
-            .and_then(|bytes| Bincode::<Sieve>::deserialize(bytes).ok())
-        {
-            Ok((sieve.inner, script_object.inner))
-        } else {
-            // Deserialization failed, probably because the script compiler version changed
-            match self.core.sieve.untrusted_compiler.compile(
-                script_bytes.get(0..script_offset).ok_or_else(|| {
-                    trc::StoreEvent::NotFound
-                        .into_err()
-                        .caused_by(trc::location!())
-                        .document_id(document_id)
-                })?,
-            ) {
-                Ok(sieve) => {
-                    // Store updated compiled sieve script
-                    let sieve = Bincode::new(sieve);
-                    let compiled_bytes = (&sieve).serialize();
-                    let mut updated_sieve_bytes =
-                        Vec::with_capacity(script_offset + compiled_bytes.len());
-                    updated_sieve_bytes.extend_from_slice(&script_bytes[0..script_offset]);
-                    updated_sieve_bytes.extend_from_slice(&compiled_bytes);
-
-                    // Store updated blob
-                    let mut new_blob_id = blob_id.clone();
-                    new_blob_id.hash = self
-                        .put_blob(account_id, &updated_sieve_bytes, false)
-                        .await?
-                        .hash;
-                    let mut new_script_object = script_object.inner.clone();
-                    new_script_object.set(Property::BlobId, new_blob_id.clone());
-
-                    // Update script object
-                    let mut batch = BatchBuilder::new();
-                    batch
-                        .with_account_id(account_id)
-                        .with_collection(Collection::SieveScript)
-                        .update_document(document_id)
-                        .assert_value(Property::Value, &script_object)
-                        .set(Property::Value, (&new_script_object).serialize())
-                        .clear(BlobOp::Link {
-                            hash: blob_id.hash.clone(),
-                        })
-                        .set(
-                            BlobOp::Link {
-                                hash: new_blob_id.hash,
-                            },
-                            Vec::new(),
-                        );
-                    self.write_batch(batch).await?;
-
-                    Ok((sieve.inner, new_script_object))
-                }
-                Err(error) => Err(trc::StoreEvent::UnexpectedError
-                    .caused_by(trc::location!())
-                    .reason(error)
-                    .details("Failed to compile Sieve script")),
-            }
-        }
     }
 }

@@ -1,34 +1,61 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
+pub mod bimap;
+pub mod cache;
 pub mod codec;
 pub mod config;
 pub mod glob;
-pub mod lru_cache;
+pub mod json;
 pub mod map;
 pub mod snowflake;
-pub mod suffixlist;
+pub mod template;
+pub mod topological;
 pub mod url_params;
 
+use compact_str::ToCompactString;
+use futures::StreamExt;
+use reqwest::Response;
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     ClientConfig, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
 };
 use rustls_pki_types::TrustAnchor;
 
+pub use downcast_rs;
+pub use erased_serde;
+
 pub const BLOB_HASH_LEN: usize = 32;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BlobHash([u8; BLOB_HASH_LEN]);
+#[derive(
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[rkyv(derive(Debug))]
+#[repr(transparent)]
+pub struct BlobHash(pub [u8; BLOB_HASH_LEN]);
 
 impl BlobHash {
     pub fn new_max() -> Self {
         BlobHash([u8::MAX; BLOB_HASH_LEN])
+    }
+
+    pub fn generate(value: impl AsRef<[u8]>) -> Self {
+        BlobHash(blake3::hash(value.as_ref()).into())
     }
 
     pub fn try_from_hash_slice(value: &[u8]) -> Result<BlobHash, std::array::TryFromSliceError> {
@@ -48,21 +75,9 @@ impl BlobHash {
     }
 }
 
-impl From<&[u8]> for BlobHash {
-    fn from(value: &[u8]) -> Self {
-        BlobHash(blake3::hash(value).into())
-    }
-}
-
-impl From<Vec<u8>> for BlobHash {
-    fn from(value: Vec<u8>) -> Self {
-        value.as_slice().into()
-    }
-}
-
-impl From<&Vec<u8>> for BlobHash {
-    fn from(value: &Vec<u8>) -> Self {
-        value.as_slice().into()
+impl From<&ArchivedBlobHash> for BlobHash {
+    fn from(value: &ArchivedBlobHash) -> Self {
+        BlobHash(value.0)
     }
 }
 
@@ -90,6 +105,110 @@ impl AsMut<[u8]> for BlobHash {
     }
 }
 
+pub trait HttpLimitResponse: Sync + Send {
+    fn bytes_with_limit(
+        self,
+        limit: usize,
+    ) -> impl std::future::Future<Output = reqwest::Result<Option<Vec<u8>>>> + Send;
+}
+
+impl HttpLimitResponse for Response {
+    async fn bytes_with_limit(self, limit: usize) -> reqwest::Result<Option<Vec<u8>>> {
+        if self
+            .content_length()
+            .is_some_and(|len| len as usize > limit)
+        {
+            return Ok(None);
+        }
+
+        let mut bytes = Vec::with_capacity(std::cmp::min(limit, 1024));
+        let mut stream = self.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() + chunk.len() > limit {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        Ok(Some(bytes))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Semver(u64);
+
+impl Semver {
+    pub fn current() -> Self {
+        env!("CARGO_PKG_VERSION").try_into().unwrap()
+    }
+
+    pub fn new(major: u16, minor: u16, patch: u16) -> Self {
+        let mut version: u64 = 0;
+        version |= (major as u64) << 32;
+        version |= (minor as u64) << 16;
+        version |= patch as u64;
+        Semver(version)
+    }
+
+    pub fn unpack(&self) -> (u16, u16, u16) {
+        let version = self.0;
+        let major = ((version >> 32) & 0xFFFF) as u16;
+        let minor = ((version >> 16) & 0xFFFF) as u16;
+        let patch = (version & 0xFFFF) as u16;
+        (major, minor, patch)
+    }
+
+    pub fn major(&self) -> u16 {
+        (self.0 >> 32) as u16
+    }
+
+    pub fn minor(&self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    pub fn patch(&self) -> u16 {
+        self.0 as u16
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl AsRef<u64> for Semver {
+    fn as_ref(&self) -> &u64 {
+        &self.0
+    }
+}
+
+impl From<u64> for Semver {
+    fn from(value: u64) -> Self {
+        Semver(value)
+    }
+}
+
+impl TryFrom<&str> for Semver {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let mut parts = value.splitn(3, '.');
+        let major = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        let minor = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        let patch = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        Ok(Semver::new(major, minor, patch))
+    }
+}
+
+impl Display for Semver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (major, minor, patch) = self.unpack();
+        write!(f, "{major}.{minor}.{patch}")
+    }
+}
+
 pub trait UnwrapFailure<T> {
     fn failed(self, action: &str) -> T;
 }
@@ -101,7 +220,7 @@ impl<T> UnwrapFailure<T> for Option<T> {
             None => {
                 trc::event!(
                     Server(trc::ServerEvent::StartupError),
-                    Details = message.to_string()
+                    Details = message.to_compact_string()
                 );
                 eprintln!("{message}");
                 std::process::exit(1);
@@ -117,8 +236,8 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
             Err(err) => {
                 trc::event!(
                     Server(trc::ServerEvent::StartupError),
-                    Details = message.to_string(),
-                    Reason = err.to_string()
+                    Details = message.to_compact_string(),
+                    Reason = err.to_compact_string()
                 );
 
                 #[cfg(feature = "test_mode")]
@@ -137,7 +256,7 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
 pub fn failed(message: &str) -> ! {
     trc::event!(
         Server(trc::ServerEvent::StartupError),
-        Details = message.to_string(),
+        Details = message.to_compact_string(),
     );
     eprintln!("{message}");
     std::process::exit(1);
@@ -146,7 +265,7 @@ pub fn failed(message: &str) -> ! {
 pub async fn wait_for_shutdown() {
     #[cfg(not(target_env = "msvc"))]
     let signal = {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut h_term = signal(SignalKind::terminate()).failed("start signal handler");
         let mut h_int = signal(SignalKind::interrupt()).failed("start signal handler");
@@ -247,5 +366,44 @@ impl ServerCertVerifier for DummyVerifier {
             SignatureScheme::ED25519,
             SignatureScheme::ED448,
         ]
+    }
+}
+
+// Basic email sanitizer
+pub fn sanitize_email(email: &str) -> Option<String> {
+    let mut result = String::with_capacity(email.len());
+    let mut found_local = false;
+    let mut found_domain = false;
+    let mut last_ch = char::from(0);
+
+    for ch in email.chars() {
+        if !ch.is_whitespace() {
+            if ch == '@' {
+                if !result.is_empty() && !found_local {
+                    found_local = true;
+                } else {
+                    return None;
+                }
+            } else if ch == '.' {
+                if !(last_ch.is_alphanumeric() || last_ch == '-' || last_ch == '_') {
+                    return None;
+                } else if found_local {
+                    found_domain = true;
+                }
+            }
+            last_ch = ch;
+            for ch in ch.to_lowercase() {
+                result.push(ch);
+            }
+        }
+    }
+
+    if found_domain
+        && last_ch != '.'
+        && psl::domain(result.as_bytes()).is_some_and(|d| d.suffix().typ().is_some())
+    {
+        Some(result)
+    } else {
+        None
     }
 }

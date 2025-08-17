@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -10,19 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::config::smtp::report::AggregateFrequency;
+use common::{config::smtp::report::AggregateFrequency, ipc::DmarcEvent};
 use mail_auth::{
     common::parse::TxtRecordParser,
     dmarc::Dmarc,
     report::{ActionDisposition, Disposition, DmarcResult, Record, Report},
 };
+use smtp::reporting::dmarc::DmarcReporting;
 use store::write::QueueClass;
 
-use smtp::reporting::DmarcEvent;
-
 use crate::smtp::{
-    inbound::{sign::SIGNATURES, TestMessage},
-    outbound::TestServer,
+    DnsCache, TestSMTP,
+    inbound::{TestMessage, sign::SIGNATURES},
     session::VerifyResponse,
 };
 
@@ -30,12 +29,15 @@ const CONFIG: &str = r#"
 [session.rcpt]
 relay = true
 
+[server]
+hostname = "mx.example.org"
+
 [report]
 submitter = "'mx.example.org'"
 
 [report.dmarc.aggregate]
 from-name = "'DMARC Report'"
-from-address = "'reports@example.org'"
+from-address = "'reports@' + config_get('report.domain')"
 org-name = "'Foobar, Inc.'"
 contact-info = "'https://foobar.org/contact'"
 send = "daily"
@@ -49,23 +51,17 @@ async fn report_dmarc() {
     // Enable logging
     crate::enable_logging();
 
-
     // Create scheduler
-    let mut local = TestServer::new(
-        "smtp_report_dmarc_test",
-        CONFIG.to_string() + SIGNATURES,
-        true,
-    )
-    .await;
+    let mut local = TestSMTP::new("smtp_report_dmarc_test", CONFIG.to_string() + SIGNATURES).await;
 
     // Authorize external report for foobar.org
     let core = local.build_smtp();
-    core.core.smtp.resolvers.dns.txt_add(
+    core.txt_add(
         "foobar.org._report._dmarc.foobar.net",
         Dmarc::parse(b"v=DMARC1;").unwrap(),
         Instant::now() + Duration::from_secs(10),
     );
-    let qr = &mut local.qr;
+    let qr = &mut local.queue_receiver;
 
     // Schedule two events with a same policy and another one with a different policy
     let dmarc_record = Arc::new(
@@ -115,12 +111,12 @@ async fn report_dmarc() {
     // Expect report
     let message = qr.expect_message().await;
     qr.assert_no_events();
-    assert_eq!(message.recipients.len(), 1);
+    assert_eq!(message.message.recipients.len(), 1);
     assert_eq!(
-        message.recipients.last().unwrap().address,
+        message.message.recipients.last().unwrap().address(),
         "reports@foobar.net"
     );
-    assert_eq!(message.return_path, "reports@example.org");
+    assert_eq!(message.message.return_path, "reports@example.org");
     message
         .read_lines(qr)
         .await

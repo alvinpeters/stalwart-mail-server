@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -18,9 +18,14 @@ impl EventType {
                 | StoreEvent::BlobWrite
                 | StoreEvent::BlobDelete
                 | StoreEvent::SqlQuery
-                | StoreEvent::LdapQuery
-                | StoreEvent::LdapBind => Level::Trace,
-                StoreEvent::NotFound => Level::Debug,
+                | StoreEvent::LdapQuery => Level::Trace,
+                StoreEvent::CacheMiss
+                | StoreEvent::CacheHit
+                | StoreEvent::CacheStale
+                | StoreEvent::CacheUpdate
+                | StoreEvent::NotFound
+                | StoreEvent::HttpStoreFetch
+                | StoreEvent::LdapWarning => Level::Debug,
                 StoreEvent::AssertValueFailed
                 | StoreEvent::FoundationdbError
                 | StoreEvent::MysqlError
@@ -31,6 +36,7 @@ impl EventType {
                 | StoreEvent::ElasticsearchError
                 | StoreEvent::RedisError
                 | StoreEvent::S3Error
+                | StoreEvent::AzureError
                 | StoreEvent::FilesystemError
                 | StoreEvent::PoolError
                 | StoreEvent::DataCorruption
@@ -40,11 +46,11 @@ impl EventType {
                 | StoreEvent::NotSupported
                 | StoreEvent::UnexpectedError
                 | StoreEvent::CryptoError => Level::Error,
-                StoreEvent::BlobMissingMarker => Level::Warn,
+                StoreEvent::BlobMissingMarker | StoreEvent::HttpStoreError => Level::Warn,
             },
             EventType::Jmap(_) => Level::Debug,
             EventType::Imap(event) => match event {
-                ImapEvent::ConnectionStart | ImapEvent::ConnectionEnd => Level::Info,
+                ImapEvent::ConnectionStart | ImapEvent::ConnectionEnd => Level::Debug,
                 ImapEvent::GetAcl
                 | ImapEvent::SetAcl
                 | ImapEvent::MyRights
@@ -76,11 +82,12 @@ impl EventType {
                 | ImapEvent::Thread
                 | ImapEvent::Error
                 | ImapEvent::IdleStart
-                | ImapEvent::IdleStop => Level::Debug,
+                | ImapEvent::IdleStop
+                | ImapEvent::GetQuota => Level::Debug,
                 ImapEvent::RawInput | ImapEvent::RawOutput => Level::Trace,
             },
             EventType::ManageSieve(event) => match event {
-                ManageSieveEvent::ConnectionStart | ManageSieveEvent::ConnectionEnd => Level::Info,
+                ManageSieveEvent::ConnectionStart | ManageSieveEvent::ConnectionEnd => Level::Debug,
                 ManageSieveEvent::CreateScript
                 | ManageSieveEvent::UpdateScript
                 | ManageSieveEvent::GetScript
@@ -99,7 +106,7 @@ impl EventType {
                 ManageSieveEvent::RawInput | ManageSieveEvent::RawOutput => Level::Trace,
             },
             EventType::Pop3(event) => match event {
-                Pop3Event::ConnectionStart | Pop3Event::ConnectionEnd => Level::Info,
+                Pop3Event::ConnectionStart | Pop3Event::ConnectionEnd => Level::Debug,
                 Pop3Event::Delete
                 | Pop3Event::Reset
                 | Pop3Event::Quit
@@ -117,7 +124,7 @@ impl EventType {
                 Pop3Event::RawInput | Pop3Event::RawOutput => Level::Trace,
             },
             EventType::Smtp(event) => match event {
-                SmtpEvent::ConnectionStart | SmtpEvent::ConnectionEnd => Level::Info,
+                SmtpEvent::ConnectionStart | SmtpEvent::ConnectionEnd => Level::Debug,
                 SmtpEvent::DidNotSayEhlo
                 | SmtpEvent::EhloExpected
                 | SmtpEvent::LhloExpected
@@ -154,10 +161,8 @@ impl EventType {
                 | SmtpEvent::InvalidParameter
                 | SmtpEvent::UnsupportedParameter
                 | SmtpEvent::SyntaxError
-                | SmtpEvent::PipeSuccess
-                | SmtpEvent::PipeError
                 | SmtpEvent::Error => Level::Debug,
-                SmtpEvent::MissingLocalHostname | SmtpEvent::RemoteIdNotFound => Level::Warn,
+                SmtpEvent::MissingLocalHostname | SmtpEvent::IdNotFound => Level::Warn,
                 SmtpEvent::ConcurrencyLimitExceeded
                 | SmtpEvent::TransferLimitExceeded
                 | SmtpEvent::RateLimitExceeded
@@ -185,6 +190,7 @@ impl EventType {
                 | SmtpEvent::MailboxDoesNotExist
                 | SmtpEvent::RelayNotAllowed
                 | SmtpEvent::RcptTo
+                | SmtpEvent::RcptToGreylisted
                 | SmtpEvent::TooManyInvalidRcpt
                 | SmtpEvent::Vrfy
                 | SmtpEvent::VrfyNotFound
@@ -221,14 +227,15 @@ impl EventType {
                 LimitEvent::Quota => Level::Debug,
                 LimitEvent::BlobQuota => Level::Debug,
                 LimitEvent::TooManyRequests => Level::Warn,
+                LimitEvent::TenantQuota => Level::Info,
             },
             EventType::Manage(_) => Level::Debug,
             EventType::Auth(cause) => match cause {
-                AuthEvent::Failed => Level::Debug,
+                AuthEvent::Failed | AuthEvent::TokenExpired => Level::Debug,
                 AuthEvent::MissingTotp => Level::Trace,
                 AuthEvent::TooManyAttempts => Level::Warn,
                 AuthEvent::Error => Level::Error,
-                AuthEvent::Success => Level::Info,
+                AuthEvent::Success | AuthEvent::ClientRegistration => Level::Info,
             },
             EventType::Config(cause) => match cause {
                 ConfigEvent::ParseError
@@ -239,10 +246,8 @@ impl EventType {
                 ConfigEvent::DefaultApplied
                 | ConfigEvent::MissingSetting
                 | ConfigEvent::UnusedSetting
-                | ConfigEvent::ParseWarning
-                | ConfigEvent::BuildWarning
-                | ConfigEvent::AlreadyUpToDate
-                | ConfigEvent::ExternalKeyIgnored => Level::Debug,
+                | ConfigEvent::AlreadyUpToDate => Level::Debug,
+                ConfigEvent::ParseWarning | ConfigEvent::BuildWarning => Level::Warn,
                 ConfigEvent::ImportExternal => Level::Info,
             },
             EventType::Resource(cause) => match cause {
@@ -268,9 +273,9 @@ impl EventType {
                 PurgeEvent::Finished => Level::Debug,
                 PurgeEvent::Running => Level::Info,
                 PurgeEvent::Error => Level::Error,
-                PurgeEvent::PurgeActive
-                | PurgeEvent::AutoExpunge
-                | PurgeEvent::TombstoneCleanup => Level::Debug,
+                PurgeEvent::InProgress | PurgeEvent::AutoExpunge | PurgeEvent::TombstoneCleanup => {
+                    Level::Debug
+                }
             },
             EventType::Eval(event) => match event {
                 EvalEvent::Error | EvalEvent::StoreNotFound => Level::Debug,
@@ -325,27 +330,29 @@ impl EventType {
                 | SieveEvent::QuotaExceeded
                 | SieveEvent::ListNotFound
                 | SieveEvent::ScriptNotFound
-                | SieveEvent::RuntimeError
                 | SieveEvent::MessageTooLarge => Level::Warn,
                 SieveEvent::SendMessage => Level::Info,
                 SieveEvent::UnexpectedError => Level::Error,
                 SieveEvent::ActionAccept
+                | SieveEvent::RuntimeError
                 | SieveEvent::ActionAcceptReplace
                 | SieveEvent::ActionDiscard
                 | SieveEvent::ActionReject => Level::Debug,
             },
             EventType::Spam(event) => match event {
-                SpamEvent::PyzorError | SpamEvent::TrainError | SpamEvent::ClassifyError => {
-                    Level::Warn
-                }
-                SpamEvent::Train
+                SpamEvent::PyzorError
+                | SpamEvent::TrainError
+                | SpamEvent::DnsblError
+                | SpamEvent::Pyzor
+                | SpamEvent::Train
+                | SpamEvent::TrainAccount
                 | SpamEvent::Classify
-                | SpamEvent::NotEnoughTrainingData
-                | SpamEvent::TrainBalance => Level::Debug,
-                SpamEvent::ListUpdated => Level::Info,
+                | SpamEvent::ClassifyError
+                | SpamEvent::TrainBalance
+                | SpamEvent::Dnsbl => Level::Debug,
             },
             EventType::Http(event) => match event {
-                HttpEvent::ConnectionStart | HttpEvent::ConnectionEnd => Level::Info,
+                HttpEvent::ConnectionStart | HttpEvent::ConnectionEnd => Level::Debug,
                 HttpEvent::XForwardedMissing => Level::Warn,
                 HttpEvent::Error | HttpEvent::RequestUrl => Level::Debug,
                 HttpEvent::RequestBody | HttpEvent::ResponseBody => Level::Trace,
@@ -355,35 +362,25 @@ impl EventType {
                 PushSubscriptionEvent::Success => Level::Trace,
             },
             EventType::Cluster(event) => match event {
-                ClusterEvent::PeerAlive
-                | ClusterEvent::PeerDiscovered
-                | ClusterEvent::PeerOffline
-                | ClusterEvent::PeerSuspected
-                | ClusterEvent::PeerSuspectedIsAlive
-                | ClusterEvent::PeerBackOnline
-                | ClusterEvent::PeerLeaving => Level::Info,
-                ClusterEvent::PeerHasConfigChanges
-                | ClusterEvent::PeerHasListChanges
-                | ClusterEvent::OneOrMorePeersOffline => Level::Debug,
-                ClusterEvent::EmptyPacket
-                | ClusterEvent::Error
-                | ClusterEvent::DecryptionError
-                | ClusterEvent::InvalidPacket => Level::Warn,
+                ClusterEvent::SubscriberStart
+                | ClusterEvent::SubscriberStop
+                | ClusterEvent::PublisherStart
+                | ClusterEvent::PublisherStop => Level::Info,
+                ClusterEvent::SubscriberDisconnected => Level::Warn,
+                ClusterEvent::MessageReceived | ClusterEvent::MessageSkipped => Level::Trace,
+                ClusterEvent::PublisherError
+                | ClusterEvent::SubscriberError
+                | ClusterEvent::MessageInvalid => Level::Error,
             },
             EventType::Housekeeper(event) => match event {
-                HousekeeperEvent::Start
-                | HousekeeperEvent::PurgeAccounts
-                | HousekeeperEvent::PurgeSessions
-                | HousekeeperEvent::PurgeStore
-                | HousekeeperEvent::Stop => Level::Info,
-                HousekeeperEvent::Schedule => Level::Debug,
+                HousekeeperEvent::Start | HousekeeperEvent::Stop => Level::Info,
+                HousekeeperEvent::Run | HousekeeperEvent::Schedule => Level::Debug,
             },
-            EventType::FtsIndex(event) => match event {
-                FtsIndexEvent::Index => Level::Info,
-                FtsIndexEvent::LockBusy => Level::Warn,
-                FtsIndexEvent::BlobNotFound
-                | FtsIndexEvent::Locked
-                | FtsIndexEvent::MetadataNotFound => Level::Debug,
+            EventType::TaskQueue(event) => match event {
+                TaskQueueEvent::BlobNotFound
+                | TaskQueueEvent::TaskAcquired
+                | TaskQueueEvent::TaskLocked
+                | TaskQueueEvent::MetadataNotFound => Level::Debug,
             },
             EventType::Dmarc(_) => Level::Debug,
             EventType::Spf(_) => Level::Debug,
@@ -465,6 +462,7 @@ impl EventType {
                 DeliveryEvent::RawInput | DeliveryEvent::RawOutput => Level::Trace,
             },
             EventType::Queue(event) => match event {
+                QueueEvent::BackPressure => Level::Warn,
                 QueueEvent::QueueMessage
                 | QueueEvent::QueueMessageAuthenticated
                 | QueueEvent::QueueReport
@@ -474,12 +472,12 @@ impl EventType {
                 | QueueEvent::ConcurrencyLimitExceeded
                 | QueueEvent::Rescheduled
                 | QueueEvent::QuotaExceeded => Level::Info,
-                QueueEvent::LockBusy | QueueEvent::Locked | QueueEvent::BlobNotFound => {
-                    Level::Debug
-                }
+                QueueEvent::Locked | QueueEvent::BlobNotFound => Level::Debug,
             },
             EventType::TlsRpt(event) => match event {
-                TlsRptEvent::RecordFetch | TlsRptEvent::RecordFetchError => Level::Info,
+                TlsRptEvent::RecordFetch
+                | TlsRptEvent::RecordFetchError
+                | TlsRptEvent::RecordNotFound => Level::Info,
             },
             EventType::MtaSts(event) => match event {
                 MtaStsEvent::PolicyFetch
@@ -507,10 +505,7 @@ impl EventType {
                 | IncomingReportEvent::DecompressError => Level::Info,
             },
             EventType::OutgoingReport(event) => match event {
-                OutgoingReportEvent::LockBusy
-                | OutgoingReportEvent::LockDeleted
-                | OutgoingReportEvent::Locked
-                | OutgoingReportEvent::NotFound => Level::Info,
+                OutgoingReportEvent::Locked | OutgoingReportEvent::NotFound => Level::Info,
                 OutgoingReportEvent::SpfReport
                 | OutgoingReportEvent::SpfRateLimited
                 | OutgoingReportEvent::DkimReport
@@ -531,10 +526,26 @@ impl EventType {
                 | MessageIngestEvent::Spam
                 | MessageIngestEvent::ImapAppend
                 | MessageIngestEvent::JmapAppend
-                | MessageIngestEvent::Duplicate => Level::Info,
+                | MessageIngestEvent::Duplicate
+                | MessageIngestEvent::FtsIndex => Level::Info,
                 MessageIngestEvent::Error => Level::Error,
             },
             EventType::Security(_) => Level::Info,
+            EventType::Ai(event) => match event {
+                AiEvent::LlmResponse => Level::Trace,
+                AiEvent::ApiError => Level::Warn,
+            },
+            EventType::WebDav(_) => Level::Debug,
+            EventType::Calendar(event) => match event {
+                CalendarEvent::ItipMessageSent
+                | CalendarEvent::ItipMessageReceived
+                | CalendarEvent::AlarmSent => Level::Info,
+                CalendarEvent::AlarmFailed => Level::Warn,
+                CalendarEvent::RuleExpansionError
+                | CalendarEvent::AlarmSkipped
+                | CalendarEvent::AlarmRecipientOverride
+                | CalendarEvent::ItipMessageError => Level::Debug,
+            },
         }
     }
 }

@@ -1,29 +1,42 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
+use email::cache::MessageCacheFetch;
+use email::cache::email::MessageCacheAccess;
+use jmap_proto::types::{acl::Acl, blob::BlobId, collection::Collection};
+use std::future::Future;
 use std::ops::Range;
-
-use jmap_proto::types::{
-    acl::Acl,
-    blob::{BlobId, BlobSection},
-    collection::Collection,
-};
-use mail_parser::{
-    decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode},
-    Encoding,
-};
 use store::BlobClass;
 use trc::AddContext;
 use utils::BlobHash;
 
-use crate::{auth::AccessToken, JMAP};
+pub trait BlobDownload: Sync + Send {
+    fn blob_download(
+        &self,
+        blob_id: &BlobId,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<Option<Vec<u8>>>> + Send;
 
-impl JMAP {
+    fn get_blob(
+        &self,
+        hash: &BlobHash,
+        range: Range<usize>,
+    ) -> impl Future<Output = trc::Result<Option<Vec<u8>>>> + Send;
+
+    fn has_access_blob(
+        &self,
+        blob_id: &BlobId,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<bool>> + Send;
+}
+
+impl BlobDownload for Server {
     #[allow(clippy::blocks_in_conditions)]
-    pub async fn blob_download(
+    async fn blob_download(
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
@@ -47,12 +60,14 @@ impl JMAP {
                     document_id,
                 } => {
                     if Collection::from(*collection) == Collection::Email {
-                        match self
-                            .shared_messages(access_token, *account_id, Acl::ReadItems)
+                        if !self
+                            .get_cached_messages(*account_id)
                             .await
+                            .caused_by(trc::location!())?
+                            .shared_messages(access_token, Acl::ReadItems)
+                            .contains(*document_id)
                         {
-                            Ok(shared_messages) if shared_messages.contains(*document_id) => (),
-                            _ => return Ok(None),
+                            return Ok(None);
                         }
                     } else {
                         match self
@@ -83,29 +98,8 @@ impl JMAP {
         }
     }
 
-    pub async fn get_blob_section(
-        &self,
-        hash: &BlobHash,
-        section: &BlobSection,
-    ) -> trc::Result<Option<Vec<u8>>> {
-        Ok(self
-            .get_blob(
-                hash,
-                (section.offset_start)..(section.offset_start.saturating_add(section.size)),
-            )
-            .await?
-            .and_then(|bytes| match Encoding::from(section.encoding) {
-                Encoding::None => Some(bytes),
-                Encoding::Base64 => base64_decode(&bytes),
-                Encoding::QuotedPrintable => quoted_printable_decode(&bytes),
-            }))
-    }
-
-    pub async fn get_blob(
-        &self,
-        hash: &BlobHash,
-        range: Range<usize>,
-    ) -> trc::Result<Option<Vec<u8>>> {
+    #[inline(always)]
+    async fn get_blob(&self, hash: &BlobHash, range: Range<usize>) -> trc::Result<Option<Vec<u8>>> {
         self.core
             .storage
             .blob
@@ -114,7 +108,7 @@ impl JMAP {
             .caused_by(trc::location!())
     }
 
-    pub async fn has_access_blob(
+    async fn has_access_blob(
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
@@ -135,8 +129,10 @@ impl JMAP {
                     if Collection::from(*collection) == Collection::Email {
                         access_token.is_member(*account_id)
                             || self
-                                .shared_messages(access_token, *account_id, Acl::ReadItems)
-                                .await?
+                                .get_cached_messages(*account_id)
+                                .await
+                                .caused_by(trc::location!())?
+                                .shared_messages(access_token, Acl::ReadItems)
                                 .contains(*document_id)
                     } else {
                         access_token.is_member(*account_id)

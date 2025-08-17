@@ -1,14 +1,13 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use nlp::tokenizers::types::{TokenType, TypesTokenizer};
-use sieve::{runtime::Variable, FunctionMap};
-use utils::suffixlist::DomainPart;
+use sieve::{FunctionMap, runtime::Variable};
 
-use crate::scripts::functions::{html::html_to_tokens, text::tokenize_words, ApplyString};
+use crate::scripts::functions::{ApplyString, text::tokenize_words};
 
 use super::PluginContext;
 
@@ -23,7 +22,6 @@ pub fn register_domain_part(plugin_id: u32, fnc_map: &mut FunctionMap) {
 pub fn exec_tokenize(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let mut v = ctx.arguments;
     let (urls, urls_without_scheme, emails) = match v[1].to_string().as_ref() {
-        "html" => return Ok(html_to_tokens(v[0].to_string().as_ref()).into()),
         "words" => return Ok(tokenize_words(&v[0])),
         "uri" | "url" => (true, true, true),
         "uri_strict" | "url_strict" => (true, false, false),
@@ -33,7 +31,7 @@ pub fn exec_tokenize(ctx: PluginContext<'_>) -> trc::Result<Variable> {
 
     Ok(match v.remove(0) {
         v @ (Variable::String(_) | Variable::Array(_)) => {
-            TypesTokenizer::new(v.to_string().as_ref(), &ctx.core.smtp.resolvers.psl)
+            TypesTokenizer::new(v.to_string().as_ref())
                 .tokenize_numbers(false)
                 .tokenize_urls(urls)
                 .tokenize_urls_without_scheme(urls_without_scheme)
@@ -53,6 +51,12 @@ pub fn exec_tokenize(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     })
 }
 
+enum DomainPart {
+    Sld,
+    Tld,
+    Host,
+}
+
 pub fn exec_domain_part(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let v = ctx.arguments;
     let part = match v[1].to_string().as_ref() {
@@ -63,12 +67,12 @@ pub fn exec_domain_part(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     };
 
     Ok(v[0].transform(|domain| {
-        ctx.core
-            .smtp
-            .resolvers
-            .psl
-            .domain_part(domain, part)
-            .map(Variable::from)
-            .unwrap_or_default()
+        match part {
+            DomainPart::Sld => psl::domain_str(domain),
+            DomainPart::Tld => domain.rsplit_once('.').map(|(_, tld)| tld),
+            DomainPart::Host => domain.split_once('.').map(|(host, _)| host),
+        }
+        .map(Variable::from)
+        .unwrap_or_default()
     }))
 }

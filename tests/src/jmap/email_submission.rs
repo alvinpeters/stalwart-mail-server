@@ -1,16 +1,15 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use ahash::AHashMap;
-use directory::backend::internal::manage::ManageDirectory;
 use jmap_client::{
-    core::set::{SetError, SetErrorType, SetObject},
-    email_submission::{query::Filter, Address, Delivered, DeliveryStatus, Displayed, UndoStatus},
-    mailbox::Role,
     Error,
+    core::set::{SetError, SetErrorType, SetObject},
+    email_submission::{Address, Delivered, DeliveryStatus, Displayed, UndoStatus, query::Filter},
+    mailbox::Role,
 };
 use jmap_proto::types::id::Id;
 use mail_parser::DateTime;
@@ -26,8 +25,10 @@ use tokio::{
     sync::mpsc,
 };
 
-use crate::jmap::{
-    assert_is_empty, email_set::assert_email_properties, mailbox::destroy_all_mailboxes,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{assert_is_empty, email_set::assert_email_properties, mailbox::destroy_all_mailboxes},
+    smtp::DnsCache,
 };
 
 use super::JMAPTest;
@@ -68,7 +69,7 @@ pub async fn test(params: &mut JMAPTest) {
     let server = params.server.clone();
     let client = &mut params.client;
     let (mut smtp_rx, smtp_settings) = spawn_mock_smtp_server();
-    server.core.smtp.resolvers.dns.ipv4_add(
+    server.ipv4_add(
         "localhost",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + std::time::Duration::from_secs(10),
@@ -76,39 +77,35 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create a test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "john.doe@example.com", "alias")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com", "john.doe@example.com"],
+            )
+            .await,
     )
     .to_string();
 
     // Test automatic identity creation
-    for (identity_id, email) in [(0u64, "jdoe@example.com"), (1u64, "john.doe@example.com")] {
+    client.set_default_account_id(&account_id);
+    for (identity_id, email) in [(2u64, "jdoe@example.com"), (1u64, "john.doe@example.com")] {
         let identity = client
             .identity_get(&Id::from(identity_id).to_string(), None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(identity.email().unwrap(), email);
-        assert_eq!(identity.name().unwrap(), format!("John Doe <{email}>"));
+        assert_eq!(identity.name().unwrap(), "John Doe");
     }
 
     // Create an identity without using a valid address should fail
     match client
-        .set_default_account_id(&account_id)
         .identity_create("John Doe", "someaddress@domain.com")
         .await
         .unwrap_err()
@@ -197,8 +194,13 @@ pub async fn test(params: &mut JMAPTest) {
     ));
 
     // Submit a valid message submission
-    let email_body =
-        "From: jdoe@example.com\r\nTo: jane_smith@remote.org\r\nSubject: hey\r\n\r\ntest";
+    let email_body = concat!(
+        "From: jdoe@example.com\r\n",
+        "To: jane_smith@remote.org\r\n",
+        "Bcc: bill@remote.org\r\n",
+        "Subject: hey\r\n\r\n",
+        "test"
+    );
     let email_id = client
         .email_import(
             email_body.as_bytes().to_vec(),
@@ -215,12 +217,13 @@ pub async fn test(params: &mut JMAPTest) {
         .unwrap();
 
     // Confirm that the message has been delivered
+    let email_body = email_body.replace("Bcc: bill@remote.org\r\n", "");
     assert_message_delivery(
         &mut smtp_rx,
         MockMessage::new(
             "<jdoe@example.com>",
-            ["<jane_smith@remote.org>"],
-            email_body,
+            ["<bill@remote.org>", "<jane_smith@remote.org>"],
+            &email_body,
         ),
     )
     .await;
@@ -248,15 +251,17 @@ pub async fn test(params: &mut JMAPTest) {
 
         assert_eq!(message.mail_from, "<jdoe@example.com>");
         let rcpt_to = message.rcpt_to.pop().unwrap();
-        assert!([
-            "<james@other_domain.com>",
-            "<secret_rcpt@test.com>",
-            "<tim@foobar.com>",
-        ]
-        .contains(&rcpt_to.as_str()));
+        assert!(
+            [
+                "<james@other_domain.com>",
+                "<secret_rcpt@test.com>",
+                "<tim@foobar.com>",
+            ]
+            .contains(&rcpt_to.as_str())
+        );
 
         assert!(
-            message.message.contains(email_body),
+            message.message.contains(&email_body),
             "Got [{}], Expected[{}]",
             message.message,
             email_body
@@ -307,7 +312,7 @@ pub async fn test(params: &mut JMAPTest) {
         .take_id();
     assert_message_delivery(
         &mut smtp_rx,
-        MockMessage::new("<jdoe@example.com>", ["<tim@foobar.com>"], email_body),
+        MockMessage::new("<jdoe@example.com>", ["<tim@foobar.com>"], &email_body),
     )
     .await;
     expect_nothing(&mut smtp_rx).await;
@@ -465,18 +470,20 @@ pub async fn test(params: &mut JMAPTest) {
     set_request.arguments().on_success_destroy_email(&create_id);
     request.send().await.unwrap().unwrap_method_responses();
 
-    assert!(client
-        .email_get(&email_id, None::<Vec<_>>)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        client
+            .email_get(&email_id, None::<Vec<_>>)
+            .await
+            .unwrap()
+            .is_none()
+    );
     smtp_settings.lock().do_stop = true;
 
     // Destroy the created mailbox, identity and all submissions
     for identity_id in [
         identity_id,
-        Id::from(0u64).to_string(),
         Id::from(1u64).to_string(),
+        Id::from(2u64).to_string(),
     ] {
         client.identity_destroy(&identity_id).await.unwrap();
     }
@@ -565,7 +572,7 @@ pub fn spawn_mock_smtp_server() -> (mpsc::Receiver<MockMessage>, Arc<Mutex<MockS
                             .unwrap();
                         buf.clear();
                         while rx.read_line(&mut buf).await.is_ok() {
-                            if buf.starts_with('.') {
+                            if buf.starts_with('.') && buf.len() < 4 {
                                 message.message = message.message.trim().to_string();
                                 break;
                             } else {

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -26,7 +26,8 @@ pub(crate) trait CfHandle {
 impl CfHandle for OptimisticTransactionDB<MultiThreaded> {
     #[inline(always)]
     fn subspace_handle(&self, subspace: u8) -> Arc<BoundColumnFamily<'_>> {
-        self.cf_handle(unsafe { std::str::from_utf8_unchecked(&[subspace]) })
+        let subspace = &[subspace];
+        self.cf_handle(unsafe { std::str::from_utf8_unchecked(subspace) })
             .unwrap()
     }
 }

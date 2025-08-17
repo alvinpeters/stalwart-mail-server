@@ -1,58 +1,69 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::jmap::{
-    assert_is_empty, delivery::SmtpConnection, emails_purge_tombstoned, jmap_raw_request,
-    mailbox::destroy_all_mailboxes, test_account_login,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{
+        assert_is_empty, delivery::SmtpConnection, emails_purge_tombstoned, jmap_raw_request,
+        mailbox::destroy_all_mailboxes, test_account_login,
+    },
+    smtp::queue::QueuedEvents,
 };
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::{blob::upload::DISABLE_UPLOAD_QUOTA, mailbox::INBOX_ID};
+use common::config::smtp::queue::QueueName;
+use email::mailbox::INBOX_ID;
+use jmap::blob::upload::DISABLE_UPLOAD_QUOTA;
 use jmap_client::{
     core::set::{SetErrorType, SetObject},
     email::EmailBodyPart,
 };
 use jmap_proto::types::{collection::Collection, id::Id};
+use smtp::queue::spool::SmtpSpool;
 
 use super::JMAPTest;
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running quota tests...");
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("robert@example.com", "aabbcc", "Robert Foobar")
-        .await;
-    let other_account_id = Id::from(
-        server
-            .core
-            .storage
-            .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
-    );
-    let account_id = Id::from(
-        server
-            .core
-            .storage
-            .data
-            .get_or_create_account_id("robert@example.com")
-            .await
-            .unwrap(),
-    );
-    params
-        .directory
+    let mut account_id = Id::from(0u64);
+    let mut other_account_id = Id::from(0u64);
+
+    for (id, email, password, name) in [
+        (
+            &mut other_account_id,
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+        ),
+        (
+            &mut account_id,
+            "robert@example.com",
+            "aabbcc",
+            "Robert Foobar",
+        ),
+    ] {
+        *id = Id::from(
+            server
+                .core
+                .storage
+                .data
+                .create_test_user(email, password, name, &[email][..])
+                .await,
+        );
+    }
+
+    server
+        .core
+        .storage
+        .data
         .set_test_quota("robert@example.com", 1024)
         .await;
-    params
-        .directory
+    server
+        .core
+        .storage
+        .data
         .add_to_group("robert@example.com", "jdoe@example.com")
         .await;
 
@@ -218,6 +229,23 @@ pub async fn test(params: &mut JMAPTest) {
     let create_id = create_item.create_id().unwrap();
     assert_over_quota(request.send_set_email().await.unwrap().created(&create_id));
 
+    // Recalculate quota
+    let prev_quota = server
+        .get_used_quota(account_id.document_id())
+        .await
+        .unwrap();
+    server
+        .recalculate_quota(account_id.document_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .get_used_quota(account_id.document_id())
+            .await
+            .unwrap(),
+        prev_quota
+    );
+
     // Delete messages and check available quota
     for message_id in message_ids {
         client.email_destroy(&message_id).await.unwrap();
@@ -324,6 +352,7 @@ pub async fn test(params: &mut JMAPTest) {
             .len(),
         1,
     );
+
     DISABLE_UPLOAD_QUOTA.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Remove test data
@@ -331,13 +360,12 @@ pub async fn test(params: &mut JMAPTest) {
         params.client.set_default_account_id(account_id.to_string());
         destroy_all_mailboxes(params).await;
     }
-    for event in server.smtp.next_event().await {
+    for event in server.all_queued_messages().await.messages {
         server
-            .smtp
-            .read_message(event.queue_id)
+            .read_message(event.queue_id, QueueName::default())
             .await
             .unwrap()
-            .remove(&server.smtp, event.due)
+            .remove(&server, event.due.into())
             .await;
     }
     assert_is_empty(server).await;

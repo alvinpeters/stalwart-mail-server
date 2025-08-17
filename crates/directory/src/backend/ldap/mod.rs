@@ -1,11 +1,11 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use deadpool::managed::Pool;
-use ldap3::{ldap_escape, LdapConnSettings};
+use ldap3::{LdapConnSettings, ldap_escape};
 use store::Store;
 
 pub mod config;
@@ -15,7 +15,7 @@ pub mod pool;
 pub struct LdapDirectory {
     pool: Pool<LdapConnectionManager>,
     mappings: LdapMappings,
-    auth_bind: Option<LdapFilter>,
+    auth_bind: AuthBind,
     pub(crate) data_store: Store,
 }
 
@@ -24,14 +24,12 @@ pub struct LdapMappings {
     base_dn: String,
     filter_name: LdapFilter,
     filter_email: LdapFilter,
-    filter_verify: LdapFilter,
-    filter_expand: LdapFilter,
-    filter_domains: LdapFilter,
     attr_name: Vec<String>,
     attr_type: Vec<String>,
     attr_groups: Vec<String>,
     attr_description: Vec<String>,
     attr_secret: Vec<String>,
+    attr_secret_changed: Vec<String>,
     attr_email_address: Vec<String>,
     attr_email_alias: Vec<String>,
     attr_quota: Vec<String>,
@@ -39,14 +37,43 @@ pub struct LdapMappings {
 }
 
 #[derive(Debug, Default)]
-struct LdapFilter {
-    filter: Vec<String>,
+pub(crate) struct LdapFilter {
+    filter: Vec<LdapFilterItem>,
+}
+
+#[derive(Debug)]
+enum LdapFilterItem {
+    Static(String),
+    Full,
+    LocalPart,
+    DomainPart,
 }
 
 impl LdapFilter {
     pub fn build(&self, value: &str) -> String {
-        let value = ldap_escape(value);
-        self.filter.join(value.as_ref())
+        let mut result = String::with_capacity(value.len() + 16);
+
+        for item in &self.filter {
+            match item {
+                LdapFilterItem::Static(s) => result.push_str(s),
+                LdapFilterItem::Full => result.push_str(ldap_escape(value).as_ref()),
+                LdapFilterItem::LocalPart => {
+                    result.push_str(
+                        value
+                            .rsplit_once('@')
+                            .map(|(local, _)| local)
+                            .unwrap_or(value),
+                    );
+                }
+                LdapFilterItem::DomainPart => {
+                    if let Some((_, domain)) = value.rsplit_once('@') {
+                        result.push_str(domain);
+                    }
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -75,4 +102,13 @@ impl Bind {
     pub fn new(dn: String, password: String) -> Self {
         Self { dn, password }
     }
+}
+
+pub(crate) enum AuthBind {
+    Template {
+        template: LdapFilter,
+        can_search: bool,
+    },
+    Lookup,
+    None,
 }

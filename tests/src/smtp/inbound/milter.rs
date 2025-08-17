@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,24 +8,25 @@ use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use ahash::AHashSet;
 use common::{
+    Core,
     config::smtp::session::{Milter, MilterVersion, Stage},
     expr::if_block::IfBlock,
     manager::webadmin::Resource,
-    Core,
 };
+
+use http_proto::{ToHttpResponse, request::fetch_body};
 use hyper::{body, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use jmap::api::http::{fetch_body, ToHttpResponse};
 use mail_auth::AuthenticatedMessage;
 use mail_parser::MessageParser;
 use serde::Deserialize;
 use smtp::{
-    core::{Inner, Session, SessionData},
+    core::{Session, SessionData},
     inbound::{
         hooks::{self, Request, SmtpResponse},
         milter::{
-            receiver::{FrameResult, Receiver},
             Action, Command, Macros, MilterClient, Modification, Options, Response,
+            receiver::{FrameResult, Receiver},
         },
     },
 };
@@ -38,10 +39,9 @@ use tokio::{
 use utils::config::Config;
 
 use crate::smtp::{
-    build_smtp,
-    inbound::TestMessage,
-    session::{load_test_message, TestSession, VerifyResponse},
     TempDir, TestSMTP,
+    inbound::TestMessage,
+    session::{TestSession, VerifyResponse, load_test_message},
 };
 
 #[derive(Debug, Deserialize)]
@@ -52,13 +52,13 @@ struct HeaderTest {
 
 const CONFIG_MILTER: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
 
 [session.rcpt]
@@ -78,13 +78,13 @@ stages = ["data"]
 
 const CONFIG_JMILTER: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
 
 [session.rcpt]
@@ -104,16 +104,16 @@ async fn milter_session() {
     // Configure tests
     let tmp_dir = TempDir::new("smtp_milter_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG_MILTER)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
     let _rx = spawn_mock_milter_server();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut inner = Inner::default();
-    let mut qr = inner.init_test_queue(&core);
 
     // Build session
-    let mut session = Session::test(build_smtp(core, inner));
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx.doe.org").await;
 
@@ -237,16 +237,16 @@ async fn mta_hook_session() {
     // Configure tests
     let tmp_dir = TempDir::new("smtp_mta_hook_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG_JMILTER)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
     let _rx = spawn_mock_mta_hook_server();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut inner = Inner::default();
-    let mut qr = inner.init_test_queue(&core);
 
     // Build session
-    let mut session = Session::test(build_smtp(core, inner));
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx.doe.org").await;
 
@@ -373,63 +373,67 @@ fn milter_address_modifications() {
         0,
         "127.0.0.1".parse().unwrap(),
         0,
+        Default::default(),
         0,
     );
 
     // ChangeFrom
-    assert!(data
-        .apply_milter_modifications(
+    assert!(
+        data.apply_milter_modifications(
             vec![Modification::ChangeFrom {
-                sender: "<>".to_string(),
-                args: String::new()
+                sender: "<>".into(),
+                args: "".into(),
             }],
             &parsed_test_message
         )
-        .is_none());
+        .is_none()
+    );
     let addr = data.mail_from.as_ref().unwrap();
     assert_eq!(addr.address_lcase, "");
     assert_eq!(addr.dsn_info, None);
     assert_eq!(addr.flags, 0);
 
     // ChangeFrom with parameters
-    assert!(data
-        .apply_milter_modifications(
+    assert!(
+        data.apply_milter_modifications(
             vec![Modification::ChangeFrom {
-                sender: "john@example.org".to_string(),
-                args: "REQUIRETLS ENVID=abc123".to_string(), //"NOTIFY=SUCCESS,FAILURE ENVID=abc123\n".to_string()
+                sender: "john@example.org".into(),
+                args: "REQUIRETLS ENVID=abc123".into(), //"NOTIFY=SUCCESS,FAILURE ENVID=abc123\n".into()
             }],
             &parsed_test_message
         )
-        .is_none());
+        .is_none()
+    );
     let addr = data.mail_from.as_ref().unwrap();
     assert_eq!(addr.address_lcase, "john@example.org");
     assert_ne!(addr.flags, 0);
-    assert_eq!(addr.dsn_info, Some("abc123".to_string()));
+    assert_eq!(addr.dsn_info, Some("abc123".into()));
 
     // Add recipients
-    assert!(data
-        .apply_milter_modifications(
+    assert!(
+        data.apply_milter_modifications(
             vec![
                 Modification::AddRcpt {
-                    recipient: "bill@example.org".to_string(),
-                    args: "".to_string(),
+                    recipient: "bill@example.org".into(),
+                    args: "".into(),
                 },
                 Modification::AddRcpt {
-                    recipient: "jane@foobar.org".to_string(),
-                    args: "NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;Jane.Doe@Foobar.org".to_string(),
+                    recipient: "jane@foobar.org".into(),
+                    args: "NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;Jane.Doe@Foobar.org".into(),
                 },
                 Modification::AddRcpt {
-                    recipient: "<bill@example.org>".to_string(),
-                    args: "".to_string(),
+                    recipient: "<bill@example.org>".into(),
+                    args: "".into(),
                 },
                 Modification::AddRcpt {
-                    recipient: "<>".to_string(),
-                    args: "".to_string(),
+                    recipient: "<>".into(),
+                    args: "".into(),
                 },
             ],
             &parsed_test_message
         )
-        .is_none());
+        .is_none()
+    );
     assert_eq!(data.rcpt_to.len(), 2);
     let addr = data.rcpt_to.first().unwrap();
     assert_eq!(addr.address_lcase, "bill@example.org");
@@ -438,27 +442,28 @@ fn milter_address_modifications() {
     let addr = data.rcpt_to.last().unwrap();
     assert_eq!(addr.address_lcase, "jane@foobar.org");
     assert_ne!(addr.flags, 0);
-    assert_eq!(addr.dsn_info, Some("Jane.Doe@Foobar.org".to_string()));
+    assert_eq!(addr.dsn_info, Some("Jane.Doe@Foobar.org".into()));
 
     // Remove recipients
-    assert!(data
-        .apply_milter_modifications(
+    assert!(
+        data.apply_milter_modifications(
             vec![
                 Modification::DeleteRcpt {
-                    recipient: "bill@example.org".to_string(),
+                    recipient: "bill@example.org".into(),
                 },
                 Modification::DeleteRcpt {
-                    recipient: "<>".to_string(),
+                    recipient: "<>".into(),
                 },
             ],
             &parsed_test_message
         )
-        .is_none());
+        .is_none()
+    );
     assert_eq!(data.rcpt_to.len(), 1);
     let addr = data.rcpt_to.last().unwrap();
     assert_eq!(addr.address_lcase, "jane@foobar.org");
     assert_ne!(addr.flags, 0);
-    assert_eq!(addr.dsn_info, Some("Jane.Doe@Foobar.org".to_string()));
+    assert_eq!(addr.dsn_info, Some("Jane.Doe@Foobar.org".into()));
 }
 
 #[test]
@@ -479,6 +484,7 @@ fn milter_message_modifications() {
         0,
         "127.0.0.1".parse().unwrap(),
         0,
+        Default::default(),
         0,
     );
 
@@ -547,9 +553,9 @@ async fn milter_client_test() {
     let mut client = MilterClient::connect(
         &Milter {
             enable: IfBlock::empty(""),
-            id: "test".to_string().into(),
+            id: Arc::new("test".into()),
             addrs: vec![SocketAddr::from(([127, 0, 0, 1], PORT))],
-            hostname: "localhost".to_string(),
+            hostname: "localhost".into(),
             port: PORT,
             timeout_connect: Duration::from_secs(10),
             timeout_command: Duration::from_secs(30),
@@ -598,7 +604,7 @@ async fn milter_client_test() {
     let r = client.headers(message.headers_raw()).await.unwrap();
     println!("HEADERS: {:?}", r);
     let r = client
-        .body(&message.raw_message()[message.root_part().raw_body_offset()..])
+        .body(&message.raw_message()[message.root_part().raw_body_offset() as usize..])
         .await
         .unwrap();
     println!("BODY: {:?}", r);
@@ -722,7 +728,7 @@ async fn accept_milter(
                                 "conn_fail" => Action::ConnectionFailure,
                                 "reply_code" => Action::ReplyCode {
                                     code: [b'3', b'2', b'1'],
-                                    text: "test".to_string(),
+                                    text: "test".into(),
                                 },
                                 test_num => {
                                     modifications = tests[test_num.parse::<usize>().unwrap()]
@@ -809,10 +815,7 @@ pub fn spawn_mock_mta_hook_server() -> watch::Sender<bool> {
                                         let response = handle_mta_hook(request, tests);
 
                                         Ok::<_, hyper::Error>(
-                                            Resource {
-                                                content_type: "application/json",
-                                                contents: serde_json::to_string(&response).unwrap().into_bytes(),
-                                            }
+                                            Resource::new("application/json", serde_json::to_string(&response).unwrap().into_bytes())
                                             .into_http_response().build(),
                                         )
                                     }
@@ -865,8 +868,8 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
             action: hooks::Action::Reject,
             response: SmtpResponse {
                 status: 451.into(),
-                enhanced_status: "4.3.5".to_string().into(),
-                message: "Unable to accept message at this time.".to_string().into(),
+                enhanced_status: Some("4.3.5".into()),
+                message: Some("Unable to accept message at this time.".into()),
                 disconnect: false,
             }
             .into(),
@@ -876,8 +879,8 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
             action: hooks::Action::Reject,
             response: SmtpResponse {
                 status: 421.into(),
-                enhanced_status: "4.3.0".to_string().into(),
-                message: "Server shutting down".to_string().into(),
+                enhanced_status: Some("4.3.0".into()),
+                message: Some("Server shutting down".into()),
                 disconnect: false,
             }
             .into(),
@@ -896,8 +899,8 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
             action: hooks::Action::Reject,
             response: SmtpResponse {
                 status: 321.into(),
-                enhanced_status: "3.1.1".to_string().into(),
-                message: "Test".to_string().into(),
+                enhanced_status: Some("3.1.1".into()),
+                message: Some("Test".into()),
                 disconnect: false,
             }
             .into(),
@@ -916,7 +919,7 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
                             .split_whitespace()
                             .map(|arg| {
                                 let (key, value) = arg.split_once('=').unwrap();
-                                (key.to_string(), Some(value.to_string()))
+                                (key.into(), Some(value.into()))
                             })
                             .collect(),
                     },
@@ -927,7 +930,7 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
                                 .split_whitespace()
                                 .map(|arg| {
                                     let (key, value) = arg.split_once('=').unwrap();
-                                    (key.to_string(), Some(value.to_string()))
+                                    (key.into(), Some(value.into()))
                                 })
                                 .collect(),
                         }
@@ -959,8 +962,8 @@ fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Resp
                         }
                     }
                     Modification::Quarantine { reason } => hooks::Modification::AddHeader {
-                        name: "X-Quarantine".to_string(),
-                        value: reason.to_string(),
+                        name: "X-Quarantine".into(),
+                        value: reason.clone(),
                     },
                 })
                 .collect(),

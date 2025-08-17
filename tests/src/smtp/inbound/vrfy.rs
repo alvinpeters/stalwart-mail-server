@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,23 +9,26 @@ use common::Core;
 use store::Stores;
 use utils::config::Config;
 
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 
-use crate::smtp::{
-    build_smtp,
-    session::{TestSession, VerifyResponse},
-    TempDir,
+use crate::{
+    AssertConfig,
+    smtp::{
+        TempDir, TestSMTP,
+        session::{TestSession, VerifyResponse},
+    },
 };
 
 const CONFIG: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+directory = "local"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/data.db"
 
 [directory."local"]
@@ -70,12 +73,13 @@ async fn vrfy_expn() {
 
     let tmp_dir = TempDir::new("smtp_vrfy_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // EHLO should not advertise VRFY/EXPN to 10.0.0.2
-    let mut session = Session::test(build_smtp(core, Inner::default()));
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.eval_session_params().await;
     session
         .ehlo("mx.foobar.org")
@@ -86,7 +90,7 @@ async fn vrfy_expn() {
     session.cmd("EXPN sales@foobar.org", "252 2.5.1").await;
 
     // EHLO should advertise VRFY/EXPN for 10.0.0.1
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session
         .ehlo("mx.foobar.org")

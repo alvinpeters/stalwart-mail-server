@@ -1,29 +1,36 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{borrow::Cow, fmt::Debug, str::FromStr, time::Duration};
 
+use compact_str::{CompactString, ToCompactString, format_compact};
 use mail_auth::common::verify::VerifySignature;
 
 use crate::*;
 
 impl AsRef<EventType> for Error {
     fn as_ref(&self) -> &EventType {
-        &self.inner
+        &self.0.inner
     }
 }
 
 impl From<&'static str> for Value {
     fn from(value: &'static str) -> Self {
-        Self::Static(value)
+        Self::String(CompactString::const_new(value))
     }
 }
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        Self::String(CompactString::from_string_buffer(value))
+    }
+}
+
+impl From<CompactString> for Value {
+    fn from(value: CompactString) -> Self {
         Self::String(value)
     }
 }
@@ -100,8 +107,8 @@ impl From<Duration> for Value {
     }
 }
 
-impl From<Event<EventType>> for Value {
-    fn from(value: Event<EventType>) -> Self {
+impl From<Error> for Value {
+    fn from(value: Error) -> Self {
         Self::Event(value)
     }
 }
@@ -139,8 +146,8 @@ impl From<&[u8]> for Value {
 impl From<Cow<'static, str>> for Value {
     fn from(value: Cow<'static, str>) -> Self {
         match value {
-            Cow::Borrowed(value) => Self::Static(value),
-            Cow::Owned(value) => Self::String(value),
+            Cow::Borrowed(value) => Self::String(CompactString::const_new(value)),
+            Cow::Owned(value) => Self::String(value.into()),
         }
     }
 }
@@ -151,8 +158,8 @@ where
 {
     fn from(value: &crate::Result<T>) -> Self {
         match value {
-            Ok(value) => format!("{:?}", value).into(),
-            Err(err) => err.clone().into(),
+            Ok(value) => format_compact!("{:?}", value).into(),
+            Err(err) => Value::Event(err.clone()),
         }
     }
 }
@@ -190,13 +197,12 @@ impl EventType {
 
     pub fn from_http_error(self, err: reqwest::Error) -> Error {
         self.into_err()
-            .ctx_opt(Key::Url, err.url().map(|url| url.as_ref().to_string()))
+            .ctx_opt(
+                Key::Url,
+                err.url().map(|url| url.as_ref().to_compact_string()),
+            )
             .ctx_opt(Key::Code, err.status().map(|status| status.as_u16()))
             .reason(err)
-    }
-
-    pub fn from_bincode_error(self, err: bincode::Error) -> Error {
-        self.reason(err).details("Bincode deserialization failed")
     }
 
     pub fn from_http_str_error(self, err: reqwest::header::ToStrError) -> Error {
@@ -205,7 +211,7 @@ impl EventType {
     }
 }
 
-impl From<mail_auth::Error> for Event<EventType> {
+impl From<mail_auth::Error> for Error {
     fn from(err: mail_auth::Error) -> Self {
         match err {
             mail_auth::Error::ParseError => {
@@ -219,10 +225,10 @@ impl From<mail_auth::Error> for Event<EventType> {
             }
             mail_auth::Error::CryptoError(details) => EventType::MailAuth(MailAuthEvent::Crypto)
                 .into_err()
-                .details(details),
+                .details(CompactString::from(details)),
             mail_auth::Error::Io(details) => EventType::MailAuth(MailAuthEvent::Io)
                 .into_err()
-                .details(details),
+                .details(CompactString::from(details)),
             mail_auth::Error::Base64 => EventType::MailAuth(MailAuthEvent::Base64).into_err(),
             mail_auth::Error::UnsupportedVersion => {
                 EventType::Dkim(DkimEvent::UnsupportedVersion).into_err()
@@ -259,7 +265,7 @@ impl From<mail_auth::Error> for Event<EventType> {
             }
             mail_auth::Error::DnsError(details) => EventType::MailAuth(MailAuthEvent::DnsError)
                 .into_err()
-                .details(details),
+                .details(CompactString::from(details)),
             mail_auth::Error::DnsRecordNotFound(code) => {
                 EventType::MailAuth(MailAuthEvent::DnsRecordNotFound)
                     .into_err()
@@ -282,83 +288,83 @@ impl From<mail_auth::Error> for Event<EventType> {
     }
 }
 
-impl From<&mail_auth::DkimResult> for Event<EventType> {
+impl From<&mail_auth::DkimResult> for Error {
     fn from(value: &mail_auth::DkimResult) -> Self {
         match value.clone() {
-            mail_auth::DkimResult::Pass => Event::new(EventType::Dkim(DkimEvent::Pass)),
+            mail_auth::DkimResult::Pass => Error::new(EventType::Dkim(DkimEvent::Pass)),
             mail_auth::DkimResult::Neutral(err) => {
-                Event::new(EventType::Dkim(DkimEvent::Neutral)).caused_by(Event::from(err))
+                Error::new(EventType::Dkim(DkimEvent::Neutral)).caused_by(Error::from(err))
             }
             mail_auth::DkimResult::Fail(err) => {
-                Event::new(EventType::Dkim(DkimEvent::Fail)).caused_by(Event::from(err))
+                Error::new(EventType::Dkim(DkimEvent::Fail)).caused_by(Error::from(err))
             }
             mail_auth::DkimResult::PermError(err) => {
-                Event::new(EventType::Dkim(DkimEvent::PermError)).caused_by(Event::from(err))
+                Error::new(EventType::Dkim(DkimEvent::PermError)).caused_by(Error::from(err))
             }
             mail_auth::DkimResult::TempError(err) => {
-                Event::new(EventType::Dkim(DkimEvent::TempError)).caused_by(Event::from(err))
+                Error::new(EventType::Dkim(DkimEvent::TempError)).caused_by(Error::from(err))
             }
-            mail_auth::DkimResult::None => Event::new(EventType::Dkim(DkimEvent::None)),
+            mail_auth::DkimResult::None => Error::new(EventType::Dkim(DkimEvent::None)),
         }
     }
 }
 
-impl From<&mail_auth::DmarcResult> for Event<EventType> {
+impl From<&mail_auth::DmarcResult> for Error {
     fn from(value: &mail_auth::DmarcResult) -> Self {
         match value.clone() {
-            mail_auth::DmarcResult::Pass => Event::new(EventType::Dmarc(DmarcEvent::Pass)),
+            mail_auth::DmarcResult::Pass => Error::new(EventType::Dmarc(DmarcEvent::Pass)),
             mail_auth::DmarcResult::Fail(err) => {
-                Event::new(EventType::Dmarc(DmarcEvent::Fail)).caused_by(Event::from(err))
+                Error::new(EventType::Dmarc(DmarcEvent::Fail)).caused_by(Error::from(err))
             }
             mail_auth::DmarcResult::PermError(err) => {
-                Event::new(EventType::Dmarc(DmarcEvent::PermError)).caused_by(Event::from(err))
+                Error::new(EventType::Dmarc(DmarcEvent::PermError)).caused_by(Error::from(err))
             }
             mail_auth::DmarcResult::TempError(err) => {
-                Event::new(EventType::Dmarc(DmarcEvent::TempError)).caused_by(Event::from(err))
+                Error::new(EventType::Dmarc(DmarcEvent::TempError)).caused_by(Error::from(err))
             }
-            mail_auth::DmarcResult::None => Event::new(EventType::Dmarc(DmarcEvent::None)),
+            mail_auth::DmarcResult::None => Error::new(EventType::Dmarc(DmarcEvent::None)),
         }
     }
 }
 
-impl From<&mail_auth::DkimOutput<'_>> for Event<EventType> {
+impl From<&mail_auth::DkimOutput<'_>> for Error {
     fn from(value: &mail_auth::DkimOutput<'_>) -> Self {
-        Event::from(value.result()).ctx_opt(
+        Error::from(value.result()).ctx_opt(
             Key::Domain,
-            value.signature().map(|s| s.domain().to_string()),
+            value.signature().map(|s| s.domain().to_compact_string()),
         )
     }
 }
 
-impl From<&mail_auth::IprevOutput> for Event<EventType> {
+impl From<&mail_auth::IprevOutput> for Error {
     fn from(value: &mail_auth::IprevOutput) -> Self {
         match value.result().clone() {
-            mail_auth::IprevResult::Pass => Event::new(EventType::Iprev(IprevEvent::Pass)),
+            mail_auth::IprevResult::Pass => Error::new(EventType::Iprev(IprevEvent::Pass)),
             mail_auth::IprevResult::Fail(err) => {
-                Event::new(EventType::Iprev(IprevEvent::Fail)).caused_by(Event::from(err))
+                Error::new(EventType::Iprev(IprevEvent::Fail)).caused_by(Error::from(err))
             }
             mail_auth::IprevResult::PermError(err) => {
-                Event::new(EventType::Iprev(IprevEvent::PermError)).caused_by(Event::from(err))
+                Error::new(EventType::Iprev(IprevEvent::PermError)).caused_by(Error::from(err))
             }
             mail_auth::IprevResult::TempError(err) => {
-                Event::new(EventType::Iprev(IprevEvent::TempError)).caused_by(Event::from(err))
+                Error::new(EventType::Iprev(IprevEvent::TempError)).caused_by(Error::from(err))
             }
-            mail_auth::IprevResult::None => Event::new(EventType::Iprev(IprevEvent::None)),
+            mail_auth::IprevResult::None => Error::new(EventType::Iprev(IprevEvent::None)),
         }
         .ctx_opt(
             Key::Details,
             value.ptr.as_ref().map(|s| {
                 s.iter()
-                    .map(|v| Value::String(v.to_string()))
+                    .map(|v| Value::String(v.into()))
                     .collect::<Vec<_>>()
             }),
         )
     }
 }
 
-impl From<&mail_auth::SpfOutput> for Event<EventType> {
+impl From<&mail_auth::SpfOutput> for Error {
     fn from(value: &mail_auth::SpfOutput) -> Self {
-        Event::new(EventType::Spf(match value.result() {
+        Error::new(EventType::Spf(match value.result() {
             mail_auth::SpfResult::Pass => SpfEvent::Pass,
             mail_auth::SpfResult::Fail => SpfEvent::Fail,
             mail_auth::SpfResult::SoftFail => SpfEvent::SoftFail,
@@ -367,7 +373,18 @@ impl From<&mail_auth::SpfOutput> for Event<EventType> {
             mail_auth::SpfResult::TempError => SpfEvent::TempError,
             mail_auth::SpfResult::None => SpfEvent::None,
         }))
-        .ctx_opt(Key::Details, value.explanation().map(|s| s.to_string()))
+        .ctx_opt(
+            Key::Details,
+            value.explanation().map(|s| s.to_compact_string()),
+        )
+    }
+}
+
+impl From<rkyv::rancor::Error> for Error {
+    fn from(value: rkyv::rancor::Error) -> Self {
+        Error::new(EventType::Store(StoreEvent::DeserializeError))
+            .reason(value)
+            .details("Rkyv de/serialization failed")
     }
 }
 
@@ -390,7 +407,7 @@ impl AssertSuccess for reqwest::Response {
             Err(cause
                 .ctx(Key::Code, status.as_u16())
                 .details("HTTP request failed")
-                .ctx_opt(Key::Reason, self.text().await.ok()))
+                .ctx_opt(Key::Reason, self.text().await.map(CompactString::from).ok()))
         }
     }
 }

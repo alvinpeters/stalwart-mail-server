@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,7 +9,8 @@ pub mod description;
 pub mod level;
 pub mod metrics;
 
-use std::{borrow::Cow, fmt::Display};
+use compact_str::ToCompactString;
+use std::fmt::Display;
 
 use crate::*;
 
@@ -55,19 +56,33 @@ impl<T> Event<T> {
             }
         })
     }
+
+    pub fn into_boxed(self) -> Box<Self> {
+        Box::new(self)
+    }
 }
 
-impl Event<EventType> {
+impl Error {
+    #[inline(always)]
+    pub fn new(inner: EventType) -> Self {
+        Error(Box::new(Event::new(inner)))
+    }
+
+    #[inline(always)]
+    pub fn set_ctx(&mut self, key: Key, value: impl Into<Value>) {
+        self.0.keys.push((key, value.into()));
+    }
+
     #[inline(always)]
     pub fn ctx(mut self, key: Key, value: impl Into<Value>) -> Self {
-        self.keys.push((key, value.into()));
+        self.0.keys.push((key, value.into()));
         self
     }
 
     #[inline(always)]
     pub fn ctx_unique(mut self, key: Key, value: impl Into<Value>) -> Self {
-        if self.keys.iter().all(|(k, _)| *k != key) {
-            self.keys.push((key, value.into()));
+        if self.0.keys.iter().all(|(k, _)| *k != key) {
+            self.0.keys.push((key, value.into()));
         }
         self
     }
@@ -82,7 +97,12 @@ impl Event<EventType> {
 
     #[inline(always)]
     pub fn matches(&self, inner: EventType) -> bool {
-        self.inner == inner
+        self.0.inner == inner
+    }
+
+    #[inline(always)]
+    pub fn event_type(&self) -> EventType {
+        self.0.inner
     }
 
     #[inline(always)]
@@ -112,7 +132,7 @@ impl Event<EventType> {
 
     #[inline(always)]
     pub fn reason(self, error: impl Display) -> Self {
-        self.ctx(Key::Reason, error.to_string())
+        self.ctx(Key::Reason, error.to_compact_string())
     }
 
     #[inline(always)]
@@ -136,14 +156,46 @@ impl Event<EventType> {
     }
 
     #[inline(always)]
+    pub fn keys(&self) -> &[(Key, Value)] {
+        &self.0.keys
+    }
+
+    #[inline(always)]
+    pub fn value(&self, key: Key) -> Option<&Value> {
+        self.0.value(key)
+    }
+
+    #[inline(always)]
+    pub fn value_as_str(&self, key: Key) -> Option<&str> {
+        self.0.value_as_str(key)
+    }
+
+    #[inline(always)]
+    pub fn value_as_uint(&self, key: Key) -> Option<u64> {
+        self.0.value_as_uint(key)
+    }
+
+    #[inline(always)]
+    pub fn take_value(&mut self, key: Key) -> Option<Value> {
+        self.0.take_value(key)
+    }
+
+    #[inline(always)]
     pub fn is_assertion_failure(&self) -> bool {
-        self.inner == EventType::Store(StoreEvent::AssertValueFailed)
+        self.0.inner == EventType::Store(StoreEvent::AssertValueFailed)
+    }
+
+    pub fn key(&self, key: Key) -> Option<&Value> {
+        self.0
+            .keys
+            .iter()
+            .find_map(|(k, v)| if *k == key { Some(v) } else { None })
     }
 
     #[inline(always)]
     pub fn is_jmap_method_error(&self) -> bool {
         !matches!(
-            self.inner,
+            self.0.inner,
             EventType::Jmap(
                 JmapEvent::UnknownCapability | JmapEvent::NotJson | JmapEvent::NotRequest
             )
@@ -153,7 +205,7 @@ impl Event<EventType> {
     #[inline(always)]
     pub fn must_disconnect(&self) -> bool {
         matches!(
-            self.inner,
+            self.0.inner,
             EventType::Network(_)
                 | EventType::Auth(AuthEvent::TooManyAttempts)
                 | EventType::Limit(LimitEvent::ConcurrentRequest | LimitEvent::TooManyRequests)
@@ -163,7 +215,7 @@ impl Event<EventType> {
 
     #[inline(always)]
     pub fn should_write_err(&self) -> bool {
-        !matches!(self.inner, EventType::Network(_) | EventType::Security(_))
+        !matches!(self.0.inner, EventType::Network(_) | EventType::Security(_))
     }
 
     pub fn corrupted_key(key: &[u8], value: Option<&[u8]>, caused_by: &'static str) -> Error {
@@ -261,6 +313,7 @@ impl EventType {
             EventType::Auth(cause) => cause.message(),
             EventType::Config(_) => "Configuration error",
             EventType::Resource(cause) => cause.message(),
+            EventType::Security(_) => "Insufficient permissions",
             _ => "Internal server error",
         }
     }
@@ -300,6 +353,7 @@ impl StoreEvent {
             Self::ElasticsearchError => "ElasticSearch error",
             Self::RedisError => "Redis error",
             Self::S3Error => "S3 error",
+            Self::AzureError => "Azure error",
             Self::FilesystemError => "Filesystem error",
             Self::PoolError => "Connection pool error",
             Self::DataCorruption => "Data corruption",
@@ -467,6 +521,7 @@ impl LimitEvent {
             Self::Quota => "Quota exceeded",
             Self::BlobQuota => "Blob quota exceeded",
             Self::TooManyRequests => "Too many requests",
+            Self::TenantQuota => "Tenant quota exceeded",
         }
     }
 }
@@ -599,7 +654,7 @@ impl NetworkEvent {
 impl Value {
     pub fn from_maybe_string(value: &[u8]) -> Self {
         if let Ok(value) = std::str::from_utf8(value) {
-            Self::String(value.to_string())
+            Self::String(value.into())
         } else {
             Self::Bytes(value.to_vec())
         }
@@ -616,15 +671,13 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value.as_str()),
-            Self::Static(value) => Some(value),
             _ => None,
         }
     }
 
-    pub fn into_string(self) -> Option<Cow<'static, str>> {
+    pub fn into_string(self) -> Option<CompactString> {
         match self {
-            Self::String(value) => Some(Cow::Owned(value)),
-            Self::Static(value) => Some(Cow::Borrowed(value)),
+            Self::String(value) => Some(value),
             _ => None,
         }
     }
@@ -635,7 +688,10 @@ impl<T> AddContext<T> for Result<T> {
     fn caused_by(self, location: &'static str) -> Result<T> {
         match self {
             Ok(value) => Ok(value),
-            Err(err) => Err(err.ctx(Key::CausedBy, location)),
+            Err(mut err) => {
+                err.set_ctx(Key::CausedBy, location);
+                Err(err)
+            }
         }
     }
 
@@ -655,9 +711,9 @@ impl std::error::Error for Error {}
 impl Eq for Error {}
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
-        if self.inner == other.inner && self.keys.len() == other.keys.len() {
-            for kv in self.keys.iter() {
-                if !other.keys.iter().any(|okv| kv == okv) {
+        if self.0.inner == other.0.inner && self.0.keys.len() == other.0.keys.len() {
+            for kv in self.0.keys.iter() {
+                if !other.0.keys.iter().any(|okv| kv == okv) {
                     return false;
                 }
             }
@@ -672,10 +728,7 @@ impl PartialEq for Error {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Static(l0), Self::Static(r0)) => l0 == r0,
             (Self::String(l0), Self::String(r0)) => l0 == r0,
-            (Self::String(l0), Self::Static(r0)) => l0 == r0,
-            (Self::Static(l0), Self::String(r0)) => l0 == r0,
             (Self::UInt(l0), Self::UInt(r0)) => l0 == r0,
             (Self::Int(l0), Self::Int(r0)) => l0 == r0,
             (Self::Float(l0), Self::Float(r0)) => l0 == r0,

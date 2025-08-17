@@ -1,11 +1,11 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, btree_map::Entry},
     path::PathBuf,
     sync::Arc,
 };
@@ -13,10 +13,12 @@ use std::{
 use ahash::AHashMap;
 use arc_swap::ArcSwap;
 use store::{
-    write::{BatchBuilder, ValueClass},
     Deserialize, IterateParams, Store, ValueKey,
+    write::{BatchBuilder, ValueClass},
 };
+use trc::AddContext;
 use utils::{
+    Semver,
     config::{Config, ConfigKey},
     glob::GlobPattern,
 };
@@ -34,12 +36,14 @@ pub struct Patterns {
     patterns: Vec<Pattern>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Pattern {
     Include(MatchType),
     Exclude(MatchType),
 }
 
-enum MatchType {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchType {
     Equal(String),
     StartsWith(String),
     EndsWith(String),
@@ -47,9 +51,8 @@ enum MatchType {
     All,
 }
 
-pub(crate) struct ExternalConfig {
-    pub id: String,
-    pub version: String,
+pub(crate) struct ExternalSpamRules {
+    pub version: Semver,
     pub keys: Vec<ConfigKey>,
 }
 
@@ -91,13 +94,13 @@ impl ConfigManager {
         &self,
         prefix: &str,
         strip_prefix: bool,
-    ) -> trc::Result<Vec<(String, String)>> {
+    ) -> trc::Result<BTreeMap<String, String>> {
         let mut results = self.db_list(prefix, strip_prefix).await?;
         for (key, value) in self.cfg_local.load().iter() {
             if prefix.is_empty() || (!strip_prefix && key.starts_with(prefix)) {
-                results.push((key.clone(), value.clone()));
+                results.insert(key.clone(), value.clone());
             } else if let Some(key) = key.strip_prefix(prefix) {
-                results.push((key.to_string(), value.clone()));
+                results.insert(key.to_string(), value.clone());
             }
         }
 
@@ -112,7 +115,7 @@ impl ConfigManager {
         let mut grouped = AHashMap::new();
 
         let mut list = self.list(prefix, true).await?;
-        for (key, _) in &list {
+        for key in list.keys() {
             if let Some(key) = key.strip_suffix(suffix) {
                 grouped.insert(key.to_string(), AHashMap::new());
             }
@@ -130,11 +133,11 @@ impl ConfigManager {
         Ok(grouped)
     }
 
-    async fn db_list(
+    pub async fn db_list(
         &self,
         prefix: &str,
         strip_prefix: bool,
-    ) -> trc::Result<Vec<(String, String)>> {
+    ) -> trc::Result<BTreeMap<String, String>> {
         let key = prefix.as_bytes();
         let from_key = ValueKey::from(ValueClass::Config(key.to_vec()));
         let to_key = ValueKey::from(ValueClass::Config(
@@ -143,7 +146,7 @@ impl ConfigManager {
                 .chain([u8::MAX, u8::MAX, u8::MAX, u8::MAX, u8::MAX])
                 .collect::<Vec<_>>(),
         ));
-        let mut results = Vec::new();
+        let mut results = BTreeMap::new();
         let patterns = self.cfg_local_patterns.clone();
         self.cfg_store
             .iterate(
@@ -158,18 +161,19 @@ impl ConfigManager {
                             key = key.strip_prefix(prefix).unwrap_or(key);
                         }
 
-                        results.push((key.to_string(), String::deserialize(value)?));
+                        results.insert(key.to_string(), String::deserialize(value)?);
                     }
 
                     Ok(true)
                 },
             )
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
 
         Ok(results)
     }
 
-    pub async fn set<I, T>(&self, keys: I) -> trc::Result<()>
+    pub async fn set<I, T>(&self, keys: I, overwrite: bool) -> trc::Result<()>
     where
         I: IntoIterator<Item = T>,
         T: Into<ConfigKey>,
@@ -179,15 +183,18 @@ impl ConfigManager {
 
         for key in keys {
             let key = key.into();
-            if self.cfg_local_patterns.is_local_key(&key.key) {
-                local_batch.push(key);
-            } else {
-                batch.set(ValueClass::Config(key.key.into_bytes()), key.value);
+
+            if overwrite || self.get(&key.key).await?.is_none() || key.key.starts_with("version.") {
+                if self.cfg_local_patterns.is_local_key(&key.key) {
+                    local_batch.push(key);
+                } else {
+                    batch.set(ValueClass::Config(key.key.into_bytes()), key.value);
+                }
             }
         }
 
         if !batch.is_empty() {
-            self.cfg_store.write(batch.build()).await?;
+            self.cfg_store.write(batch.build_all()).await?;
         }
 
         if !local_batch.is_empty() {
@@ -229,7 +236,7 @@ impl ConfigManager {
         } else {
             let mut batch = BatchBuilder::new();
             batch.clear(ValueClass::Config(key.to_string().into_bytes()));
-            self.cfg_store.write(batch.build()).await.map(|_| ())
+            self.cfg_store.write(batch.build_all()).await.map(|_| ())
         }
     }
 
@@ -322,83 +329,117 @@ impl ConfigManager {
             })
     }
 
-    pub async fn update_config_resource(&self, resource_id: &str) -> trc::Result<Option<String>> {
-        let external = self
-            .fetch_config_resource(resource_id)
-            .await
-            .map_err(|reason| {
-                trc::EventType::Config(trc::ConfigEvent::FetchError)
-                    .caused_by(trc::location!())
-                    .details("Failed to fetch external configuration")
-                    .ctx(trc::Key::Reason, reason)
-            })?;
-
-        if self
-            .get(&external.id)
+    pub async fn update_spam_rules(
+        &self,
+        force_update: bool,
+        overwrite: bool,
+    ) -> trc::Result<Option<Semver>> {
+        let current_version = self
+            .get("version.spam-filter")
             .await?
-            .map_or(true, |v| v != external.version)
-        {
-            self.set(external.keys).await?;
+            .and_then(|v| Semver::try_from(v.as_str()).ok());
+        let is_update = current_version.is_some();
+
+        let mut external = self.fetch_spam_rules().await.map_err(|reason| {
+            trc::EventType::Config(trc::ConfigEvent::FetchError)
+                .caused_by(trc::location!())
+                .details("Failed to update spam filter rules")
+                .ctx(trc::Key::Reason, reason)
+        })?;
+
+        if current_version.is_none_or(|v| external.version > v || force_update) {
+            if is_update {
+                // Delete previous STWT_* rules
+                let mut rule_settings = AHashMap::new();
+                for prefix in [
+                    "spam-filter.rule.stwt_",
+                    "spam-filter.dnsbl.server.stwt_",
+                    "http-lookup.stwt_",
+                ] {
+                    for (key, value) in self.list(prefix, false).await? {
+                        if key.ends_with(".enable") {
+                            rule_settings.insert(key, value);
+                        }
+                    }
+
+                    self.clear_prefix(prefix).await?;
+                }
+
+                // Update keys
+                if !rule_settings.is_empty() {
+                    for key in &mut external.keys {
+                        if let Some(value) = rule_settings.remove(&key.key) {
+                            key.value = value;
+                        }
+                    }
+                }
+
+                if !overwrite {
+                    // Do not overwrite ASN or LLM settings
+                    external.keys.retain(|key| {
+                        !key.key.starts_with("spam-filter.llm.") && !key.key.starts_with("asn.")
+                    });
+                }
+            }
+
+            self.set(external.keys, overwrite).await?;
 
             trc::event!(
                 Config(trc::ConfigEvent::ImportExternal),
-                Version = external.version.clone(),
-                Id = resource_id.to_string(),
+                Version = external.version.to_string(),
+                Id = "spam-filter",
             );
 
             Ok(Some(external.version))
         } else {
             trc::event!(
                 Config(trc::ConfigEvent::AlreadyUpToDate),
-                Version = external.version,
-                Id = resource_id.to_string(),
+                Version = external.version.to_string(),
+                Id = "spam-filter",
             );
 
             Ok(None)
         }
     }
 
-    pub(crate) async fn fetch_config_resource(
-        &self,
-        resource_id: &str,
-    ) -> Result<ExternalConfig, String> {
-        let config = String::from_utf8(self.fetch_resource(resource_id).await?)
+    pub(crate) async fn fetch_spam_rules(&self) -> Result<ExternalSpamRules, String> {
+        let config = String::from_utf8(self.fetch_resource("spam-filter").await?)
             .map_err(|err| format!("Configuration file has invalid UTF-8: {err}"))?;
         let config = Config::new(config)
             .map_err(|err| format!("Failed to parse external configuration: {err}"))?;
 
         // Import configuration
-        let mut external = ExternalConfig {
-            id: String::new(),
-            version: String::new(),
+        let mut external = ExternalSpamRules {
+            version: Semver::default(),
             keys: Vec::new(),
         };
+        let mut required_semver = Semver::default();
+        let server_semver: Semver = env!("CARGO_PKG_VERSION").try_into().unwrap();
         for (key, value) in config.keys {
-            if key.starts_with("version.") {
-                external.id.clone_from(&key);
-                external.version.clone_from(&value);
+            if key == "version.spam-filter" {
+                external.version = value.as_str().try_into().unwrap_or_default();
                 external.keys.push(ConfigKey::from((key, value)));
-            } else if key.starts_with("queue.quota.")
-                || key.starts_with("queue.throttle.")
-                || key.starts_with("session.throttle.")
-                || (key.starts_with("lookup.") && !key.starts_with("lookup.default."))
-                || key.starts_with("sieve.trusted.scripts.")
+            } else if key == "version.server" {
+                required_semver = value.as_str().try_into().unwrap_or_default();
+            } else if key.starts_with("spam-filter.")
+                || key.starts_with("http-lookup.")
+                || key.starts_with("lookup.")
+                || key.starts_with("asn.")
             {
                 external.keys.push(ConfigKey::from((key, value)));
-            } else {
-                trc::event!(
-                    Config(trc::ConfigEvent::ExternalKeyIgnored),
-                    Key = key,
-                    Value = value,
-                    Id = resource_id.to_string(),
-                );
             }
         }
 
-        if !external.version.is_empty() {
+        if !required_semver.is_valid() {
+            Err("External spam filter rules do not contain a valid server version".to_string())
+        } else if required_semver > server_semver {
+            Err(format!(
+                "External spam filter rules require server version {required_semver}, but this is version {server_semver}",
+            ))
+        } else if external.version.is_valid() {
             Ok(external)
         } else {
-            Err("External configuration file does not contain a version key".to_string())
+            Err("External spam filter rules do not contain a version key".to_string())
         }
     }
 
@@ -413,7 +454,7 @@ impl ConfigManager {
         {
             let is_tls = listener
                 .get("tls.implicit")
-                .map_or(false, |tls| tls == "true");
+                .is_some_and(|tls| tls == "true");
             let protocol = listener
                 .get("protocol")
                 .map(|s| s.as_str())
@@ -467,17 +508,7 @@ impl Patterns {
             if value.is_empty() {
                 continue;
             }
-            let match_type = if value == "*" {
-                MatchType::All
-            } else if let Some(value) = value.strip_prefix('*') {
-                MatchType::StartsWith(value.to_string())
-            } else if let Some(value) = value.strip_suffix('*') {
-                MatchType::EndsWith(value.to_string())
-            } else if value.contains('*') {
-                MatchType::Matches(GlobPattern::compile(&value, false))
-            } else {
-                MatchType::Equal(value.to_string())
-            };
+            let match_type = MatchType::parse(&value);
 
             cfg_local_patterns.push(if is_include {
                 Pattern::Include(match_type)
@@ -485,6 +516,7 @@ impl Patterns {
                 Pattern::Exclude(match_type)
             });
         }
+
         if cfg_local_patterns.is_empty() {
             cfg_local_patterns = vec![
                 Pattern::Include(MatchType::StartsWith("store.".to_string())),
@@ -494,19 +526,24 @@ impl Patterns {
                 Pattern::Exclude(MatchType::StartsWith("server.allowed-ip.".to_string())),
                 Pattern::Include(MatchType::StartsWith("server.".to_string())),
                 Pattern::Include(MatchType::StartsWith("certificate.".to_string())),
+                Pattern::Include(MatchType::StartsWith("config.local-keys.".to_string())),
                 Pattern::Include(MatchType::StartsWith(
                     "authentication.fallback-admin.".to_string(),
                 )),
-                Pattern::Exclude(MatchType::Equal("cluster.key".to_string())),
                 Pattern::Include(MatchType::StartsWith("cluster.".to_string())),
                 Pattern::Include(MatchType::Equal("storage.data".to_string())),
                 Pattern::Include(MatchType::Equal("storage.blob".to_string())),
                 Pattern::Include(MatchType::Equal("storage.lookup".to_string())),
                 Pattern::Include(MatchType::Equal("storage.fts".to_string())),
                 Pattern::Include(MatchType::Equal("storage.directory".to_string())),
-                Pattern::Include(MatchType::Equal("lookup.default.hostname".to_string())),
                 Pattern::Include(MatchType::Equal("enterprise.license-key".to_string())),
             ];
+        } else if !cfg_local_patterns.contains(&Pattern::Include(MatchType::StartsWith(
+            "config.local-keys.".to_string(),
+        ))) {
+            cfg_local_patterns.push(Pattern::Include(MatchType::StartsWith(
+                "config.local-keys.".to_string(),
+            )));
         }
 
         Patterns {
@@ -537,7 +574,21 @@ impl Patterns {
 }
 
 impl MatchType {
-    fn matches(&self, value: &str) -> bool {
+    pub fn parse(value: &str) -> Self {
+        if value == "*" {
+            MatchType::All
+        } else if let Some(value) = value.strip_suffix('*') {
+            MatchType::StartsWith(value.to_string())
+        } else if let Some(value) = value.strip_prefix('*') {
+            MatchType::EndsWith(value.to_string())
+        } else if value.contains('*') {
+            MatchType::Matches(GlobPattern::compile(value, false))
+        } else {
+            MatchType::Equal(value.to_string())
+        }
+    }
+
+    pub fn matches(&self, value: &str) -> bool {
         match self {
             MatchType::Equal(pattern) => value == pattern,
             MatchType::StartsWith(pattern) => value.starts_with(pattern),

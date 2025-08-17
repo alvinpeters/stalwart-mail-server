@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,14 +8,18 @@ use std::time::Instant;
 
 use crate::core::Session;
 use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
-    protocol::{capability::Capability, enable, ImapResponse, ProtocolVersion},
-    receiver::Request,
     Command, StatusResponse,
+    protocol::{ImapResponse, ProtocolVersion, capability::Capability, enable},
+    receiver::Request,
 };
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_enable(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapEnable)?;
+
         let op_start = Instant::now();
 
         let arguments = request.parse_enable()?;

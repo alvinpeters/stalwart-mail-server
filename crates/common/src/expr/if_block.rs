@@ -1,28 +1,27 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use utils::config::{utils::AsKey, Config};
+use compact_str::CompactString;
+use utils::config::{Config, utils::AsKey};
 
 use crate::expr::{Constant, Expression};
 
 use super::{
+    ConstantValue, ExpressionItem,
     parser::ExpressionParser,
     tokenizer::{TokenMap, Tokenizer},
-    ConstantValue, ExpressionItem,
 };
 
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "test_mode", derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfThen {
     pub expr: Expression,
     pub then: Expression,
 }
 
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "test_mode", derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfBlock {
     pub key: String,
     pub if_then: Vec<IfThen>,
@@ -233,7 +232,7 @@ impl IfBlock {
         None
     }
 
-    pub fn into_default_string(self) -> Option<String> {
+    pub fn into_default_string(self) -> Option<CompactString> {
         for expr_item in self.default.items {
             if let ExpressionItem::Constant(Constant::String(value)) = expr_item {
                 return Some(value);

@@ -1,21 +1,37 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use jmap_proto::types::{collection::Collection, state::State};
+use common::{MessageStoreCache, Server};
+use jmap_proto::types::{collection::SyncCollection, state::State};
+use std::future::Future;
 use trc::AddContext;
 
-use crate::JMAP;
-
-impl JMAP {
-    pub async fn get_state(
+pub trait StateManager: Sync + Send {
+    fn get_state(
         &self,
         account_id: u32,
-        collection: impl Into<u8>,
-    ) -> trc::Result<State> {
-        let collection = collection.into();
+        collection: SyncCollection,
+    ) -> impl Future<Output = trc::Result<State>> + Send;
+
+    fn assert_state(
+        &self,
+        account_id: u32,
+        collection: SyncCollection,
+        if_in_state: &Option<State>,
+    ) -> impl Future<Output = trc::Result<State>> + Send;
+}
+
+pub trait MessageCacheState: Sync + Send {
+    fn get_state(&self, is_mailbox: bool) -> State;
+
+    fn assert_state(&self, is_mailbox: bool, if_in_state: &Option<State>) -> trc::Result<State>;
+}
+
+impl StateManager for Server {
+    async fn get_state(&self, account_id: u32, collection: SyncCollection) -> trc::Result<State> {
         self.core
             .storage
             .data
@@ -25,10 +41,10 @@ impl JMAP {
             .map(State::from)
     }
 
-    pub async fn assert_state(
+    async fn assert_state(
         &self,
         account_id: u32,
-        collection: Collection,
+        collection: SyncCollection,
         if_in_state: &Option<State>,
     ) -> trc::Result<State> {
         let old_state: State = self.get_state(account_id, collection).await?;
@@ -38,6 +54,26 @@ impl JMAP {
             }
         }
 
+        Ok(old_state)
+    }
+}
+
+impl MessageCacheState for MessageStoreCache {
+    fn get_state(&self, is_mailbox: bool) -> State {
+        if is_mailbox {
+            State::from(self.mailboxes.change_id)
+        } else {
+            State::from(self.emails.change_id)
+        }
+    }
+
+    fn assert_state(&self, is_mailbox: bool, if_in_state: &Option<State>) -> trc::Result<State> {
+        let old_state: State = self.get_state(is_mailbox);
+        if let Some(if_in_state) = if_in_state {
+            if &old_state != if_in_state {
+                return Err(trc::JmapEvent::StateMismatch.into_err());
+            }
+        }
         Ok(old_state)
     }
 }

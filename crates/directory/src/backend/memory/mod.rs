@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -14,7 +14,7 @@ pub mod lookup;
 
 #[derive(Debug)]
 pub struct MemoryDirectory {
-    principals: Vec<Principal<u32>>,
+    principals: Vec<Principal>,
     emails_to_ids: AHashMap<String, Vec<EmailType>>,
     pub(crate) data_store: Store,
     domains: AHashSet<String>,

@@ -1,91 +1,55 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{collections::BTreeMap, sync::Arc};
-
 use ahash::AHashMap;
 use common::listener::SessionStream;
-use imap_proto::protocol::{expunge, select::Exists, Sequence};
-use jmap::mailbox::UidMailbox;
-use jmap_proto::{
-    object::Object,
-    types::{collection::Collection, property::Property, value::Value},
-};
-use store::write::assert::HashedValue;
+use email::cache::MessageCacheFetch;
+use imap_proto::protocol::{Sequence, expunge, select::Exists};
+use jmap_proto::types::{collection::Collection, property::Property};
+use std::collections::BTreeMap;
+use store::{ValueKey, write::ValueClass};
 use trc::AddContext;
-use utils::lru_cache::LruCached;
 
 use crate::core::ImapId;
 
-use super::{ImapUidToId, MailboxId, MailboxState, NextMailboxState, SelectedMailbox, SessionData};
-
-pub(crate) const MAX_RETRIES: usize = 10;
+use super::{
+    ImapUidToId, Mailbox, MailboxId, MailboxState, NextMailboxState, SelectedMailbox, SessionData,
+};
 
 impl<T: SessionStream> SessionData<T> {
-    pub async fn fetch_messages(&self, mailbox: &MailboxId) -> trc::Result<MailboxState> {
-        // Obtain message ids
-        let message_ids = self
-            .jmap
-            .get_tag(
-                mailbox.account_id,
-                Collection::Email,
-                Property::MailboxIds,
-                mailbox.mailbox_id,
-            )
-            .await?
-            .unwrap_or_default();
-
-        // Obtain UID validity
-        let uid_validity = self.get_uid_validity(mailbox).await?;
-
-        // Obtain current state
-        let modseq = self
-            .jmap
-            .core
-            .storage
-            .data
-            .get_last_change_id(mailbox.account_id, Collection::Email)
+    pub async fn fetch_messages(
+        &self,
+        mailbox: &MailboxId,
+        current_state: Option<u64>,
+    ) -> trc::Result<Option<MailboxState>> {
+        let cached_messages = self
+            .server
+            .get_cached_messages(mailbox.account_id)
             .await
-            .add_context(|e| e.caused_by(trc::location!()).account_id(mailbox.account_id))?;
+            .caused_by(trc::location!())?;
 
-        // Obtain all message ids
-        let mut uid_map = BTreeMap::new();
-        for (message_id, uid_mailbox) in self
-            .jmap
-            .get_properties::<HashedValue<Vec<UidMailbox>>, _, _>(
-                mailbox.account_id,
-                Collection::Email,
-                &message_ids,
-                Property::MailboxIds,
-            )
-            .await?
-            .into_iter()
-        {
-            // Make sure the message is still in this mailbox
-            if let Some(item) = uid_mailbox
-                .inner
-                .iter()
-                .find(|item| item.mailbox_id == mailbox.mailbox_id)
-            {
-                debug_assert!(item.uid != 0, "UID is zero for message {item:?}");
-                if uid_map.insert(item.uid, message_id).is_some() {
-                    trc::event!(
-                        Store(trc::StoreEvent::UnexpectedError),
-                        AccountId = mailbox.account_id,
-                        Collection = Collection::Mailbox,
-                        MailboxId = mailbox.mailbox_id,
-                        MessageId = message_id,
-                        SpanId = self.session_id,
-                        Details = "Duplicate IMAP UID"
-                    );
-                }
-            }
+        if current_state.is_some_and(|state| state == cached_messages.emails.change_id) {
+            return Ok(None);
         }
 
         // Obtain UID next and assign UIDs
+        let uid_map = cached_messages
+            .emails
+            .items
+            .iter()
+            .filter_map(|item| {
+                item.mailboxes.iter().find_map(|m| {
+                    if m.mailbox_id == mailbox.mailbox_id {
+                        Some((m.uid, item.document_id))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<BTreeMap<u32, u32>>();
         let mut uid_max = 0;
         let mut id_to_imap = AHashMap::with_capacity(uid_map.len());
         let mut uid_to_id = AHashMap::with_capacity(uid_map.len());
@@ -104,28 +68,26 @@ impl<T: SessionStream> SessionData<T> {
             uid_to_id.insert(uid, message_id);
         }
 
-        Ok(MailboxState {
-            uid_next: uid_max + 1,
-            uid_validity,
+        Ok(Some(MailboxState {
             total_messages: id_to_imap.len(),
             id_to_imap,
             uid_to_id,
             uid_max,
-            modseq,
+            modseq: cached_messages.emails.change_id,
             next_state: None,
-        })
+        }))
     }
 
-    pub async fn synchronize_messages(
-        &self,
-        mailbox: &SelectedMailbox,
-    ) -> trc::Result<Option<u64>> {
+    pub async fn synchronize_messages(&self, mailbox: &SelectedMailbox) -> trc::Result<u64> {
         // Obtain current modseq
-        let modseq = self.get_modseq(mailbox.id.account_id).await?;
-        if mailbox.state.lock().modseq != modseq {
+        let mut current_modseq = mailbox.state.lock().modseq;
+        if let Some(new_state) = self
+            .fetch_messages(&mailbox.id, current_modseq.into())
+            .await?
+        {
             // Synchronize messages
-            let new_state = self.fetch_messages(&mailbox.id).await?;
             let mut current_state = mailbox.state.lock();
+            current_modseq = new_state.modseq;
 
             // Add missing uids
             let mut deletions = current_state
@@ -147,11 +109,6 @@ impl<T: SessionStream> SessionData<T> {
             }
             current_state.id_to_imap = id_to_imap;
 
-            // Update cache
-            self.imap
-                .cache_mailbox
-                .insert(mailbox.id, Arc::new(new_state.clone()));
-
             // Update state
             current_state.modseq = new_state.modseq;
             current_state.next_state = Some(Box::new(NextMailboxState {
@@ -160,14 +117,14 @@ impl<T: SessionStream> SessionData<T> {
             }));
         }
 
-        Ok(modseq)
+        Ok(current_modseq)
     }
 
     pub async fn write_mailbox_changes(
         &self,
         mailbox: &SelectedMailbox,
         is_qresync: bool,
-    ) -> trc::Result<Option<u64>> {
+    ) -> trc::Result<u64> {
         // Resync mailbox
         let modseq = self.synchronize_messages(mailbox).await?;
         let mut buf = Vec::new();
@@ -205,40 +162,28 @@ impl<T: SessionStream> SessionData<T> {
         Ok(modseq)
     }
 
-    pub async fn get_modseq(&self, account_id: u32) -> trc::Result<Option<u64>> {
-        // Obtain current modseq
-        self.jmap
+    pub async fn get_uid_next(&self, mailbox: &MailboxId) -> trc::Result<u32> {
+        self.server
             .core
             .storage
             .data
-            .get_last_change_id(account_id, Collection::Email)
-            .await
-            .add_context(|e| {
-                e.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(Collection::Email)
+            .get_counter(ValueKey {
+                account_id: mailbox.account_id,
+                collection: Collection::Mailbox.into(),
+                document_id: mailbox.mailbox_id,
+                class: ValueClass::Property(Property::EmailIds.into()),
             })
+            .await
+            .map(|v| (v + 1) as u32)
     }
 
-    pub async fn get_uid_validity(&self, mailbox: &MailboxId) -> trc::Result<u32> {
-        self.jmap
-            .get_property::<Object<Value>>(
-                mailbox.account_id,
-                Collection::Mailbox,
-                mailbox.mailbox_id,
-                &Property::Value,
-            )
-            .await?
-            .and_then(|obj| obj.get(&Property::Cid).as_uint())
-            .ok_or_else(|| {
-                trc::ImapEvent::Error
-                    .caused_by(trc::location!())
-                    .details("Mailbox unavailable")
-                    .account_id(mailbox.account_id)
-                    .collection(Collection::Mailbox)
-                    .document_id(mailbox.mailbox_id)
-            })
-            .map(|v| v as u32)
+    pub fn mailbox_state(&self, mailbox: &MailboxId) -> Option<Mailbox> {
+        self.mailboxes
+            .lock()
+            .iter()
+            .find(|m| m.account_id == mailbox.account_id)
+            .and_then(|m| m.mailbox_state.get(&mailbox.mailbox_id))
+            .cloned()
     }
 }
 
@@ -251,17 +196,21 @@ impl SelectedMailbox {
         if !sequence.is_saved_search() {
             let mut ids = AHashMap::new();
             let state = self.state.lock();
-            if state.id_to_imap.is_empty() {
-                return Ok(ids);
-            }
 
             if is_uid {
-                for (id, imap_id) in &state.id_to_imap {
-                    if sequence.contains(imap_id.uid, state.uid_max) {
-                        ids.insert(*id, *imap_id);
+                let id_to_imap = state
+                    .next_state
+                    .as_ref()
+                    .map(|s| &s.next_state.id_to_imap)
+                    .unwrap_or(&state.id_to_imap);
+                if !state.id_to_imap.is_empty() {
+                    for (id, imap_id) in id_to_imap {
+                        if sequence.contains(imap_id.uid, state.uid_max) {
+                            ids.insert(*id, *imap_id);
+                        }
                     }
                 }
-            } else {
+            } else if !state.id_to_imap.is_empty() {
                 for (id, imap_id) in &state.id_to_imap {
                     if sequence.contains(imap_id.seqnum, state.total_messages as u32) {
                         ids.insert(*id, *imap_id);
@@ -318,9 +267,9 @@ impl SelectedMailbox {
         deleted_ids
     }
 
-    pub fn append_messages(&self, ids: Vec<ImapUidToId>, modseq: Option<u64>) -> u32 {
+    pub fn append_messages(&self, ids: Vec<ImapUidToId>, modseq: Option<u64>) {
         let mut mailbox = self.state.lock();
-        if modseq.unwrap_or(0) > mailbox.modseq.unwrap_or(0) {
+        if modseq.unwrap_or(0) > mailbox.modseq {
             let mut uid_max = 0;
             for id in ids {
                 mailbox.total_messages += 1;
@@ -336,8 +285,6 @@ impl SelectedMailbox {
                 uid_max = id.uid;
             }
             mailbox.uid_max = uid_max;
-            mailbox.uid_next = uid_max + 1;
         }
-        mailbox.uid_validity
     }
 }

@@ -1,18 +1,36 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::collections::HashMap;
-
 use prettytable::{Attr, Cell, Row, Table};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
-use crate::modules::Response;
+use crate::modules::{Response, UnwrapResult};
 
 use super::cli::{Client, ServerCommands};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateSettings {
+    Delete {
+        keys: Vec<String>,
+    },
+    Clear {
+        prefix: String,
+        #[serde(default)]
+        filter: Option<String>,
+    },
+    Insert {
+        prefix: Option<String>,
+        values: Vec<(String, String)>,
+        assert_empty: bool,
+    },
+}
 
 impl ServerCommands {
     pub async fn exec(self, client: Client) {
@@ -40,17 +58,23 @@ impl ServerCommands {
                     .http_request::<Value, _>(
                         Method::POST,
                         "/api/settings",
-                        Some(vec![(key.clone(), value.unwrap_or_default())]),
+                        Some(vec![UpdateSettings::Insert {
+                            prefix: None,
+                            values: vec![(key.clone(), value.unwrap_or_default())],
+                            assert_empty: false,
+                        }]),
                     )
                     .await;
                 eprintln!("Successfully added key {key}.");
             }
             ServerCommands::DeleteConfig { key } => {
                 client
-                    .http_request::<Value, String>(
-                        Method::DELETE,
-                        &format!("/api/settings/{key}"),
-                        None,
+                    .http_request::<Value, _>(
+                        Method::POST,
+                        "/api/settings",
+                        Some(vec![UpdateSettings::Delete {
+                            keys: vec![key.clone()],
+                        }]),
                     )
                     .await;
                 eprintln!("Successfully deleted key {key}.");
@@ -59,7 +83,7 @@ impl ServerCommands {
                 let results = client
                     .http_request::<Response<HashMap<String, String>>, String>(
                         Method::GET,
-                        &format!("/api/settings/list/{}", prefix.unwrap_or_default()),
+                        &format!("/api/settings/list?prefix={}", prefix.unwrap_or_default()),
                         None,
                     )
                     .await
@@ -86,6 +110,28 @@ impl ServerCommands {
                     results.len(),
                     if results.len() == 1 { "" } else { "s" }
                 );
+            }
+            ServerCommands::Healthcheck { check } => {
+                let response = reqwest::get(
+                    format!("{}/healthz/{}",
+                            client.url,
+                            check.unwrap_or("ready".to_string()))
+                )
+                    .await
+                    .unwrap();
+
+                match response.status() {
+                    StatusCode::OK => {
+                        eprintln!("Success")
+                    },
+                    _ => {
+                        eprintln!(
+                            "Request failed: {}",
+                            response.text().await.unwrap_result("fetch text")
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }

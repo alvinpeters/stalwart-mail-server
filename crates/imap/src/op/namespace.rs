@@ -1,19 +1,23 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use crate::core::Session;
 use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
-    protocol::{namespace::Response, ImapResponse},
-    receiver::Request,
     Command, StatusResponse,
+    protocol::{ImapResponse, namespace::Response},
+    receiver::Request,
 };
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_namespace(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapNamespace)?;
+
         trc::event!(
             Imap(trc::ImapEvent::Namespace),
             SpanId = self.session_id,
@@ -26,7 +30,7 @@ impl<T: SessionStream> Session<T> {
                 .serialize(
                     Response {
                         shared_prefix: if self.state.session_data().mailboxes.lock().len() > 1 {
-                            self.jmap.core.jmap.shared_folder.clone().into()
+                            Some(self.server.core.jmap.shared_folder.as_str().into())
                         } else {
                             None
                         },

@@ -1,12 +1,14 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{sync::Arc, time::Instant};
 
+use common::{Server, auth::AccessToken};
 use futures_util::{SinkExt, StreamExt};
+use http_proto::HttpSessionData;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use jmap_proto::{
@@ -21,14 +23,21 @@ use trc::JmapEvent;
 use tungstenite::Message;
 use utils::map::bitmap::Bitmap;
 
-use crate::{
-    api::http::{HttpSessionData, ToRequestError},
-    auth::AccessToken,
-    JMAP,
-};
+use crate::api::{ToRequestError, request::RequestHandler};
+use std::future::Future;
 
-impl JMAP {
-    pub async fn handle_websocket_stream(
+pub trait WebSocketHandler: Sync + Send {
+    fn handle_websocket_stream(
+        &self,
+        stream: WebSocketStream<TokioIo<Upgraded>>,
+        access_token: Arc<AccessToken>,
+        session: HttpSessionData,
+    ) -> impl Future<Output = ()> + Send;
+}
+
+impl WebSocketHandler for Server {
+    #![allow(clippy::large_futures)]
+    async fn handle_websocket_stream(
         &self,
         mut stream: WebSocketStream<TokioIo<Upgraded>>,
         access_token: Arc<AccessToken>,
@@ -56,14 +65,16 @@ impl JMAP {
         {
             Ok(change_rx) => change_rx,
             Err(err) => {
-                trc::error!(err
-                    .details("Failed to subscribe to state manager")
-                    .span_id(session.session_id));
+                trc::error!(
+                    err.details("Failed to subscribe to state manager")
+                        .span_id(session.session_id)
+                );
 
                 let _ = stream
                     .send(Message::Text(
                         WebSocketRequestError::from(RequestError::internal_server_error())
-                            .to_json(),
+                            .to_json()
+                            .into(),
                     ))
                     .await;
                 return;
@@ -87,7 +98,7 @@ impl JMAP {
                                     ) {
                                         Ok(WebSocketMessage::Request(request)) => {
                                             let response = self
-                                                .handle_request(
+                                                .handle_jmap_request(
                                                     request.request,
                                                     access_token.clone(),
                                                     &session,
@@ -115,7 +126,7 @@ impl JMAP {
                                             response
                                         },
                                     };
-                                    if let Err(err) = stream.send(Message::Text(response)).await {
+                                    if let Err(err) = stream.send(Message::Text(response.into())).await {
                                         trc::event!(Jmap(JmapEvent::WebsocketError),
                                                     Details = "Failed to send text message",
                                                     SpanId = session.session_id,
@@ -167,18 +178,15 @@ impl JMAP {
                 }
                 state_change = change_rx.recv() => {
                     if let Some(state_change) = state_change {
-                        if !change_types.is_empty() && state_change
-                            .types
-                            .iter()
-                            .any(|(t, _)| change_types.contains(*t))
-                            {
-                                for (type_state, change_id) in state_change.types {
-                                    changes
-                                        .changed
-                                        .get_mut_or_insert(state_change.account_id.into())
-                                        .set(type_state, change_id.into());
-                                }
-                            }
+                        let mut types = state_change.types;
+                        types.intersection(&change_types);
+
+                        for type_state in types {
+                            changes
+                                .changed
+                                .get_mut_or_insert(state_change.account_id.into())
+                                .set(type_state, state_change.change_id.into());
+                        }
                     } else {
                         trc::event!(
                             Jmap(JmapEvent::WebsocketStop),
@@ -195,7 +203,7 @@ impl JMAP {
                 // Send any queued changes
                 let elapsed = last_changes_sent.elapsed();
                 if elapsed >= throttle {
-                    if let Err(err) = stream.send(Message::Text(changes.to_json())).await {
+                    if let Err(err) = stream.send(Message::Text(changes.to_json().into())).await {
                         trc::event!(
                             Jmap(JmapEvent::WebsocketError),
                             Details = "Failed to send state change message.",
@@ -211,7 +219,7 @@ impl JMAP {
                     next_event = throttle - elapsed;
                 }
             } else if last_heartbeat.elapsed() > heartbeat {
-                if let Err(err) = stream.send(Message::Ping(vec![])).await {
+                if let Err(err) = stream.send(Message::Ping(Vec::<u8>::new().into())).await {
                     trc::event!(
                         Jmap(JmapEvent::WebsocketError),
                         Details = "Failed to send ping message.",

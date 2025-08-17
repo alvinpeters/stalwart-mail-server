@@ -1,12 +1,10 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::borrow::Cow;
-
-use super::Variable;
+use super::{StringCow, Variable};
 
 pub mod array;
 pub mod asynch;
@@ -14,12 +12,13 @@ pub mod email;
 pub mod misc;
 pub mod text;
 
-pub trait ResolveVariable {
+pub trait ResolveVariable: Sync + Send {
     fn resolve_variable(&self, variable: u32) -> Variable<'_>;
+    fn resolve_global(&self, variable: &str) -> Variable<'_>;
 }
 
 impl<'x> Variable<'x> {
-    fn transform(self, f: impl Fn(Cow<'x, str>) -> Variable<'x>) -> Variable<'x> {
+    fn transform(self, f: impl Fn(StringCow<'x>) -> Variable<'x>) -> Variable<'x> {
         match self {
             Variable::String(s) => f(s),
             Variable::Array(list) => Variable::Array(
@@ -76,7 +75,10 @@ pub(crate) const FUNCTIONS: &[(&str, fn(Vec<Variable>) -> Variable, u32)] = &[
     ("rsplit", text::fn_rsplit, 2),
     ("split_once", text::fn_split_once, 2),
     ("rsplit_once", text::fn_rsplit_once, 2),
+    ("split_n", text::fn_split_n, 3),
     ("split_words", text::fn_split_words, 1),
+    ("hash", text::fn_hash, 2),
+    ("if_then", misc::fn_if_then, 3),
 ];
 
 pub const F_IS_LOCAL_DOMAIN: u32 = 0;

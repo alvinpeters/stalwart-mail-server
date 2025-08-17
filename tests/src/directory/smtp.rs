@@ -1,25 +1,22 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::sync::Arc;
-
+use super::dummy_tls_acceptor;
+use crate::directory::{DirectoryTest, Item, LookupResult};
 use common::listener::limiter::{ConcurrencyLimiter, InFlight};
-use directory::QueryBy;
+use directory::{QueryParams, backend::RcptType};
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
+use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
 };
 use tokio_rustls::TlsAcceptor;
-
-use crate::directory::{DirectoryTest, Item, LookupResult};
-
-use super::dummy_tls_acceptor;
 
 #[tokio::test]
 async fn lmtp_directory() {
@@ -30,47 +27,44 @@ async fn lmtp_directory() {
     // Obtain directory handle
     let mut config = DirectoryTest::new(None).await;
     let handle = config.directories.directories.remove("smtp").unwrap();
-    let core = config.core;
+    let core = config.server;
 
     // Basic lookup
     let tests = vec![
+        (Item::IsAccount("john-ok@domain".into()), LookupResult::True),
         (
-            Item::IsAccount("john-ok@domain".to_string()),
-            LookupResult::True,
-        ),
-        (
-            Item::IsAccount("john-bad@domain".to_string()),
+            Item::IsAccount("john-bad@domain".into()),
             LookupResult::False,
         ),
         (
-            Item::Verify("john-ok@domain".to_string()),
-            LookupResult::Values(vec!["john-ok@domain".to_string()]),
+            Item::Verify("john-ok@domain".into()),
+            LookupResult::Values(vec!["john-ok@domain".into()]),
         ),
         (
-            Item::Verify("doesnot@exist.org".to_string()),
+            Item::Verify("doesnot@exist.org".into()),
             LookupResult::False,
         ),
         (
-            Item::Expand("sales-ok,item1,item2,item3".to_string()),
+            Item::Expand("sales-ok,item1,item2,item3".into()),
             LookupResult::Values(vec![
-                "sales-ok".to_string(),
-                "item1".to_string(),
-                "item2".to_string(),
-                "item3".to_string(),
+                "sales-ok".into(),
+                "item1".into(),
+                "item2".into(),
+                "item3".into(),
             ]),
         ),
-        (Item::Expand("other".to_string()), LookupResult::False),
+        (Item::Expand("other".into()), LookupResult::False),
         (
             Item::Authenticate(Credentials::Plain {
-                username: "john".to_string(),
-                secret: "ok".to_string(),
+                username: "john".into(),
+                secret: "ok".into(),
             }),
             LookupResult::True,
         ),
         (
             Item::Authenticate(Credentials::Plain {
-                username: "john".to_string(),
-                secret: "bad".to_string(),
+                username: "john".into(),
+                secret: "bad".into(),
             }),
             LookupResult::False,
         ),
@@ -78,9 +72,11 @@ async fn lmtp_directory() {
 
     for (item, expected) in &tests {
         let result: LookupResult = match item {
-            Item::IsAccount(v) => core.rcpt(&handle, v, 0).await.unwrap().into(),
+            Item::IsAccount(v) => {
+                (core.rcpt(&handle, v, 0).await.unwrap() == RcptType::Mailbox).into()
+            }
             Item::Authenticate(v) => handle
-                .query(QueryBy::Credentials(v), true)
+                .query(QueryParams::credentials(v).with_return_member_of(true))
                 .await
                 .unwrap()
                 .is_some()
@@ -122,9 +118,11 @@ async fn lmtp_directory() {
         requests.push((
             tokio::spawn(async move {
                 let result: LookupResult = match &item {
-                    Item::IsAccount(v) => core.rcpt(&handle, v, 0).await.unwrap().into(),
+                    Item::IsAccount(v) => {
+                        (core.rcpt(&handle, v, 0).await.unwrap() == RcptType::Mailbox).into()
+                    }
                     Item::Authenticate(v) => handle
-                        .query(QueryBy::Credentials(v), true)
+                        .query(QueryParams::credentials(v).with_return_member_of(true))
                         .await
                         .unwrap()
                         .is_some()
@@ -182,7 +180,9 @@ async fn lmtp_directory() {
             requests.push((
                 tokio::spawn(async move {
                     let result: LookupResult = match &item {
-                        Item::IsAccount(v) => core.rcpt(&handle, v, 0).await.unwrap().into(),
+                        Item::IsAccount(v) => {
+                            (core.rcpt(&handle, v, 0).await.unwrap() == RcptType::Mailbox).into()
+                        }
                         _ => unreachable!(),
                     };
 
@@ -222,7 +222,7 @@ pub fn spawn_mock_lmtp_server(max_concurrency: u64) -> watch::Sender<bool> {
                         Ok((stream, _)) => {
                             let acceptor = acceptor.clone();
                             let in_flight = limited.is_allowed();
-                            tokio::spawn(accept_smtp(stream, rx.clone(), acceptor, in_flight));
+                            tokio::spawn(accept_smtp(stream, rx.clone(), acceptor, in_flight.into()));
                         }
                         Err(err) => {
                             panic!("Something went wrong: {err}" );
@@ -276,24 +276,24 @@ async fn accept_smtp(
 
         let buf = std::str::from_utf8(&buf_u8[0..br]).unwrap();
         let response = if buf.starts_with("LHLO") {
-            "250-mx.foobar.org\r\n250 AUTH PLAIN\r\n".to_string()
+            "250-mx.foobar.org\r\n250 AUTH PLAIN\r\n".into()
         } else if buf.starts_with("MAIL FROM") {
             if buf.contains("<>") || buf.contains("ok@") {
-                "250 OK\r\n".to_string()
+                "250 OK\r\n".into()
             } else {
-                "552-I do not\r\n552 like that MAIL FROM.\r\n".to_string()
+                "552-I do not\r\n552 like that MAIL FROM.\r\n".into()
             }
         } else if buf.starts_with("RCPT TO") {
             if buf.contains("ok") {
-                "250 OK\r\n".to_string()
+                "250 OK\r\n".into()
             } else {
-                "550-I refuse to\r\n550 accept that recipient.\r\n".to_string()
+                "550-I refuse to\r\n550 accept that recipient.\r\n".into()
             }
         } else if buf.starts_with("VRFY") {
             if buf.contains("ok") {
                 format!("250 {}\r\n", buf.split_once(' ').unwrap().1)
             } else {
-                "550-I refuse to\r\n550 verify that recipient.\r\n".to_string()
+                "550-I refuse to\r\n550 verify that recipient.\r\n".into()
             }
         } else if buf.starts_with("EXPN") {
             if buf.contains("ok") {
@@ -320,21 +320,21 @@ async fn accept_smtp(
 
                 buf
             } else {
-                "550-I refuse to\r\n550 accept that recipient.\r\n".to_string()
+                "550-I refuse to\r\n550 accept that recipient.\r\n".into()
             }
         } else if buf.starts_with("AUTH PLAIN") {
             let buf = base64_decode(buf.rsplit_once(' ').unwrap().1.as_bytes()).unwrap();
             if String::from_utf8_lossy(&buf).contains("ok") {
-                "235 Great success!\r\n".to_string()
+                "235 Great success!\r\n".into()
             } else {
-                "535 No soup for you\r\n".to_string()
+                "535 No soup for you\r\n".into()
             }
         } else if buf.starts_with("NOOP") {
-            "250 Siesta time\r\n".to_string()
+            "250 Siesta time\r\n".into()
         } else if buf.starts_with("QUIT") {
-            "250 Arrivederci!\r\n".to_string()
+            "250 Arrivederci!\r\n".into()
         } else if buf.starts_with("RSET") {
-            "250 Your wish is my command.\r\n".to_string()
+            "250 Your wish is my command.\r\n".into()
         } else {
             panic!("Unknown command: {}", buf.trim());
         };

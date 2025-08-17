@@ -1,23 +1,23 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use common::Core;
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 
 use crate::smtp::{
-    build_smtp,
+    TestSMTP,
     session::{TestSession, VerifyResponse},
 };
 
 #[tokio::test]
 async fn basic_commands() {
-        // Enable logging
-        crate::enable_logging();
+    // Enable logging
+    crate::enable_logging();
 
-    let mut session = Session::test(build_smtp(Core::default(), Inner::default()));
+    let mut session = Session::test(TestSMTP::from_core(Core::default()).server);
 
     // STARTTLS should be available on clear text connections
     session.stream.tls = false;

@@ -1,18 +1,22 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Duration;
+#![warn(clippy::large_futures)]
+#![warn(clippy::cast_possible_truncation)]
+#![warn(clippy::cast_possible_wrap)]
+#![warn(clippy::cast_sign_loss)]
 
-use common::{config::server::ServerProtocol, manager::boot::BootManager, Ipc, IPC_CHANNEL_BUFFER};
-use imap::core::{ImapSessionManager, IMAP};
-use jmap::{api::JmapSessionManager, services::gossip::spawn::GossiperBuilder, JMAP};
+use common::{config::server::ServerProtocol, core::BuildServer, manager::boot::BootManager};
+use http::HttpSessionManager;
+use imap::core::ImapSessionManager;
 use managesieve::core::ManageSieveSessionManager;
 use pop3::Pop3SessionManager;
-use smtp::core::{SmtpSessionManager, SMTP};
-use tokio::sync::mpsc;
+use services::{StartServices, broadcast::subscriber::spawn_broadcast_subscriber};
+use smtp::{StartQueueManager, core::SmtpSessionManager};
+use std::time::Duration;
 use trc::Collector;
 use utils::wait_for_shutdown;
 
@@ -26,76 +30,72 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     // Load config and apply macros
-    let init = BootManager::init().await;
+    let mut init = Box::pin(BootManager::init()).await;
 
-    // Parse core
-    let mut config = init.config;
-    let core = init.core;
+    // Migrate database
+    if let Err(err) = migration::try_migrate(&init.inner.build_server()).await {
+        trc::event!(
+            Server(trc::ServerEvent::StartupError),
+            Details = "Failed to migrate database, aborting startup.",
+            Reason = err,
+        );
+        return Ok(());
+    }
 
-    // Setup IPC channels
-    let (delivery_tx, delivery_rx) = mpsc::channel(IPC_CHANNEL_BUFFER);
-    let ipc = Ipc { delivery_tx };
-
-    // Init servers
-    let smtp = SMTP::init(
-        &mut config,
-        core.clone(),
-        ipc,
-        init.servers.span_id_gen.clone(),
-    )
-    .await;
-    let jmap = JMAP::init(&mut config, delivery_rx, core.clone(), smtp.inner.clone()).await;
-    let imap = IMAP::init(&mut config, jmap.clone()).await;
-    let gossiper = GossiperBuilder::try_parse(&mut config);
+    // Init services
+    init.start_services().await;
+    init.start_queue_manager();
 
     // Log configuration errors
-    config.log_errors();
-    config.log_warnings();
+    init.config.log_errors();
+    init.config.log_warnings();
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
     // Log licensing information
     #[cfg(feature = "enterprise")]
-    core.load().as_ref().log_license_details();
+    init.inner.build_server().log_license_details();
+    // SPDX-SnippetEnd
 
     // Spawn servers
     let (shutdown_tx, shutdown_rx) = init.servers.spawn(|server, acceptor, shutdown_rx| {
         match &server.protocol {
             ServerProtocol::Smtp | ServerProtocol::Lmtp => server.spawn(
-                SmtpSessionManager::new(smtp.clone()),
-                core.clone(),
+                SmtpSessionManager::new(init.inner.clone()),
+                init.inner.clone(),
                 acceptor,
                 shutdown_rx,
             ),
             ServerProtocol::Http => server.spawn(
-                JmapSessionManager::new(jmap.clone()),
-                core.clone(),
+                HttpSessionManager::new(init.inner.clone()),
+                init.inner.clone(),
                 acceptor,
                 shutdown_rx,
             ),
             ServerProtocol::Imap => server.spawn(
-                ImapSessionManager::new(imap.clone()),
-                core.clone(),
+                ImapSessionManager::new(init.inner.clone()),
+                init.inner.clone(),
                 acceptor,
                 shutdown_rx,
             ),
             ServerProtocol::Pop3 => server.spawn(
-                Pop3SessionManager::new(imap.clone()),
-                core.clone(),
+                Pop3SessionManager::new(init.inner.clone()),
+                init.inner.clone(),
                 acceptor,
                 shutdown_rx,
             ),
             ServerProtocol::ManageSieve => server.spawn(
-                ManageSieveSessionManager::new(imap.clone()),
-                core.clone(),
+                ManageSieveSessionManager::new(init.inner.clone()),
+                init.inner.clone(),
                 acceptor,
                 shutdown_rx,
             ),
         };
     });
 
-    // Spawn gossip
-    if let Some(gossiper) = gossiper {
-        gossiper.spawn(jmap, shutdown_rx.clone()).await;
-    }
+    // Start broadcast subscriber
+    spawn_broadcast_subscriber(init.inner, shutdown_rx);
 
     // Wait for shutdown signal
     wait_for_shutdown().await;

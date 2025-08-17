@@ -1,19 +1,25 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::path::PathBuf;
 
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::email::crypto::{
-    try_parse_certs, Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams, EncryptionType,
+use email::message::crypto::{
+    Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams, EncryptionType, try_parse_certs,
 };
 use jmap_proto::types::id::Id;
 use mail_parser::{MessageParser, MimeHeaders};
+use store::{
+    Deserialize, Serialize,
+    write::{Archive, Archiver},
+};
 
-use crate::jmap::{delivery::SmtpConnection, ManagementApi};
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{ManagementApi, delivery::SmtpConnection},
+};
 
 use super::JMAPTest;
 
@@ -23,18 +29,18 @@ pub async fn test(params: &mut JMAPTest) {
     // Create test account
     let server = params.server.clone();
     let client = &mut params.client;
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
 
@@ -211,22 +217,30 @@ pub async fn import_certs_and_encrypt() {
                 .unwrap();
             assert!(!message.is_encrypted());
             params.algo = algo;
-            message.encrypt(&params).await.unwrap();
+            let arch =
+                Archive::deserialize_owned(Archiver::new(params.clone()).serialize().unwrap())
+                    .unwrap();
+            message
+                .encrypt(arch.unarchive::<EncryptionParams>().unwrap())
+                .await
+                .unwrap();
         }
     }
 
     // S/MIME and PGP should not be allowed mixed
-    assert!(try_parse_certs(
-        EncryptionMethod::PGP,
-        std::fs::read(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("crypto")
-                .join("cert_mixed.pem"),
+    assert!(
+        try_parse_certs(
+            EncryptionMethod::PGP,
+            std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources")
+                    .join("crypto")
+                    .join("cert_mixed.pem"),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -239,7 +253,7 @@ pub fn check_is_encrypted() {
     )
     .unwrap();
 
-    for raw_message in messages.split("---") {
+    for raw_message in messages.split("!!!") {
         let is_encrypted = raw_message.contains("TRUE");
         let message = MessageParser::new()
             .parse(raw_message.trim().as_bytes())

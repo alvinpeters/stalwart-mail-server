@@ -1,18 +1,26 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
 use jmap_proto::{
     method::query::{QueryRequest, QueryResponse, RequestArguments},
     types::{id::Id, state::State},
 };
+use std::future::Future;
 
-use crate::{auth::AccessToken, JMAP};
+pub trait QuotaQuery: Sync + Send {
+    fn quota_query(
+        &self,
+        request: QueryRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
+}
 
-impl JMAP {
-    pub async fn quota_query(
+impl QuotaQuery for Server {
+    async fn quota_query(
         &self,
         request: QueryRequest<RequestArguments>,
         access_token: &AccessToken,

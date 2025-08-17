@@ -1,12 +1,12 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use super::{USIZE_BITS, USIZE_BITS_MASK};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitset<const N: usize>(pub(crate) [usize; N]);
 
 impl<const N: usize> Bitset<N> {
@@ -37,6 +37,24 @@ impl<const N: usize> Bitset<N> {
         self.0[index / USIZE_BITS] & (1 << (index & USIZE_BITS_MASK)) != 0
     }
 
+    pub fn union(&mut self, other: &Self) {
+        for i in 0..N {
+            self.0[i] |= other.0[i];
+        }
+    }
+
+    pub fn intersection(&mut self, other: &Self) {
+        for i in 0..N {
+            self.0[i] &= other.0[i];
+        }
+    }
+
+    pub fn difference(&mut self, other: &Self) {
+        for i in 0..N {
+            self.0[i] &= !other.0[i];
+        }
+    }
+
     pub fn clear_all(&mut self) {
         for i in 0..N {
             self.0[i] = 0;
@@ -50,6 +68,10 @@ impl<const N: usize> Bitset<N> {
             }
         }
         true
+    }
+
+    pub fn inner(&self) -> &[usize; N] {
+        &self.0
     }
 }
 

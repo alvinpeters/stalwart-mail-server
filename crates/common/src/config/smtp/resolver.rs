@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,45 +8,37 @@ use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
     time::Duration,
 };
 
 use mail_auth::{
-    common::lru::{DnsCache, LruCache},
+    MessageAuthenticator,
     hickory_resolver::{
-        config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
+        TokioResolver,
+        config::{NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts},
+        name_server::TokioConnectionProvider,
         system_conf::read_system_conf,
-        AsyncResolver, TokioAsyncResolver,
     },
-    Resolver,
 };
-use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use utils::{
-    config::{utils::ParseValue, Config},
-    suffixlist::PublicSuffix,
+    cache::CacheItemWeight,
+    config::{Config, utils::ParseValue},
 };
 
-use crate::Core;
+use crate::Server;
 
 pub struct Resolvers {
-    pub dns: Resolver,
+    pub dns: MessageAuthenticator,
     pub dnssec: DnssecResolver,
-    pub cache: DnsRecordCache,
-    pub psl: PublicSuffix,
 }
 
 #[derive(Clone)]
 pub struct DnssecResolver {
-    pub resolver: TokioAsyncResolver,
+    pub resolver: TokioResolver,
 }
 
-pub struct DnsRecordCache {
-    pub tlsa: LruCache<String, Arc<Tlsa>>,
-    pub mta_sts: LruCache<String, Arc<Policy>>,
-}
-
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsaEntry {
     pub is_end_entity: bool,
     pub is_sha256: bool,
@@ -54,14 +46,15 @@ pub struct TlsaEntry {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tlsa {
     pub entries: Vec<TlsaEntry>,
     pub has_end_entities: bool,
     pub has_intermediates: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Default, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Mode {
     Enforce,
     Testing,
@@ -69,18 +62,43 @@ pub enum Mode {
     None,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MxPattern {
     Equals(String),
     StartsWith(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub id: String,
     pub mode: Mode,
     pub mx: Vec<MxPattern>,
     pub max_age: u64,
+}
+
+impl CacheItemWeight for Tlsa {
+    fn weight(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| (entry.data.len() + std::mem::size_of::<TlsaEntry>()) as u64)
+            .sum::<u64>()
+            + std::mem::size_of::<Tlsa>() as u64
+    }
+}
+
+impl CacheItemWeight for Policy {
+    fn weight(&self) -> u64 {
+        (std::mem::size_of::<Policy>()
+            + self
+                .mx
+                .iter()
+                .map(|mx| match mx {
+                    MxPattern::Equals(t) => t.len(),
+                    MxPattern::StartsWith(t) => t.len(),
+                })
+                .sum::<usize>()) as u64
+    }
 }
 
 impl Resolvers {
@@ -100,7 +118,7 @@ impl Resolvers {
                 })
                 .unwrap_or_else(|_| (ResolverConfig::cloudflare(), ResolverOpts::default())),
             "custom" => {
-                let mut resolver_config = ResolverConfig::new();
+                let mut resolver_config = ResolverConfig::default();
                 for url in config
                     .values("resolver.custom")
                     .map(|(_, v)| v.to_string())
@@ -112,21 +130,23 @@ impl Resolvers {
                     {
                         (
                             match proto.as_str() {
-                                "udp" => Protocol::Udp,
-                                "tcp" => Protocol::Tcp,
-                                "tls" => Protocol::Tls,
+                                "udp" => ProtocolConfig::Udp,
+                                "tcp" => ProtocolConfig::Tcp,
+                                "tls" => ProtocolConfig::Tls {
+                                    server_name: host.clone().into(),
+                                },
                                 _ => {
                                     config.new_parse_error(
                                         "resolver.custom",
                                         format!("Invalid custom resolver protocol {url:?}"),
                                     );
-                                    Protocol::Udp
+                                    ProtocolConfig::Udp
                                 }
                             },
                             host.to_string(),
                         )
                     } else {
-                        (Protocol::Udp, url)
+                        (ProtocolConfig::Udp, url)
                     };
 
                     let (host, port) = if let Some(host) = host.strip_prefix('[') {
@@ -198,6 +218,10 @@ impl Resolvers {
         if let Some(attempts) = config.property("resolver.attempts") {
             opts.attempts = attempts;
         }
+        opts.edns0 = config
+            .property_or_default("resolver.edns", "true")
+            .unwrap_or(true);
+
         // We already have a cache, so disable the built-in cache
         opts.cache_size = 0;
 
@@ -206,38 +230,16 @@ impl Resolvers {
         let mut opts_dnssec = opts.clone();
         opts_dnssec.validate = true;
 
-        let mut capacities = [1024usize; 5];
-        for (pos, key) in ["txt", "mx", "ipv4", "ipv6", "ptr"].into_iter().enumerate() {
-            if let Some(capacity) = config.property(("cache.resolver", key, "size")) {
-                capacities[pos] = capacity;
-            }
-        }
-
         Resolvers {
-            dns: Resolver::with_capacities(
-                resolver_config,
-                opts,
-                capacities[0],
-                capacities[1],
-                capacities[2],
-                capacities[3],
-                capacities[4],
-            )
-            .unwrap(),
+            dns: MessageAuthenticator::new(resolver_config, opts).unwrap(),
             dnssec: DnssecResolver {
-                resolver: AsyncResolver::tokio(config_dnssec, opts_dnssec),
+                resolver: TokioResolver::builder_with_config(
+                    config_dnssec,
+                    TokioConnectionProvider::default(),
+                )
+                .with_options(opts_dnssec)
+                .build(),
             },
-            cache: DnsRecordCache {
-                tlsa: LruCache::with_capacity(
-                    config.property("cache.resolver.tlsa.size").unwrap_or(1024),
-                ),
-                mta_sts: LruCache::with_capacity(
-                    config
-                        .property("cache.resolver.mta-sts.size")
-                        .unwrap_or(1024),
-                ),
-            },
-            psl: PublicSuffix::parse(config, "resolver.public-suffix").await,
         }
     }
 }
@@ -312,15 +314,27 @@ impl Policy {
     }
 }
 
-impl Core {
+impl Server {
     pub fn build_mta_sts_policy(&self) -> Option<Policy> {
-        self.smtp.session.mta_sts_policy.clone().and_then(|policy| {
-            policy.try_build(self.tls.certificates.load().keys().filter(|key| {
-                !key.starts_with("mta-sts.")
-                    && !key.starts_with("autoconfig.")
-                    && !key.starts_with("autodiscover.")
-            }))
-        })
+        self.core
+            .smtp
+            .session
+            .mta_sts_policy
+            .clone()
+            .and_then(|policy| {
+                policy.try_build(
+                    self.inner
+                        .data
+                        .tls_certificates
+                        .load()
+                        .keys()
+                        .filter(|key| {
+                            !key.starts_with("mta-sts.")
+                                && !key.starts_with("autoconfig.")
+                                && !key.starts_with("autodiscover.")
+                        }),
+                )
+            })
     }
 }
 
@@ -347,16 +361,15 @@ impl Default for Resolvers {
         opts_dnssec.validate = true;
 
         Self {
-            dns: Resolver::with_capacities(config, opts, 1024, 1024, 1024, 1024, 1024)
-                .expect("Failed to build DNS resolver"),
+            dns: MessageAuthenticator::new(config, opts).expect("Failed to build DNS resolver"),
             dnssec: DnssecResolver {
-                resolver: AsyncResolver::tokio(config_dnssec, opts_dnssec),
+                resolver: TokioResolver::builder_with_config(
+                    config_dnssec,
+                    TokioConnectionProvider::default(),
+                )
+                .with_options(opts_dnssec)
+                .build(),
             },
-            cache: DnsRecordCache {
-                tlsa: LruCache::with_capacity(1024),
-                mta_sts: LruCache::with_capacity(1024),
-            },
-            psl: PublicSuffix::default(),
         }
     }
 }
@@ -401,17 +414,6 @@ impl Clone for Resolvers {
         Self {
             dns: self.dns.clone(),
             dnssec: self.dnssec.clone(),
-            cache: self.cache.clone(),
-            psl: self.psl.clone(),
-        }
-    }
-}
-
-impl Clone for DnsRecordCache {
-    fn clone(&self) -> Self {
-        Self {
-            tlsa: Mutex::new(self.tlsa.lock().clone()),
-            mta_sts: Mutex::new(self.mta_sts.lock().clone()),
         }
     }
 }

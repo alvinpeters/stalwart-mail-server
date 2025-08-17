@@ -1,29 +1,41 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
+use email::message::index::PREVIEW_LENGTH;
 use jmap_proto::{
     method::parse::{ParseEmailRequest, ParseEmailResponse},
-    object::Object,
-    types::{property::Property, value::Value},
+    types::{
+        property::Property,
+        value::{Object, Value},
+    },
 };
 use mail_parser::{
-    decoders::html::html_to_text, parsers::preview::preview_text, MessageParser, PartType,
+    MessageParser, PartType, decoders::html::html_to_text, parsers::preview::preview_text,
 };
+use std::future::Future;
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, JMAP};
+use crate::blob::download::BlobDownload;
 
 use super::{
     body::{ToBodyPart, TruncateBody},
     headers::HeaderToValue,
-    index::PREVIEW_LENGTH,
 };
 
-impl JMAP {
-    pub async fn email_parse(
+pub trait EmailParse: Sync + Send {
+    fn email_parse(
+        &self,
+        request: ParseEmailRequest,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<ParseEmailResponse>> + Send;
+}
+
+impl EmailParse for Server {
+    async fn email_parse(
         &self,
         request: ParseEmailRequest,
         access_token: &AccessToken,
@@ -112,6 +124,7 @@ impl JMAP {
                         email.append(
                             Property::HasAttachment,
                             Value::Bool(message.parts.iter().enumerate().any(|(part_id, part)| {
+                                let part_id = part_id as u32;
                                 match &part.body {
                                     PartType::Html(_) | PartType::Text(_) => {
                                         !message.text_body.contains(&part_id)
@@ -130,7 +143,7 @@ impl JMAP {
                                 .text_body
                                 .first()
                                 .or_else(|| message.html_body.first())
-                                .and_then(|idx| message.parts.get(*idx))
+                                .and_then(|idx| message.parts.get(*idx as usize))
                                 .map(|part| &part.body)
                             {
                                 Some(PartType::Text(text)) => {
@@ -203,6 +216,7 @@ impl JMAP {
                     Property::BodyValues => {
                         let mut body_values = Object::with_capacity(message.parts.len());
                         for (part_id, part) in message.parts.iter().enumerate() {
+                            let part_id = part_id as u32;
                             if ((message.html_body.contains(&part_id)
                                 && (fetch_all_body_values || fetch_html_body_values))
                                 || (message.text_body.contains(&part_id)

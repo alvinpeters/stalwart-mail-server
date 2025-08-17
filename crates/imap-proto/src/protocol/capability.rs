@@ -1,10 +1,10 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{authenticate::Mechanism, ImapResponse};
+use super::{ImapResponse, authenticate::Mechanism};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
@@ -34,6 +34,7 @@ pub enum Capability {
     Sort,
     Thread,       //THREAD=REFERENCES
     ListExtended, //LIST-EXTENDED
+    ListStatus,   //LIST-STATUS
     ESort,
     SortDisplay,      //SORT=DISPLAY
     SpecialUse,       //SPECIAL-USE
@@ -48,6 +49,27 @@ pub enum Capability {
     Preview,
     Utf8Accept,
     Auth(Mechanism),
+    Quota,
+    QuotaResource(QuotaResourceName),
+    QuotaSet,
+    JmapAccess,
+}
+
+/*
+
+STORAGE 	The physical space estimate, in units of 1024 octets, of the mailboxes governed by the quota root. 	DELETED-STORAGE STATUS request data item and response data item 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.1]
+MESSAGE 	The number of messages stored within the mailboxes governed by the quota root. 	DELETED STATUS request data item and response data item 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.2]
+MAILBOX 	The number of mailboxes governed by the quota root. 	N/A 	N/A 	[Alexey_Melnikov] 	[IESG] 	[RFC9208, Section 5.3]
+ANNOTATION-STORAGE
+
+*/
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaResourceName {
+    Storage,
+    Message,
+    Mailbox,
+    AnnotationStorage,
 }
 
 impl Capability {
@@ -86,16 +108,30 @@ impl Capability {
             Capability::Sort => b"SORT",
             Capability::Thread => b"THREAD=REFERENCES",
             Capability::ListExtended => b"LIST-EXTENDED",
+            Capability::ListStatus => b"LIST-STATUS",
             Capability::ESort => b"ESORT",
             Capability::SortDisplay => b"SORT=DISPLAY",
             Capability::SpecialUse => b"SPECIAL-USE",
             Capability::CreateSpecialUse => b"CREATE-SPECIAL-USE",
             Capability::Move => b"MOVE",
             Capability::Utf8Accept => b"UTF8=ACCEPT",
+            Capability::Quota => b"QUOTA",
+            Capability::QuotaResource(quota_resource) => {
+                buf.extend_from_slice(b"QUOTA=RES-");
+                buf.extend_from_slice(match quota_resource {
+                    QuotaResourceName::Storage => b"STORAGE",
+                    QuotaResourceName::Message => b"MESSAGE",
+                    QuotaResourceName::Mailbox => b"MAILBOX",
+                    QuotaResourceName::AnnotationStorage => b"ANNOTATION-STORAGE",
+                });
+                return;
+            }
+            Capability::QuotaSet => b"QUOTA=SET",
+            Capability::JmapAccess => b"JMAPACCESS",
         });
     }
 
-    pub fn all_capabilities(is_authenticated: bool, is_tls: bool) -> Vec<Capability> {
+    pub fn all_capabilities(is_authenticated: bool, offer_tls: bool) -> Vec<Capability> {
         let mut capabilities = vec![
             Capability::IMAP4rev2,
             Capability::IMAP4rev1,
@@ -104,6 +140,7 @@ impl Capability {
             Capability::LiteralPlus,
             Capability::Id,
             Capability::Utf8Accept,
+            Capability::JmapAccess,
         ];
 
         if is_authenticated {
@@ -122,6 +159,7 @@ impl Capability {
                 Capability::Sort,
                 Capability::Thread,
                 Capability::ListExtended,
+                Capability::ListStatus,
                 Capability::ESort,
                 Capability::SortDisplay,
                 Capability::SpecialUse,
@@ -133,14 +171,17 @@ impl Capability {
                 Capability::StatusSize,
                 Capability::ObjectId,
                 Capability::Preview,
+                Capability::Quota,
+                Capability::QuotaResource(QuotaResourceName::Storage),
             ]);
         } else {
             capabilities.extend([
-                Capability::Auth(Mechanism::OAuthBearer),
                 Capability::Auth(Mechanism::Plain),
+                Capability::Auth(Mechanism::OAuthBearer),
+                Capability::Auth(Mechanism::XOauth2),
             ]);
         }
-        if !is_tls {
+        if offer_tls {
             capabilities.push(Capability::StartTLS);
         }
 
@@ -164,8 +205,8 @@ impl ImapResponse for Response {
 #[cfg(test)]
 mod tests {
     use crate::protocol::{
-        capability::{Capability, Response},
         ImapResponse,
+        capability::{Capability, Response},
     };
 
     #[test]

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -12,17 +12,19 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use arc_swap::ArcSwap;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use dns_update::{providers::rfc2136::DnsAddress, DnsUpdater, TsigAlgorithm};
+use base64::{
+    Engine,
+    engine::general_purpose::{self, STANDARD},
+};
+use dns_update::{DnsUpdater, TsigAlgorithm, providers::rfc2136::DnsAddress};
 use rcgen::generate_simple_self_signed;
 use rustls::{
+    SupportedProtocolVersion,
     crypto::ring::sign::any_supported_type,
     sign::CertifiedKey,
     version::{TLS12, TLS13},
-    SupportedProtocolVersion,
 };
-use rustls_pemfile::{certs, read_one, Item};
+use rustls_pemfile::{Item, certs, read_one};
 use rustls_pki_types::PrivateKeyDer;
 use utils::config::Config;
 use x509_parser::{
@@ -32,28 +34,21 @@ use x509_parser::{
 };
 
 use crate::listener::{
-    acme::{directory::LETS_ENCRYPT_PRODUCTION_DIRECTORY, AcmeProvider, ChallengeSettings},
-    tls::TlsManager,
+    acme::{
+        AcmeProvider, ChallengeSettings, EabSettings, directory::LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+    },
+    tls::AcmeProviders,
 };
 
 pub static TLS13_VERSION: &[&SupportedProtocolVersion] = &[&TLS13];
 pub static TLS12_VERSION: &[&SupportedProtocolVersion] = &[&TLS12];
 
-impl TlsManager {
+impl AcmeProviders {
     pub fn parse(config: &mut Config) -> Self {
-        let mut certificates = AHashMap::new();
-        let mut acme_providers = AHashMap::new();
-        let mut subject_names = AHashSet::new();
-
-        // Parse certificates
-        parse_certificates(config, &mut certificates, &mut subject_names);
+        let mut providers = AHashMap::new();
 
         // Parse ACME providers
-        'outer: for acme_id in config
-            .sub_keys("acme", ".directory")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        'outer: for acme_id in config.sub_keys("acme", ".directory") {
             let acme_id = acme_id.as_str();
             let directory = config
                 .value(("acme", acme_id, "directory"))
@@ -64,11 +59,7 @@ impl TlsManager {
                 .values(("acme", acme_id, "contact"))
                 .filter_map(|(_, v)| {
                     let v = v.trim().to_string();
-                    if !v.is_empty() {
-                        Some(v)
-                    } else {
-                        None
-                    }
+                    if !v.is_empty() { Some(v) } else { None }
                 })
                 .collect::<Vec<_>>();
             let renew_before: Duration = config
@@ -135,13 +126,38 @@ impl TlsManager {
                 continue 'outer;
             }
 
+            // Obtain EAB settings
+            let eab = if let (Some(eab_kid), Some(eab_hmac_key)) = (
+                config
+                    .value(("acme", acme_id, "eab.kid"))
+                    .filter(|s| !s.is_empty()),
+                config
+                    .value(("acme", acme_id, "eab.hmac-key"))
+                    .filter(|s| !s.is_empty()),
+            ) {
+                if let Ok(hmac_key) =
+                    general_purpose::URL_SAFE_NO_PAD.decode(eab_hmac_key.trim().as_bytes())
+                {
+                    EabSettings {
+                        kid: eab_kid.to_string(),
+                        hmac_key,
+                    }
+                    .into()
+                } else {
+                    config.new_build_error(
+                        format!("acme.{acme_id}.eab.hmac-key"),
+                        "Failed to base64 decode HMAC key",
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+
             // This ACME manager is the default when SNI is not available
             let default = config
                 .property::<bool>(("acme", acme_id, "default"))
                 .unwrap_or_default();
-
-            // Add domains for self-signed certificate
-            subject_names.extend(domains.iter().cloned());
 
             if !domains.is_empty() {
                 match AcmeProvider::new(
@@ -150,11 +166,12 @@ impl TlsManager {
                     domains,
                     contact,
                     challenge,
+                    eab,
                     renew_before,
                     default,
                 ) {
                     Ok(acme_provider) => {
-                        acme_providers.insert(acme_id.to_string(), acme_provider);
+                        providers.insert(acme_id.to_string(), acme_provider);
                     }
                     Err(err) => {
                         config.new_build_error(format!("acme.{acme_id}"), err.to_string());
@@ -163,26 +180,16 @@ impl TlsManager {
             }
         }
 
-        if subject_names.is_empty() {
-            subject_names.insert("localhost".to_string());
-        }
-
-        TlsManager {
-            certificates: ArcSwap::from_pointee(certificates),
-            acme_providers,
-            self_signed_cert: build_self_signed_cert(subject_names.into_iter().collect::<Vec<_>>())
-                .or_else(|err| {
-                    config.new_build_error("certificate.self-signed", err);
-                    build_self_signed_cert(vec!["localhost".to_string()])
-                })
-                .ok()
-                .map(Arc::new),
-        }
+        AcmeProviders { providers }
     }
 }
 
 #[allow(clippy::unnecessary_to_owned)]
 fn build_dns_updater(config: &mut Config, acme_id: &str) -> Option<DnsUpdater> {
+    let timeout = config
+        .property_or_default(("acme", acme_id, "timeout"), "30s")
+        .unwrap_or_else(|| Duration::from_secs(30));
+
     match config.value_require(("acme", acme_id, "provider"))? {
         "rfc2136-tsig" => {
             let algorithm: TsigAlgorithm = config
@@ -228,27 +235,79 @@ fn build_dns_updater(config: &mut Config, acme_id: &str) -> Option<DnsUpdater> {
             })
             .ok()
         }
-        "cloudflare" => {
-            let timeout = config
-                .property_or_default(("acme", acme_id, "timeout"), "30s")
-                .unwrap_or_else(|| Duration::from_secs(30));
-
-            DnsUpdater::new_cloudflare(
-                config
-                    .value_require(("acme", acme_id, "secret"))?
-                    .trim()
-                    .to_string(),
-                config.value(("acme", acme_id, "user")).map(|s| s.trim()),
-                timeout.into(),
+        "cloudflare" => DnsUpdater::new_cloudflare(
+            config
+                .value_require(("acme", acme_id, "secret"))?
+                .trim()
+                .to_string(),
+            config.value(("acme", acme_id, "user")).map(|s| s.trim()),
+            timeout.into(),
+        )
+        .map_err(|err| {
+            config.new_build_error(
+                ("acme", acme_id, "provider"),
+                format!("Failed to create Cloudflare DNS updater: {err}"),
             )
-            .map_err(|err| {
-                config.new_build_error(
-                    ("acme", acme_id, "provider"),
-                    format!("Failed to create Cloudflare DNS updater: {err}"),
-                )
-            })
-            .ok()
-        }
+        })
+        .ok(),
+        "digitalocean" => DnsUpdater::new_digitalocean(
+            config
+                .value_require(("acme", acme_id, "secret"))?
+                .trim()
+                .to_string(),
+            timeout.into(),
+        )
+        .map_err(|err| {
+            config.new_build_error(
+                ("acme", acme_id, "provider"),
+                format!("Failed to create DigitalOcean DNS updater: {err}"),
+            )
+        })
+        .ok(),
+        "desec" => DnsUpdater::new_desec(
+            config
+                .value_require(("acme", acme_id, "secret"))?
+                .trim()
+                .to_string(),
+            timeout.into(),
+        )
+        .map_err(|err| {
+            config.new_build_error(
+                ("acme", acme_id, "provider"),
+                format!("Failed to create Desec DNS updater: {err}"),
+            )
+        })
+        .ok(),
+        "ovh" => DnsUpdater::new_ovh(
+            config
+                .value_require(("acme", acme_id, "key"))
+                .map(|s| s.trim())?
+                .to_string(),
+            config
+                .value_require(("acme", acme_id, "secret"))?
+                .trim()
+                .to_string(),
+            config
+                .value_require(("acme", acme_id, "consumer-key"))?
+                .trim()
+                .to_string(),
+            config
+                .value_require(("acme", acme_id, "ovh-endpoint"))?
+                .parse()
+                .map_err(|_| {
+                    config
+                        .new_parse_error(("acme", acme_id, "ovh-endpoint"), "Invalid OVH endpoint")
+                })
+                .ok()?,
+            timeout.into(),
+        )
+        .map_err(|err| {
+            config.new_build_error(
+                ("acme", acme_id, "provider"),
+                format!("Failed to create Desec DNS updater: {err}"),
+            )
+        })
+        .ok(),
         _ => {
             config.new_parse_error(("acme", acme_id, "provider"), "Unsupported provider");
             None
@@ -262,11 +321,7 @@ pub(crate) fn parse_certificates(
     subject_names: &mut AHashSet<String>,
 ) {
     // Parse certificates
-    for cert_id in config
-        .sub_keys("certificate", ".cert")
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-    {
+    for cert_id in config.sub_keys("certificate", ".cert") {
         let cert_id = cert_id.as_str();
         let key_cert = ("certificate", cert_id, "cert");
         let key_pk = ("certificate", cert_id, "private-key");

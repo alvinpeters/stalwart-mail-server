@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,15 +9,18 @@ pub mod session;
 
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 
-use common::listener::{limiter::InFlight, ServerInstance};
-use imap::core::{ImapInstance, Inner};
+use common::{
+    Inner, Server,
+    auth::AccessToken,
+    listener::{ServerInstance, limiter::InFlight},
+};
+
+use compact_str::CompactString;
 use imap_proto::receiver::{CommandParser, Receiver};
-use jmap::{auth::AccessToken, JMAP};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub struct Session<T: AsyncRead + AsyncWrite> {
-    pub jmap: JMAP,
-    pub imap: Arc<Inner>,
+    pub server: Server,
     pub instance: Arc<ServerInstance>,
     pub receiver: Receiver<Command>,
     pub state: State,
@@ -48,12 +51,12 @@ impl State {
 
 #[derive(Clone)]
 pub struct ManageSieveSessionManager {
-    pub imap: ImapInstance,
+    pub inner: Arc<Inner>,
 }
 
 impl ManageSieveSessionManager {
-    pub fn new(imap: ImapInstance) -> Self {
-        Self { imap }
+    pub fn new(inner: Arc<Inner>) -> Self {
+        Self { inner }
     }
 }
 
@@ -300,12 +303,12 @@ impl SerializeResponse for trc::Error {
 
 impl From<ResponseCode> for trc::Value {
     fn from(value: ResponseCode) -> Self {
-        trc::Value::Static(value.as_str())
+        trc::Value::String(CompactString::const_new(value.as_str()))
     }
 }
 
 impl From<ResponseType> for trc::Value {
     fn from(value: ResponseType) -> Self {
-        trc::Value::Static(value.as_str())
+        trc::Value::String(CompactString::const_new(value.as_str()))
     }
 }

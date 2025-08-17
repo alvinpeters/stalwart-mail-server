@@ -1,28 +1,27 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{
-    sync::{atomic::Ordering, Arc, LazyLock},
-    thread::{park, Builder, JoinHandle},
+    sync::{Arc, LazyLock, atomic::Ordering},
+    thread::{Builder, JoinHandle, park},
     time::SystemTime,
 };
 
 use ahash::AHashMap;
 use atomics::bitset::AtomicBitset;
 use ipc::{
-    channel::{Receiver, CHANNEL_FLAGS, CHANNEL_UPDATE_MARKER},
-    subscriber::{Interests, Subscriber},
     USIZE_BITS,
+    channel::{CHANNEL_FLAGS, CHANNEL_UPDATE_MARKER, Receiver},
+    subscriber::{Interests, Subscriber},
 };
 use parking_lot::Mutex;
 
 use crate::*;
 
-pub(crate) type GlobalInterests =
-    AtomicBitset<{ (TOTAL_EVENT_COUNT + USIZE_BITS - 1) / USIZE_BITS }>;
+pub(crate) type GlobalInterests = AtomicBitset<{ TOTAL_EVENT_COUNT.div_ceil(USIZE_BITS) }>;
 
 pub(crate) static TRACE_INTERESTS: GlobalInterests = GlobalInterests::new();
 pub(crate) type CollectorThread = JoinHandle<()>;

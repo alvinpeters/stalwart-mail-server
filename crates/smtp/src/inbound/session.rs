@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,6 +9,8 @@ use common::{
     expr::{self, functions::ResolveVariable, *},
     listener::SessionStream,
 };
+
+use compact_str::ToCompactString;
 use smtp_proto::{
     request::receiver::{
         BdatReceiver, DataReceiver, DummyDataReceiver, DummyLineReceiver, LineReceiver,
@@ -17,7 +19,7 @@ use smtp_proto::{
     *,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use trc::{NetworkEvent, SmtpEvent};
+use trc::{NetworkEvent, SecurityEvent, SmtpEvent};
 
 use crate::core::{Session, State};
 
@@ -84,10 +86,9 @@ impl<T: SessionStream> Session<T> {
                                 initial_response,
                             } => {
                                 let auth: u64 = self
-                                    .core
-                                    .core
+                                    .server
                                     .eval_if::<Mechanism, _>(
-                                        &self.core.core.smtp.session.auth.mechanisms,
+                                        &self.server.core.smtp.session.auth.mechanisms,
                                         self,
                                         self.data.session_id,
                                     )
@@ -101,11 +102,11 @@ impl<T: SessionStream> Session<T> {
                                     );
 
                                     self.write(b"503 5.5.1 AUTH not allowed.\r\n").await?;
-                                } else if !self.data.authenticated_as.is_empty() {
+                                } else if let Some(authenticated_as) = self.authenticated_as() {
                                     trc::event!(
                                         Smtp(SmtpEvent::AlreadyAuthenticated),
                                         SpanId = self.data.session_id,
-                                        AccountName = self.data.authenticated_as.clone(),
+                                        AccountName = authenticated_as.to_string(),
                                     );
 
                                     self.write(b"503 5.5.1 Already authenticated.\r\n").await?;
@@ -237,6 +238,33 @@ impl<T: SessionStream> Session<T> {
                         Err(err) => match err {
                             Error::NeedsMoreData { .. } => break 'outer,
                             Error::UnknownCommand | Error::InvalidResponse { .. } => {
+                                // Check for port scanners
+                                if !self.is_authenticated() {
+                                    match self
+                                        .server
+                                        .is_scanner_fail2banned(self.data.remote_ip)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            trc::event!(
+                                                Security(SecurityEvent::ScanBan),
+                                                SpanId = self.data.session_id,
+                                                RemoteIp = self.data.remote_ip,
+                                                Reason = "Invalid SMTP command",
+                                            );
+
+                                            return Err(());
+                                        }
+                                        Ok(false) => {}
+                                        Err(err) => {
+                                            trc::error!(
+                                                err.span_id(self.data.session_id)
+                                                    .details("Failed to check for fail2ban")
+                                            );
+                                        }
+                                    }
+                                }
+
                                 trc::event!(
                                     Smtp(SmtpEvent::InvalidCommand),
                                     SpanId = self.data.session_id,
@@ -271,11 +299,16 @@ impl<T: SessionStream> Session<T> {
                                     Details = syntax
                                 );
 
-                                self.write(
-                                    format!("501 5.5.2 Syntax error, expected: {syntax}\r\n")
-                                        .as_bytes(),
-                                )
-                                .await?;
+                                if !self.params.ehlo_reject_non_fqdn && syntax.starts_with("EHLO ")
+                                {
+                                    self.handle_ehlo("null".to_string(), true).await?
+                                } else {
+                                    self.write(
+                                        format!("501 5.5.2 Syntax error, expected: {syntax}\r\n")
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                                }
                             }
                             Error::InvalidParameter { param } => {
                                 trc::event!(
@@ -313,15 +346,15 @@ impl<T: SessionStream> Session<T> {
                 State::Data(receiver) => {
                     if self.data.message.len() + bytes.len() < self.params.max_message_size {
                         if receiver.ingest(&mut iter, &mut self.data.message) {
-                            let num_rcpts = self.data.rcpt_to.len();
                             let message = self.queue_message().await;
+                            let num_responses = if self.instance.protocol == ServerProtocol::Smtp {
+                                1
+                            } else {
+                                self.data.rcpt_oks
+                            };
                             if !message.is_empty() {
-                                if self.instance.protocol == ServerProtocol::Smtp {
+                                for _ in 0..num_responses {
                                     self.write(message.as_ref()).await?;
-                                } else {
-                                    for _ in 0..num_rcpts {
-                                        self.write(message.as_ref()).await?;
-                                    }
                                 }
                                 self.reset();
                                 state = State::default();
@@ -340,15 +373,16 @@ impl<T: SessionStream> Session<T> {
                     if receiver.ingest(&mut iter, &mut self.data.message) {
                         if self.can_send_data().await? {
                             if receiver.is_last {
-                                let num_rcpts = self.data.rcpt_to.len();
                                 let message = self.queue_message().await;
                                 if !message.is_empty() {
-                                    if self.instance.protocol == ServerProtocol::Smtp {
+                                    let num_responses =
+                                        if self.instance.protocol == ServerProtocol::Smtp {
+                                            1
+                                        } else {
+                                            self.data.rcpt_oks
+                                        };
+                                    for _ in 0..num_responses {
                                         self.write(message.as_ref()).await?;
-                                    } else {
-                                        for _ in 0..num_rcpts {
-                                            self.write(message.as_ref()).await?;
-                                        }
                                     }
                                     self.reset();
                                 } else {
@@ -439,6 +473,7 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
         self.data.priority = 0;
         self.data.delivery_by = 0;
         self.data.future_release = 0;
+        self.data.rcpt_oks = 0;
     }
 
     #[inline(always)]
@@ -524,7 +559,7 @@ impl<T: SessionStream> ResolveVariable for Session<T> {
                 .data
                 .rcpt_to
                 .iter()
-                .map(|r| Variable::String(r.address_lcase.as_str().into()))
+                .map(|r| Variable::from(r.address_lcase.as_str()))
                 .collect::<Vec<_>>()
                 .into(),
             V_SENDER => self
@@ -542,16 +577,36 @@ impl<T: SessionStream> ResolveVariable for Session<T> {
                 .unwrap_or_default()
                 .into(),
             V_HELO_DOMAIN => self.data.helo_domain.as_str().into(),
-            V_AUTHENTICATED_AS => self.data.authenticated_as.as_str().into(),
+            V_AUTHENTICATED_AS => self.authenticated_as().unwrap_or_default().into(),
             V_LISTENER => self.instance.id.as_str().into(),
             V_REMOTE_IP => self.data.remote_ip_str.as_str().into(),
             V_REMOTE_PORT => self.data.remote_port.into(),
             V_LOCAL_IP => self.data.local_ip_str.as_str().into(),
             V_LOCAL_PORT => self.data.local_port.into(),
             V_TLS => self.stream.is_tls().into(),
-            V_PRIORITY => self.data.priority.to_string().into(),
+            V_PRIORITY => self.data.priority.to_compact_string().into(),
             V_PROTOCOL => self.instance.protocol.as_str().into(),
+            V_ASN => self
+                .data
+                .asn_geo_data
+                .asn
+                .as_ref()
+                .map(|a| a.id)
+                .unwrap_or_default()
+                .into(),
+            V_COUNTRY => self
+                .data
+                .asn_geo_data
+                .country
+                .as_ref()
+                .map(|c| c.as_str())
+                .unwrap_or_default()
+                .into(),
             _ => expr::Variable::default(),
         }
+    }
+
+    fn resolve_global(&self, _: &str) -> Variable<'_> {
+        Variable::Integer(0)
     }
 }

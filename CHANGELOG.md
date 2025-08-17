@@ -2,11 +2,462 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.13.2] - 2025-07-28
+
+If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking changes** to the message queue and MTA configuration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- ACME: DeSEC cloud DNS provider support (contributed by @Tyr3al).
+- ACME: OVH cloud DNS provider support (contributed by @srachner).
+- CalDAV Scheduling: Catalan language support (contributed by @jolupa) (#1873).
+- MTA: Allow to send e-mails as group, while member of that group (#485).
+- OIDC: Allow local access tokens to be used with third-party OIDC backends (#1311 stalwartlabs/webadmin#52).
+
+## Changed
+- IMAP: Return `OK` when moving/copying non-existent messages (#670).
+- IMAP: Copy flags when copying/moving messages between accounts.
+
+## Fixed
+- MTA: Do not convert e-mail local parts to lowercase (#1916).
+- Sieve: `fileinto` should override spam filter (#1917).
+- JMAP: Incorrect `accountId` used in email set and import methods (#1777).
+- WebDAV: Always return `MULTISTATUS` when calendar-query yields no results.
+- LDAP: Only set account name if not returned in LDAP query (#1471).
+- Enterprise: Invalidate logo cache when changes are made (#1856).
+- Enterprise: Fix tenant quota update API.
+
+## [0.13.1] - 2025-07-16
+
+If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking changes** to the message queue and MTA configuration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- ACME: DigitalOcean cloud DNS provider support (#1667).
+
+## Changed
+
+## Fixed
+- Migration: Old queue events not deleted causing high CPU usage in some deployments (#1833).
+- MTA: `mta-sts` setting parsing issue (#1830).
+- JMAP: `sortOrder` should not be null (#1831).
+- Allow invalid TOML when parsing database settings (#1822).
+
+## [0.13.0] - 2025-07-15
+
+If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking changes** to the message queue and MTA configuration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- MTA queue enhancements (#1246 #1035 #457).
+- Danish locale support (contributed by @Fadil2k) (#1772).
+- DKIM support for `stalwart-cli` (contributed by @rmsc) (#1804).
+
+## Changed
+- Invalidate access token caches in a cluster using pub/sub (#1741).
+- Allow updating secrets for all directory types.
+
+## Fixed
+- WebDAV: Return all shared resources in `calendar-home-set` and `addressbook-home-set` (#1796).
+- WebDAV ACL: Fix write permission and `multiget` reports (#1768).
+- CalDAV Scheduling: Include `DTSTART`/`DTEND` properties in iMIP `CANCEL` messages (#1775).
+- HTTP: Do not include `WWW-Authenticate` headers in API responses (#1795).
+- API: Allow API keys to be used with external directories (#1815).
+- IMAP: Fix issue creating subfolders under INBOX for group shared folder (#1817).
+- IMAP: Custom Name for Shared Folders ignored (#1620).
+- LDAP: `local` placeholder should return username when its not an email address (#1784).
+
+## [0.12.5] - 2025-06-25
+
+If you are upgrading from v0.11.x, this version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- Calendar Scheduling Extensions to CalDAV - RFC6368 (#1514)
+- Calendar E-Mail Notifications (#1514)
+- Limited i18n support for calendaring events.
+- Assisted CalDAV/CardDAV shared resource discovery (#1691).
+
+## Changed
+- JMAP: Allow unauthenticated access to JMAP session object.
+
+## Fixed
+- WebDAV: Return NOTFOUND error instead of MULTISTATUS on empty PROPFIND responses (#1657).
+- WebDAV: Update account name when refreshing DAV caches (#1694).
+- JMAP: Do not include email address in identity names (#1688).
+- IMAP: Normalize `INBOX` name when creating/renaming folders (#1636).
+- LDAP: Request `secret-changed` attribute in LDAP queries (#1409).
+- Branding: Unable to change logos (#1652).
+- Antispam: Skip `card-is-ham` override when sender does not pass DMARC (#1648).
+- FoundationDB: Renew old/expired FDB read transactions after the `1007` error code is received rather than estimating expiration time.
+
+## [0.12.4] - 2025-06-03
+
+If you are upgrading from v0.11.x, this version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- LDAP authentication enhancements (#1269 #1471 #795 #1496).
+- MTA: Return Queue IDs during message acceptance (#927).
+
+## Changed
+- LDAP: `bind.auth.enable` is now `bind.auth.method`, read the updated [LDAP documentation](https://stalw.art/docs/auth/backend/ldap) for more information.
+
+## Fixed
+- DNS: `hickory-resolver` bug hitting 100% CPU usage when resolving DNSSEC records.
+- IMAP: Return the message UID in the destination mailbox if the message already exists (#1201).
+- MTA: TLS reports being issued for sent TLS reports (infinite loop) (#1301).
+- WebDAV: Return `CTag` on `/dav/cal/account` resources to force iOS synchronize.
+- CardDAV: Strict vCard parsing (#1607).
+- WebDAV: Dead property updates (#1611).
+- WebDAV: Use last change id in `CTag`.
+
+## [0.12.3] - 2025-05-30
+
+If you are upgrading from v0.11.x, this version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- Store vanished IMAP UIDs and WebDAV paths in the changelog.
+
+## Changed
+
+## Fixed
+- XML `CDATA` injection (credits to @andreymal for the report).
+- Macro references are replaced with their content when writing config file (#1595).
+- Double nested CalDAV and CardDAV property tags (#1591).
+- Allow empty properties in PROPPATCH requests (#1580).
+
+## [0.12.2] - 2025-05-27
+
+If you are upgrading from v0.11.x, this version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+- CardDAV: Legacy vCard 2.1 and 3.0 serialization support.
+- WebDAV: Add SRV Records to help DAV autodiscovery (closes #1565).
+
+## Changed
+
+## Fixed
+- Report list attempts to deserialize empty values (#1562)
+- Refresh expired FoundationDB transactions while retrieving large blobs (#1555).
+
+## [0.12.1] - 2025-05-26
+
+If you are upgrading from v0.11.x, this version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+
+## Changed
+
+## Fixed
+- Migration tool to generate the correct next id (#1561).
+- Failed to parse setting dav.lock.max-timeout (closes #1559).
+- Failed to build OpenTelemetry span exporter: no http client specified (#1571).
+
+## [0.12.0] - 2025-05-26
+
+This version includes **breaking changes** to the database layout and requires a migration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+### Added
+- [Collaboration](https://stalw.art/docs/collaboration/overview) features including [Calendars over CalDAV](https://stalw.art/docs/http/calendar/), [Contacts over CardDAV](https://stalw.art/docs/http/contact/) and [File Storage over WebDAV](https://stalw.art/docs/http/file-storage/).
+- Peer-to-peer [cluster coordination](https://stalw.art/docs/cluster/coordination/overview) or with Apache Kafka, Redpanda, NATS or Redis.
+- Incremental caching of emails, calendars, contacts and file metadata.
+- Zero-copy deserialization.
+- Train spam messages as ham when the sender is in the user's address book.  
+- `XOAUTH2` SASL mechanism support (#1194 #1369).
+- Support for RFC9698, the `JMAPACCESS` Extension for IMAP.
+- Search index for accounts and other principals (#1368).
+- Add `description` property to OIDC ID token (#1234).
+
+### Changed
+- Deprecated gossip protocol in favor of the new [coordinator](https://stalw.art/docs/cluster/coordination/overview) options.
+- Renamed Git repository from `stalwartlabs/mail-server` to `stalwartlabs/stalwart` and the Docker image from `stalwartlabs/mail-server` to `stalwartlabs/stalwart`.
+- Renamed multiple settings:
+  - `server.http.*` to `http.*`.
+  - `jmap.folders.*` to `email.folders.*`.
+  - `jmap.account.purge.frequency` to `account.purge.frequency`.
+  - `jmap.email.auto-expunge` to `email.auto-expunge`.
+  - `jmap.protocol.changes.max-history` to `changes.max-history`.
+  - `storage.encryption.*` to `email.encryption.*`.
+- Deprecated `lookup.default.*` settings in favor of `server.hostname` and `report.domain`. v0.11 and before supported both, v0.12 will only support the new settings.
+
+### Fixed
+- Allow undiscovered UIDs to be used in IMAP `COPY`/`MOVE` operations (#1201).
+- Refuse loopback SMTP delivery (#1377).
+- Hide the current server version (#1435).
+- Use the newest `X-Spam-Status` Header (#1308).
+- MySQL Driver error: Transactions couldn't be nested (#1271).
+- Spawn a delivery thread for `EmailSubmission/set` requests (#1540).
+- ACME: Don't restrict challenge types (#1522).
+- Autoconfig: return `%EMAILADDRESS%` if no e-mail address is provided (#1537).
+
+## [0.11.8] - 2025-04-30
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+
+### Changed
+
+### Fixed
+- Allow undiscovered UIDs to be used in `COPY`/`MOVE` operations (#1201).
+
+## [0.11.7] - 2025-03-23
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- LDAP attribute to indicate password change (#1156).
+
+### Changed
+- Lazy DKIM key parsing (#1211).
+- Enable `edns0` for system resolver by default (#1282).
+- Bump FoundationDB to `7.3`.
+
+### Fixed
+- Fix incorrect `UIDNEXT` when mailbox is empty (#1201).
+- Sender variable not set when evaluating `must-match-sender` (#1294).
+- Do not panic when mailboxId is not found (#1293).
+- Prioritize local over span keys when serializing webhook payloads (#1250).
+- Allow TLS name mismatch as per RFC7671 Section 5.1.
+- Try with implicit MX when no MX records are found.
+- SQL `secrets` directory query.
+
+## [0.11.5] - 2025-02-01
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+
+### Changed
+- Open source third party OIDC support.
+
+### Fixed
+- Case insensitive flag parsing (#1138).
+- BCC not removed from JMAP EmailSubmissions (#618).
+- Group pipelined IMAP FETCH and STATUS operations (#1096).
+
+## [0.11.4] - 2025-01-29
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- RFC 9208 - IMAP QUOTA Extension (#484).
+
+### Changed
+- `session.throttle.*` is now `queue.limiter.inbound.*`.
+- `queue.throttle.*` is now `queue.limiter.outbound.*`.
+- Changed DNSBL error level to debug (#1107).
+
+### Fixed
+- Creating a mailbox in a shared folder results in wrong hierarchy (#1128).
+- IMAP LIST-STATUS (RFC 5819) returns items in wrong order (#1129).
+- Avoid non-RFC SMTP status codes (#1109).
+- Do not DNSBL check invalid domains (#1107).
+- Sieve message flag parser (#1059).
+- Sieve script import case insensitivity (#962).
+- `mailto:` parsing in HTMLs.
+
+## [0.11.2] - 2025-01-17
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- Automatic revoking of access tokens when secrets, permissions, ACLs or group memberships change (#649).
+- Increased concurrency for local message delivery (configurable via `queue.threads.local`).
+- Cluster node roles.
+- `config_get` expression function.
+
+### Changed
+- `queue.outbound.concurrency` is now `queue.threads.remote`.
+- `lookup.default.hostname` is now `server.hostname`.
+- `lookup.default.domain` is now `report.domain`.
+
+### Fixed
+- Distributed locking issues in non-Redis stores (#1066).
+- S3 incorrect backoff wait time after failures.
+- Panic parsing broken HTMLs.
+- Update CLI response serializer to v0.11.x (#1082).
+- Histogram bucket counts (#1079).
+- Do not rate limit trusted IPs (#1078).
+- Avoid double encrypting PGP parts encoded as plain text (#1083).
+- Return empty SASL challenge rather than "" (#1064).
+
+## [0.11.0] - 2025-01-06
+
+This version includes breaking changes to the configuration file, please read [UPGRADING.md](UPGRADING.md) for details.
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- Spam filter rewritten in Rust for a significant performance improvement.
+- Multiple spam filter improvements (#947) such as training spam/ham when moving between inbox and spam folders (#819).
+- Improved distributed locking and handling of large distributed SMTP queues.
+- ASN and GeoIP lookups.
+- Bulk operations REST endpoints (#925).
+- Faster S3-FIFO caching.
+- Support adding the `Delivered-To` header (#916).
+- Semver compatibility checks when upgrading (#844).
+- Sharded In-Memory Store.
+
+### Changed
+- Removed authentication rate limit (no longer necessary since there is fail2ban).
+- Pipes have been deprecated in favor of MTA hooks.
+
+### Fixed
+- OpenPGP EOF error (#1024).
+- Convert emails obtained from external directories to lowercase (#1004).
+- LDAP: Support both name and email fields to be mapped to the same attribute.
+- Admin role can't be assigned if an account with the same name exists.
+- Fix macro detection in DNS record generation (#978).
+- Use host FQDN in install script (#1003).
+
+## [0.10.7] - 2024-12-04
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- Delivery and DMARC Troubleshooting (#420).
+- Support for external email addresses on mailing lists (#152).
+- Azure blob storage support.
+
+### Changed
+
+### Fixed
+- Some mails can't be moved out of the junk folder (#670).
+- Out of bound index error on Sieve script (#941).
+- Missing `User-Agent` header for ACME (#937).
+- UTF8 support in IMAP4rev1 (#948).
+- Account alias owner leak on autodiscover.
+- Include all events in OTEL traces + Include spanId in webhooks.
+- Implement `todo!()` causing panic on concurrency and rate limits.
+- Mark SQL store as active if used as a telemetry store.
+- Discard empty form submissions.
+
+## [0.10.6] - 2024-11-07
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- Enterprise license automatic renewals before expiration (disabled by default).
+- Allow to LDAP search using bind dn instead of auth bind connection when bind auth is enabled (#873)
+
+### Changed
+
+### Fixed
+- Include `preferred_username` and `email` in OIDC `id_token`.
+- Verify roles and permissions when creating or modifying accounts (#874)
+
+## [0.10.5] - 2024-10-15
+
+To upgrade replace the `stalwart-mail` binary. 
+
+### Added
+- Data store CLI.
+
+### Changed
+
+### Fixed
+- Tokenizer performance issue (#863)
+- Incorrect AI model endpoint setting.
+
+## [0.10.4] - 2024-10-08
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin. 
+
+### Added
+- Detect and ban port scanners as well as other forms of abuse (#820).
+- ACME External Account Binding support (#379).
+
+### Changed
+- The settings `server.fail2ban.*` have been moved to `server.auto-ban.*`.
+- The event `security.brute-force-ban` is now `security.abuse-ban`.
+
+### Fixed
+- Do not send SPF failures reports to local domains.
+- Allow `nonce` in OAuth code requests.
+- Warn when there are errors migrating domains rather than aborting migration.
+
+## [0.10.3] - 2024-10-07
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin. Enterprise users wishing to use the new LLM-powered spam filter should also upgrade the spam filter rules.
+
+### Added
+- AI-powered Spam filtering and Sieve scripting (Enterprise feature).
+
+### Changed
+- The untrusted Sieve interpreter now has the `vnd.stalwart.expressions` extension enabled by default. This allows Sieve users to use the `eval` function to evaluate expressions in their scripts. If you would like to disable this extension, you can do so by adding `vnd.stalwart.expressions` to `sieve.untrusted.disabled-capabilities`.
+
+### Fixed
+- S3-compatible backends: Retry on `5xx` errors.
+- OIDC: Include `nonce` parameter in `id_token` response.
+
+## [0.10.2] - 2024-10-02
+
+To upgrade first upgrade the webadmin and then replace the `stalwart-mail` binary. If you read these instructions too late, you can upgrade to the latest web-admin using `curl -k -u admin:yourpass https://yourserver/api/update/webadmin`.
+
+### Added
+- OpenID Connect server (#298).
+- OpenID Connect backend support (Enterprise feature).
+- OpenID Connect Dynamic Client Registration (#4)
+- OAuth 2.0 Dynamic Client Registration Protocol ([RFC7591](https://datatracker.ietf.org/doc/html/rfc7591)) (#136)
+- OAuth 2.0 Token Introspection ([RFC7662](https://datatracker.ietf.org/doc/html/rfc7662)).
+- Contact form submission handling.
+- `webadmin.path` setting to override unpack directory (#792).
+
+### Changed
+
+### Fixed
+- Missing `LIST-STATUS` from RFC5819 in IMAP capability responses (#816).
+- Do not allow tenant domains to be deleted if they have members (#812).
+- Tenant principal limits (#810).
+
+## [0.10.1] - 2024-09-26
+
+To upgrade replace the `stalwart-mail` binary.
+
+### Added
+- `OAUTHBEARER` SASL support in all services (#627).
+
+### Changed
+
+### Fixed
+- Fixed `migrate_directory` range scan (#784).
+
+## [0.10.0] - 2024-09-21
+
+This version includes breaking changes to how accounts are stored. Please read [UPGRADING.md](UPGRADING.md) for details.
+
+### Added
+- Multi-tenancy (Enterprise feature).
+- Branding (Enterprise feature).
+- Roles and permissions.
+- Full-text search re-indexing.
+- Partial database backups (#497).
+
+### Changed
+
+### Fixed
+- IMAP `IDLE` support for command pipelining, aka the Apple Mail iOS 18 bug (#765).
+- Case insensitive INBOX `fileinto` (#763).
+- Properly decode undelete account name (#761).
+
+## [0.9.4] - 2024-09-09
+
+To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
+
+### Added
+- Support for global Sieve scripts that can be used by users to filter their incoming mail.
+- Allow localhost to override HTTP access controls to prevent lockouts.
+
+### Changed
+- Sieve runtime error default log level is now `debug`.
+
+### Fixed
+- Ignore INBOX case on Sieve's `fileinto` (#725)
+- Local keys parsing and retrieval issues.
+- Lookup reload does not include database settings.
+- Account count is incorrect.
+
 ## [0.9.3] - 2024-08-29
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
 
-## Added
+### Added
 - Dashboard (Enterprise feature)
 - Alerts (Enterprise feature)
 - SYN Flood (session "loitering") attack protection (#482)
@@ -25,7 +476,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
 
-## Added
+### Added
 - Message delivery history (Enterprise feature)
 - Live tracing and logging (Enterprise feature)
 - SQL Read Replicas (Enterprise feature)
@@ -43,7 +494,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
 
-## Added
+### Added
 - Metrics support (closes #478)
   - OpenTelemetry Push Exporter
   - Prometheus Pull Exporter (closes #275)
@@ -64,7 +515,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin. This version includes breaking changes to the Webhooks configuration and produces a slightly different log output, read [UPGRADING.md](UPGRADING.md) for details.
 
-## Added
+### Added
 - Improved and faster tracing and logging.
 - Customizable event logging levels.
 
@@ -78,7 +529,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary.
 
-## Added
+### Added
 - Restore deleted e-mails (Enterprise Edition only)
 - Kubernetes (K8S) livenessProbe and readinessProbe endpoints.
 
@@ -93,7 +544,7 @@ To upgrade replace the `stalwart-mail` binary.
 
 To upgrade replace the `stalwart-mail` binary.
 
-## Added
+### Added
 
 ### Changed
 
@@ -105,7 +556,7 @@ To upgrade replace the `stalwart-mail` binary.
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin.
 
-## Added
+### Added
 - Two-factor authentication with Time-based One-Time Passwords (#436)
 - Application passwords (#479).
 - Option to disable user accounts.
@@ -122,7 +573,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin and spam filter versions.
 
-## Added
+### Added
 - Webhooks support (#480)
 - MTA Hooks (like milter but over HTTP)
 - Manually train and test spam classifier (#473 #264 #257 #471)
@@ -143,7 +594,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin and spam filter versions.
 
-## Added
+### Added
 - POP3 support.
 - DKIM signature length exploit protection.
 - Faster email deletion.
@@ -167,7 +618,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 This version uses a different database layout which is incompatible with previous versions. Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.
 
-## Added
+### Added
 - Clustering support with node auto-discovery and partition-tolerant failure detection.
 - Autoconfig and MS Autodiscover support (#336)
 - New variables `retry_num`, `notify_num`, `last_error` add `last_status` available in queue expressions.
@@ -196,7 +647,7 @@ This version uses a different database layout which is incompatible with previou
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin version.
 
-## Added
+### Added
 - Full database export and import functionality
 - Add --help and --version command line arguments (#365)
 - Allow catch-all addresses when validating must match sender
@@ -215,7 +666,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web-admin version.
 
-## Added
+### Added
 - Support for `DNS-01` and `HTTP-01` ACME challenges (#226)
 - Configurable external resources (#355)
 
@@ -229,7 +680,7 @@ To upgrade replace the `stalwart-mail` binary and then upgrade to the latest web
 
 To upgrade replace the `stalwart-mail` binary.
 
-## Added
+### Added
 - Make initial admin password configurable via env (#311)
 
 ### Changed
@@ -243,7 +694,7 @@ To upgrade replace the `stalwart-mail` binary.
 
 This version uses a different database layout and introduces multiple breaking changes in the configuration files. Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.
 
-## Added
+### Added
 - Web-based administration interface.
 - REST API for management and configuration.
 - Automatic RSA and ED25519 DKIM key generation.
@@ -265,7 +716,7 @@ This version uses a different database layout and introduces multiple breaking c
 
 This version introduces breaking changes in the configuration file. Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.
 
-## Added
+### Added
 - Distributed and fault-tolerant SMTP message queues.
 - Distributed rate-limiting and fail2ban.
 - Expressions in configuration files.
@@ -281,7 +732,7 @@ This version introduces breaking changes in the configuration file. Please read 
 
 Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.
 
-## Added
+### Added
 - Built-in [fail2ban](https://stalw.art/docs/server/fail2ban) and IP address/mask blocking (#164).
 - CLI: Read URL and credentials from environment variables (#88).
 - mySQL driver: Add `max-allowed-packet` setting (#201).
@@ -299,7 +750,7 @@ Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to
 
 Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to upgrade from previous versions.
 
-## Added
+### Added
 - [ACME](https://stalw.art/docs/server/tls/acme) support for automatic TLS certificate generation and renewal (#160).
 - TLS certificate [hot-reloading](https://stalw.art/docs/management/database/maintenance#tls-certificate-reloading).
 - [HAProxy protocol](https://stalw.art/docs/server/proxy) support (#36).
@@ -312,7 +763,7 @@ Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to
 
 ## [0.5.1] - 2024-01-02
 
-## Added
+### Added
 - SMTP smuggling protection: Sanitization of outgoing messages that do not use `CRLF` as line endings.
 - SMTP sender validation for authenticated users: Added the `session.auth.must-match-sender` configuration option to enforce that the sender address used in the `MAIL FROM` command matches the authenticated user or any of their associated e-mail addresses.
 
@@ -330,7 +781,7 @@ Please read the [UPGRADING.md](UPGRADING.md) file for more information on how to
 
 This version requires a database migration and introduces breaking changes in the configuration file. Please read the [UPGRADING.md](UPGRADING.md) file for more information.
 
-## Added
+### Added
 - Performance enhancements:
   - Messages are parsed only once and their offsets stored in the database, which avoids having to parse them on every `FETCH` request.
   - Background full-text indexing.
@@ -356,7 +807,7 @@ This version requires a database migration and introduces breaking changes in th
 
 ## [0.4.2] - 2023-11-01
 
-## Added
+### Added
 - JMAP for Quotas support ([RFC9425](https://www.rfc-editor.org/rfc/rfc9425.html))
 - JMAP Blob Management Extension support ([RFC9404](https://www.rfc-editor.org/rfc/rfc9404.html))
 - Spam Filter - Empty header rules.
@@ -369,7 +820,7 @@ This version requires a database migration and introduces breaking changes in th
 
 ## [0.4.1] - 2023-10-26
 
-## Added
+### Added
 
 ### Changed
 
@@ -381,7 +832,7 @@ This version requires a database migration and introduces breaking changes in th
 
 This version introduces some breaking changes in the configuration file. Please read the [UPGRADING.md](UPGRADING.md) file for more information.
 
-## Added
+### Added
 - Built-in Spam and Phishing filter.
 - Scheduled queries on some directory types.
 - In-memory maps and lists containing glob or regex patterns.
@@ -397,7 +848,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.10] - 2023-10-17
 
-## Added
+### Added
 - Option to allow invalid certificates on outbound SMTP connections.
 - Option to disable ansi colors on `stdout`.
 
@@ -408,7 +859,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.9] - 2023-10-07
 
-## Added
+### Added
 - Support for reading environment variables from the configuration file using the `!ENV_VAR_NAME` special keyword.
 - Option to disable ANSI color codes in logs.
 
@@ -420,7 +871,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.8] - 2023-09-19
 
-## Added
+### Added
 - Journal logging support
 - IMAP support for UTF8 APPEND
 
@@ -433,7 +884,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.7] - 2023-09-05
 
-## Added
+### Added
 - Option to disable IMAP All Messages folder (#68).
 - Option to allow unencrypted SMTP AUTH (#72)
 - Support for `rcpt-domain` key in `rcpt.relay` SMTP rule evaluation.
@@ -450,7 +901,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.6] - 2023-08-29
 
-## Added
+### Added
 - Arithmetic and logical expression evaluation in Sieve scripts.
 - Support for storing query results in Sieve variables.
 - Results of SPF, DKIM, ARC, DMARC and IPREV checks available as environment variables in Sieve scripts.
@@ -466,7 +917,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.5] - 2023-08-18
 
-## Added
+### Added
 - TCP listener option `nodelay`.
  
 ### Changed
@@ -477,7 +928,7 @@ This version introduces some breaking changes in the configuration file. Please 
 
 ## [0.3.4] - 2023-08-09
 
-## Added
+### Added
 - JMAP: Support for setting custom HTTP response headers (#52)
  
 ### Changed

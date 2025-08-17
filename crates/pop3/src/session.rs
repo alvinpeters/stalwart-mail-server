@@ -1,21 +1,23 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::borrow::Cow;
 
-use common::listener::{SessionData, SessionManager, SessionResult, SessionStream};
-use jmap::JMAP;
+use common::{
+    core::BuildServer,
+    listener::{SessionData, SessionManager, SessionResult, SessionStream},
+};
 use tokio_rustls::server::TlsStream;
 
 use crate::{
+    Pop3SessionManager, SERVER_GREETING, Session, State,
     protocol::{
         request::Parser,
         response::{Response, SerializeResponse},
     },
-    Pop3SessionManager, Session, State, SERVER_GREETING,
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,8 +30,7 @@ impl SessionManager for Pop3SessionManager {
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut session = Session {
-                jmap: JMAP::from(self.pop3.jmap_instance),
-                imap: self.pop3.imap_inner,
+                server: self.inner.build_server(),
                 instance: session.instance,
                 receiver: Parser::default(),
                 state: State::NotAuthenticated {
@@ -71,9 +72,9 @@ impl<T: SessionStream> Session<T> {
             tokio::select! {
                 result = tokio::time::timeout(
                     if !matches!(self.state, State::NotAuthenticated {..}) {
-                        self.jmap.core.imap.timeout_auth
+                        self.server.core.imap.timeout_auth
                     } else {
-                        self.jmap.core.imap.timeout_unauth
+                        self.server.core.imap.timeout_unauth
                     },
                     self.stream.read(&mut buf)) => {
                     match result {
@@ -141,8 +142,7 @@ impl<T: SessionStream> Session<T> {
                 .instance
                 .tls_accept(self.stream, self.session_id)
                 .await?,
-            jmap: self.jmap,
-            imap: self.imap,
+            server: self.server,
             instance: self.instance,
             receiver: self.receiver,
             state: self.state,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,34 +7,34 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use rustls::{
-    crypto::ring::{default_provider, ALL_CIPHER_SUITES},
-    ServerConfig, SupportedCipherSuite, ALL_VERSIONS,
+    ALL_VERSIONS, ServerConfig, SupportedCipherSuite,
+    crypto::ring::{ALL_CIPHER_SUITES, default_provider},
 };
 
 use tokio::net::TcpSocket;
 use tokio_rustls::TlsAcceptor;
 use utils::{
     config::{
-        utils::{AsKey, ParseValue},
         Config,
+        utils::{AsKey, ParseValue},
     },
     snowflake::SnowflakeIdGenerator,
 };
 
 use crate::{
-    listener::{tls::CertificateResolver, TcpAcceptor},
-    SharedCore,
+    Inner,
+    listener::{TcpAcceptor, tls::CertificateResolver},
 };
 
 use super::{
+    Listener, Listeners, ServerProtocol, TcpListener,
     tls::{TLS12_VERSION, TLS13_VERSION},
-    Listener, Server, ServerProtocol, Servers,
 };
 
-impl Servers {
+impl Listeners {
     pub fn parse(config: &mut Config) -> Self {
         // Parse ACME managers
-        let mut servers = Servers {
+        let mut servers = Listeners {
             span_id_gen: Arc::new(
                 config
                     .property::<u64>("cluster.node-id")
@@ -45,11 +45,7 @@ impl Servers {
         };
 
         // Parse servers
-        for id in config
-            .sub_keys("server.listener", ".protocol")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for id in config.sub_keys("server.listener", ".protocol") {
             servers.parse_server(config, id);
         }
         servers
@@ -139,7 +135,7 @@ impl Servers {
                 let _ = socket.set_reuseaddr(true);
             }
 
-            listeners.push(Listener {
+            listeners.push(TcpListener {
                 socket,
                 addr,
                 ttl: config
@@ -197,7 +193,7 @@ impl Servers {
         }
 
         let span_id_gen = self.span_id_gen.clone();
-        self.servers.push(Server {
+        self.servers.push(Listener {
             max_connections: config
                 .property_or_else(
                     ("server.listener", id, "max-connections"),
@@ -213,14 +209,10 @@ impl Servers {
         });
     }
 
-    pub fn parse_tcp_acceptors(&mut self, config: &mut Config, core: SharedCore) {
-        let resolver = Arc::new(CertificateResolver::new(core.clone()));
+    pub fn parse_tcp_acceptors(&mut self, config: &mut Config, inner: Arc<Inner>) {
+        let resolver = Arc::new(CertificateResolver::new(inner.clone()));
 
-        for id_ in config
-            .sub_keys("server.listener", ".protocol")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for id_ in config.sub_keys("server.listener", ".protocol") {
             let id = id_.as_str();
             // Build TLS config
             let acceptor = if config

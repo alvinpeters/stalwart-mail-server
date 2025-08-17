@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,8 +7,12 @@
 use std::borrow::Cow;
 
 use ahash::AHashMap;
-use common::{expr::functions::ResolveVariable, scripts::ScriptModification, Core};
-use sieve::{runtime::Variable, Envelope};
+use common::{
+    Server, auth::AccessToken, expr::functions::ResolveVariable, scripts::ScriptModification,
+};
+
+use mail_parser::Message;
+use sieve::{Envelope, runtime::Variable};
 
 pub mod envelope;
 pub mod event_loop;
@@ -28,7 +32,7 @@ pub enum ScriptResult {
 }
 
 pub struct ScriptParameters<'x> {
-    message: Option<&'x [u8]>,
+    message: Option<Message<'x>>,
     headers: Option<&'x [u8]>,
     variables: AHashMap<Cow<'static, str>, Variable>,
     envelope: Vec<(Envelope, Variable)>,
@@ -36,8 +40,8 @@ pub struct ScriptParameters<'x> {
     from_name: String,
     return_path: String,
     sign: Vec<String>,
-    #[cfg(feature = "test_mode")]
-    expected_variables: Option<AHashMap<String, Variable>>,
+    access_token: Option<&'x AccessToken>,
+    session_id: u64,
 }
 
 impl<'x> ScriptParameters<'x> {
@@ -47,37 +51,40 @@ impl<'x> ScriptParameters<'x> {
             envelope: Vec::with_capacity(6),
             message: None,
             headers: None,
-            #[cfg(feature = "test_mode")]
-            expected_variables: None,
             from_addr: Default::default(),
             from_name: Default::default(),
             return_path: Default::default(),
             sign: Default::default(),
+            access_token: None,
+            session_id: Default::default(),
         }
     }
 
     pub async fn with_envelope(
         mut self,
-        core: &Core,
+        server: &Server,
         vars: &impl ResolveVariable,
         session_id: u64,
     ) -> Self {
         for (variable, expr) in [
-            (&mut self.from_addr, &core.sieve.from_addr),
-            (&mut self.from_name, &core.sieve.from_name),
-            (&mut self.return_path, &core.sieve.return_path),
+            (&mut self.from_addr, &server.core.sieve.from_addr),
+            (&mut self.from_name, &server.core.sieve.from_name),
+            (&mut self.return_path, &server.core.sieve.return_path),
         ] {
-            if let Some(value) = core.eval_if(expr, vars, session_id).await {
+            if let Some(value) = server.eval_if(expr, vars, session_id).await {
                 *variable = value;
             }
         }
-        if let Some(value) = core.eval_if(&core.sieve.sign, vars, session_id).await {
+        if let Some(value) = server
+            .eval_if(&server.core.sieve.sign, vars, session_id)
+            .await
+        {
             self.sign = value;
         }
         self
     }
 
-    pub fn with_message(self, message: &'x [u8]) -> Self {
+    pub fn with_message(self, message: Message<'x>) -> Self {
         Self {
             message: message.into(),
             ..self
@@ -105,12 +112,13 @@ impl<'x> ScriptParameters<'x> {
         self
     }
 
-    #[cfg(feature = "test_mode")]
-    pub fn with_expected_variables(
-        mut self,
-        expected_variables: AHashMap<String, Variable>,
-    ) -> Self {
-        self.expected_variables = expected_variables.into();
+    pub fn with_access_token(mut self, access_token: &'x AccessToken) -> Self {
+        self.access_token = Some(access_token);
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: u64) -> Self {
+        self.session_id = session_id;
         self
     }
 }

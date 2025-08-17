@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,20 +8,18 @@ use core::panic;
 use std::{fmt::Write, fs, path::PathBuf};
 
 use crate::{
-    enable_logging,
+    AssertConfig, enable_logging,
     smtp::{
-        build_smtp,
-        inbound::{sign::SIGNATURES, TestMessage, TestQueueEvent},
-        session::{TestSession, VerifyResponse},
         TempDir, TestSMTP,
+        inbound::{TestMessage, TestQueueEvent, sign::SIGNATURES},
+        session::{TestSession, VerifyResponse},
     },
-    AssertConfig,
 };
 use common::Core;
 
 use smtp::{
-    core::{Inner, Session},
-    scripts::ScriptResult,
+    core::Session,
+    scripts::{ScriptResult, event_loop::RunScript},
 };
 use store::Stores;
 use utils::config::Config;
@@ -43,11 +41,8 @@ max-connections = 10
 min-connections = 0
 idle-timeout = "5m"
 
-[session.data.pipe."test"]
-command = [ { if = "remote_ip = '10.0.0.123'", then = "'/bin/bash'" }, 
-            { else = false } ]
-arguments = "['{CFG_PATH}/pipe_me.sh', 'hello', 'world']"
-timeout = "10s"
+[spam-filter]
+enable = false
 
 [sieve.trusted]
 from-name = "'Sieve Daemon'"
@@ -100,7 +95,6 @@ email = ["john@localdomain.org", "jdoe@localdomain.org", "john.doe@localdomain.o
 email-list = ["info@localdomain.org"]
 member-of = ["sales"]
 
-
 "#;
 
 #[tokio::test]
@@ -135,38 +129,23 @@ async fn sieve_scripts() {
     }
 
     // Prepare config
-    let mut inner = Inner::default();
     let tmp_dir = TempDir::new("smtp_sieve_test", true);
-    let mut config = Config::new(
-        tmp_dir.update_config(
-            config.replace(
-                "{CFG_PATH}",
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources")
-                    .join("smtp")
-                    .join("pipe")
-                    .as_path()
-                    .to_str()
-                    .unwrap(),
-            ),
-        ),
-    )
-    .unwrap();
+    let mut config = Config::new(tmp_dir.update_config(config)).unwrap();
     config.resolve_all_macros().await;
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
-    let mut qr = inner.init_test_queue(&core);
     config.assert_no_errors();
 
     // Build session
-    let core = build_smtp(core, inner);
-    let mut session = Session::test(core.clone());
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server.clone());
     session.data.remote_ip_str = "10.0.0.88".parse().unwrap();
     session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     assert!(!session.init_conn().await);
 
     // Run tests
-    for (name, script) in &core.core.sieve.scripts {
+    for (name, script) in &test.server.core.sieve.trusted_scripts {
         if name.starts_with("stage_") || name.ends_with("_include") {
             continue;
         }
@@ -174,10 +153,9 @@ async fn sieve_scripts() {
         let params = session
             .build_script_parameters("data")
             .set_variable("from", "john.doe@example.org")
-            .with_envelope(&core.core, &session, 0)
+            .with_envelope(&test.server, &session, 0)
             .await;
-        let core_ = core.clone();
-        match core_.run_script(name.to_string(), script, params, 0).await {
+        match test.server.run_script(name.into(), script, params).await {
             ScriptResult::Accept { .. } => (),
             ScriptResult::Reject(message) => panic!("{}", message),
             err => {
@@ -248,7 +226,7 @@ async fn sieve_scripts() {
         )
         .await;
     qr.assert_no_events();
-    qr.clear_queue(&core).await;
+    qr.clear_queue(&test.server).await;
 
     // Expect message delivery plus a notification
     session
@@ -259,20 +237,20 @@ async fn sieve_scripts() {
             "250",
         )
         .await;
-    qr.read_event().await.assert_reload();
-    qr.read_event().await.assert_reload();
+    qr.read_event().await.assert_refresh();
+    qr.read_event().await.assert_refresh();
     let messages = qr.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
     let mut messages = messages.into_iter();
     let notification = messages.next().unwrap();
-    assert_eq!(notification.return_path, "");
-    assert_eq!(notification.recipients.len(), 2);
+    assert_eq!(notification.message.return_path, "");
+    assert_eq!(notification.message.recipients.len(), 2);
     assert_eq!(
-        notification.recipients.first().unwrap().address,
+        notification.message.recipients.first().unwrap().address(),
         "john@example.net"
     );
     assert_eq!(
-        notification.recipients.last().unwrap().address,
+        notification.message.recipients.last().unwrap().address(),
         "jane@example.org"
     );
     notification
@@ -295,7 +273,7 @@ async fn sieve_scripts() {
         .assert_not_contains("X-Part-Number: 5")
         .assert_not_contains("THIS IS A PIECE OF HTML TEXT");
     qr.assert_no_events();
-    qr.clear_queue(&core).await;
+    qr.clear_queue(&test.server).await;
 
     // Expect a modified message delivery plus a notification
     session
@@ -306,8 +284,8 @@ async fn sieve_scripts() {
             "250",
         )
         .await;
-    qr.read_event().await.assert_reload();
-    qr.read_event().await.assert_reload();
+    qr.read_event().await.assert_refresh();
+    qr.read_event().await.assert_refresh();
     let messages = qr.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
     let mut messages = messages.into_iter();
@@ -332,7 +310,7 @@ async fn sieve_scripts() {
         .assert_contains("X-Part-Number: 5")
         .assert_contains("THIS IS A PIECE OF HTML TEXT")
         .assert_not_contains("X-My-Header: true");
-    qr.clear_queue(&core).await;
+    qr.clear_queue(&test.server).await;
 
     // Expect a modified redirected message
     session
@@ -345,10 +323,10 @@ async fn sieve_scripts() {
         .await;
 
     let redirect = qr.expect_message().await;
-    assert_eq!(redirect.return_path, "");
-    assert_eq!(redirect.recipients.len(), 1);
+    assert_eq!(redirect.message.return_path, "");
+    assert_eq!(redirect.message.recipients.len(), 1);
     assert_eq!(
-        redirect.recipients.first().unwrap().address,
+        redirect.message.recipients.first().unwrap().address(),
         "redirect@here.email"
     );
     redirect
@@ -373,10 +351,10 @@ async fn sieve_scripts() {
         .await;
 
     let redirect = qr.expect_message().await;
-    assert_eq!(redirect.return_path, "");
-    assert_eq!(redirect.recipients.len(), 1);
+    assert_eq!(redirect.message.return_path, "");
+    assert_eq!(redirect.message.recipients.len(), 1);
     assert_eq!(
-        redirect.recipients.first().unwrap().address,
+        redirect.message.recipients.first().unwrap().address(),
         "redirect@somewhere.email"
     );
     redirect
@@ -389,25 +367,5 @@ async fn sieve_scripts() {
         .assert_contains("From: Joe SixPack <joe@football.example.com>")
         .assert_contains("Received: ")
         .assert_contains("Authentication-Results: ");
-    qr.assert_no_events();
-
-    // Test pipes
-    session.data.remote_ip_str = "10.0.0.123".parse().unwrap();
-    session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
-    session
-        .send_message(
-            "test@example.net",
-            &["pipe@foobar.com"],
-            "test:no_dkim",
-            "250",
-        )
-        .await;
-
-    qr.expect_message()
-        .await
-        .read_lines(&qr)
-        .await
-        .assert_contains("X-My-Header: true")
-        .assert_contains("Authentication-Results");
     qr.assert_no_events();
 }

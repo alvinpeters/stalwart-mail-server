@@ -1,13 +1,14 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::sync::Arc;
 
-use sieve::{runtime::Variable, Envelope};
+use sieve::{Envelope, runtime::Variable};
 use store::Value;
+use unicode_security::mixed_script::AugmentedScriptSet;
 
 use crate::IntoString;
 
@@ -54,5 +55,23 @@ pub fn to_store_value(value: &Variable) -> Value<'static> {
         Variable::Integer(v) => Value::Integer(*v),
         Variable::Float(v) => Value::Float(*v),
         v => Value::Text(v.to_string().into_owned().into()),
+    }
+}
+
+pub trait IsMixedCharset {
+    fn is_mixed_charset(&self) -> bool;
+}
+
+impl<T: AsRef<str>> IsMixedCharset for T {
+    fn is_mixed_charset(&self) -> bool {
+        let mut set: Option<AugmentedScriptSet> = None;
+
+        for ch in self.as_ref().chars() {
+            if !ch.is_ascii() {
+                set.get_or_insert_default().intersect_with(ch.into());
+            }
+        }
+
+        set.is_some_and(|set| set.is_empty())
     }
 }

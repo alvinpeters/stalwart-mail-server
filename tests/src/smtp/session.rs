@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,16 +7,17 @@
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use common::{
+    Server,
     config::server::ServerProtocol,
-    listener::{limiter::ConcurrencyLimiter, ServerInstance, SessionStream, TcpAcceptor},
+    listener::{ServerInstance, SessionStream, TcpAcceptor, limiter::ConcurrencyLimiter},
 };
-use rustls::{server::ResolvesServerCert, ServerConfig};
+use rustls::{ServerConfig, server::ResolvesServerCert};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::watch,
 };
 
-use smtp::core::{Session, SessionAddress, SessionData, SessionParameters, State, SMTP};
+use smtp::core::{Session, SessionAddress, SessionData, SessionParameters, State};
 use tokio_rustls::TlsAcceptor;
 use utils::snowflake::SnowflakeIdGenerator;
 
@@ -81,8 +82,8 @@ impl Unpin for DummyIo {}
 
 #[allow(async_fn_in_trait)]
 pub trait TestSession {
-    fn test(core: SMTP) -> Self;
-    fn test_with_shutdown(core: SMTP, shutdown_rx: watch::Receiver<bool>) -> Self;
+    fn test(server: Server) -> Self;
+    fn test_with_shutdown(server: Server, shutdown_rx: watch::Receiver<bool>) -> Self;
     fn response(&mut self) -> Vec<String>;
     fn write_rx(&mut self, data: &str);
     async fn rset(&mut self);
@@ -96,11 +97,11 @@ pub trait TestSession {
 }
 
 impl TestSession for Session<DummyIo> {
-    fn test_with_shutdown(core: SMTP, shutdown_rx: watch::Receiver<bool>) -> Self {
+    fn test_with_shutdown(server: Server, shutdown_rx: watch::Receiver<bool>) -> Self {
         Self {
             state: State::default(),
             instance: Arc::new(ServerInstance::test_with_shutdown(shutdown_rx)),
-            core,
+            server,
             stream: DummyIo {
                 rx_buf: vec![],
                 tx_buf: vec![],
@@ -111,16 +112,16 @@ impl TestSession for Session<DummyIo> {
                 0,
                 "127.0.0.1".parse().unwrap(),
                 0,
+                Default::default(),
                 0,
             ),
             params: SessionParameters::default(),
-            in_flight: vec![],
-            hostname: "localhost".to_string(),
+            hostname: "localhost".into(),
         }
     }
 
-    fn test(core: SMTP) -> Self {
-        Self::test_with_shutdown(core, watch::channel(false).1)
+    fn test(server: Server) -> Self {
+        Self::test_with_shutdown(server, watch::channel(false).1)
     }
 
     fn response(&mut self) -> Vec<String> {
@@ -222,60 +223,51 @@ impl TestSession for Session<DummyIo> {
         let message = self
             .build_message(
                 SessionAddress {
-                    address: "bill@foobar.org".to_string(),
-                    address_lcase: "bill@foobar.org".to_string(),
-                    domain: "foobar.org".to_string(),
+                    address: "bill@foobar.org".into(),
+                    address_lcase: "bill@foobar.org".into(),
+                    domain: "foobar.org".into(),
                     flags: 123,
-                    dsn_info: "envelope1".to_string().into(),
+                    dsn_info: Some("envelope1".into()),
                 },
                 vec![
                     SessionAddress {
-                        address: "a@foobar.org".to_string(),
-                        address_lcase: "a@foobar.org".to_string(),
-                        domain: "foobar.org".to_string(),
+                        address: "a@foobar.org".into(),
+                        address_lcase: "a@foobar.org".into(),
+                        domain: "foobar.org".into(),
                         flags: 1,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "b@test.net".to_string(),
-                        address_lcase: "b@test.net".to_string(),
-                        domain: "test.net".to_string(),
+                        address: "b@test.net".into(),
+                        address_lcase: "b@test.net".into(),
+                        domain: "test.net".into(),
                         flags: 2,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "c@foobar.org".to_string(),
-                        address_lcase: "c@foobar.org".to_string(),
-                        domain: "foobar.org".to_string(),
+                        address: "c@foobar.org".into(),
+                        address_lcase: "c@foobar.org".into(),
+                        domain: "foobar.org".into(),
                         flags: 3,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "d@test.net".to_string(),
-                        address_lcase: "d@test.net".to_string(),
-                        domain: "test.net".to_string(),
+                        address: "d@test.net".into(),
+                        address_lcase: "d@test.net".into(),
+                        domain: "test.net".into(),
                         flags: 4,
                         dsn_info: None,
                     },
                 ],
-                self.core.inner.queue_id_gen.generate().unwrap(),
+                self.server.inner.data.queue_id_gen.generate(),
                 0,
             )
             .await;
-        assert_eq!(
-            message
-                .domains
-                .iter()
-                .map(|d| d.domain.clone())
-                .collect::<Vec<_>>(),
-            vec!["foobar.org".to_string(), "test.net".to_string()]
-        );
+
         let rcpts = ["a@foobar.org", "b@test.net", "c@foobar.org", "d@test.net"];
-        let domain_idx = [0, 1, 0, 1];
-        for rcpt in &message.recipients {
+        for rcpt in &message.message.recipients {
             let idx = (rcpt.flags - 1) as usize;
-            assert_eq!(rcpts[idx], rcpt.address);
-            assert_eq!(domain_idx[idx], rcpt.domain_idx);
+            assert_eq!(rcpts[idx], rcpt.address());
         }
     }
 }

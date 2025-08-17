@@ -1,76 +1,87 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{sync::Arc, time::Instant};
-
+use super::ToModSeq;
 use crate::{
     core::{Mailbox, Session, SessionData},
     op::ImapContext,
     spawn_op,
 };
 use common::listener::SessionStream;
+use directory::Permission;
+use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use imap_proto::{
+    Command, ResponseCode, StatusResponse,
     parser::PushUnique,
     protocol::status::{Status, StatusItem, StatusItemType},
     receiver::Request,
-    Command, ResponseCode, StatusResponse,
 };
-use jmap_proto::{
-    object::Object,
-    types::{collection::Collection, id::Id, keyword::Keyword, property::Property, value::Value},
-};
-use store::{
-    roaring::RoaringBitmap,
-    write::{key::DeserializeBigEndian, ValueClass},
-    IndexKeyPrefix, IterateParams, ValueKey,
-};
+use jmap_proto::types::{collection::Collection, id::Id, keyword::Keyword, property::Property};
+use std::time::Instant;
 use store::{Deserialize, U32_LEN};
+use store::{
+    IndexKeyPrefix, IterateParams, roaring::RoaringBitmap, write::key::DeserializeBigEndian,
+};
 use trc::AddContext;
 
-use super::ToModSeq;
-
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_status(&mut self, request: Request<Command>) -> trc::Result<()> {
-        let op_start = Instant::now();
-        let arguments = request.parse_status(self.version)?;
+    pub async fn handle_status(&mut self, requests: Vec<Request<Command>>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapStatus)?;
+
         let version = self.version;
         let data = self.state.session_data();
 
         spawn_op!(data, {
-            // Refresh mailboxes
-            data.synchronize_mailboxes(false)
-                .await
-                .imap_ctx(&arguments.tag, trc::location!())?;
+            let mut did_sync = false;
 
-            // Fetch status
-            let status = data
-                .status(arguments.mailbox_name, &arguments.items)
-                .await
-                .imap_ctx(&arguments.tag, trc::location!())?;
+            for request in requests.into_iter() {
+                match request.parse_status(version) {
+                    Ok(arguments) => {
+                        let op_start = Instant::now();
+                        if !did_sync {
+                            // Refresh mailboxes
+                            data.synchronize_mailboxes(false)
+                                .await
+                                .imap_ctx(&arguments.tag, trc::location!())?;
+                            did_sync = true;
+                        }
 
-            trc::event!(
-                Imap(trc::ImapEvent::Status),
-                SpanId = data.session_id,
-                MailboxName = status.mailbox_name.clone(),
-                Details = arguments
-                    .items
-                    .iter()
-                    .map(|c| trc::Value::from(format!("{c:?}")))
-                    .collect::<Vec<_>>(),
-                Elapsed = op_start.elapsed()
-            );
+                        // Fetch status
+                        let status = data
+                            .status(arguments.mailbox_name, &arguments.items)
+                            .await
+                            .imap_ctx(&arguments.tag, trc::location!())?;
 
-            let mut buf = Vec::with_capacity(32);
-            status.serialize(&mut buf, version.is_rev2());
-            data.write_bytes(
-                StatusResponse::completed(Command::Status)
-                    .with_tag(arguments.tag)
-                    .serialize(buf),
-            )
-            .await
+                        trc::event!(
+                            Imap(trc::ImapEvent::Status),
+                            SpanId = data.session_id,
+                            MailboxName = status.mailbox_name.clone(),
+                            Details = arguments
+                                .items
+                                .iter()
+                                .map(|c| trc::Value::from(format!("{c:?}")))
+                                .collect::<Vec<_>>(),
+                            Elapsed = op_start.elapsed()
+                        );
+
+                        let mut buf = Vec::with_capacity(32);
+                        status.serialize(&mut buf, version.is_rev2());
+                        data.write_bytes(
+                            StatusResponse::completed(Command::Status)
+                                .with_tag(arguments.tag)
+                                .serialize(buf),
+                        )
+                        .await?;
+                    }
+                    Err(err) => data.write_error(err).await?,
+                }
+            }
+
+            Ok(())
         })
     }
 }
@@ -82,11 +93,11 @@ impl<T: SessionStream> SessionData<T> {
             mailbox
         } else {
             // Some IMAP clients will try to get the status of a mailbox with the NoSelect flag
-            return if mailbox_name == self.jmap.core.jmap.shared_folder
+            return if mailbox_name == self.server.core.jmap.shared_folder
                 || mailbox_name
                     .split_once('/')
-                    .map_or(false, |(base_name, path)| {
-                        base_name == self.jmap.core.jmap.shared_folder && !path.contains('/')
+                    .is_some_and(|(base_name, path)| {
+                        base_name == self.server.core.jmap.shared_folder && !path.contains('/')
                     })
             {
                 Ok(StatusItem {
@@ -102,11 +113,12 @@ impl<T: SessionStream> SessionData<T> {
                                     | Status::Unseen
                                     | Status::Recent
                                     | Status::Deleted
-                                    | Status::HighestModSeq => StatusItemType::Number(0),
+                                    | Status::HighestModSeq
+                                    | Status::DeletedStorage => StatusItemType::Number(0),
                                     Status::UidNext | Status::UidValidity => {
                                         StatusItemType::Number(1)
                                     }
-                                    Status::MailboxId => StatusItemType::String("none".to_string()),
+                                    Status::MailboxId => StatusItemType::String("none".into()),
                                 },
                             )
                         })
@@ -126,51 +138,46 @@ impl<T: SessionStream> SessionData<T> {
 
         for account in self.mailboxes.lock().iter_mut() {
             if account.account_id == mailbox.account_id {
-                let mailbox_state = account
-                    .mailbox_state
-                    .entry(mailbox.mailbox_id)
-                    .or_insert_with(Mailbox::default);
-                let update_recent = mailbox_state.total_messages.is_none();
+                let mailbox_state =
+                    if let Some(mailbox_state) = account.mailbox_state.get(&mailbox.mailbox_id) {
+                        mailbox_state
+                    } else {
+                        continue;
+                    };
                 for item in items {
                     match item {
                         Status::Messages => {
-                            if let Some(value) = mailbox_state.total_messages {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
-                            } else {
-                                items_update.push_unique(*item);
-                            }
+                            items_response.push((
+                                *item,
+                                StatusItemType::Number(mailbox_state.total_messages),
+                            ));
                         }
                         Status::UidNext => {
-                            if let Some(value) = mailbox_state.uid_next {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
-                            } else {
-                                items_update.push_unique(*item);
-                            }
+                            items_response
+                                .push((*item, StatusItemType::Number(mailbox_state.uid_next)));
                         }
                         Status::UidValidity => {
-                            if let Some(value) = mailbox_state.uid_validity {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
-                            } else {
-                                items_update.push_unique(*item);
-                            }
+                            items_response
+                                .push((*item, StatusItemType::Number(mailbox_state.uid_validity)));
                         }
                         Status::Unseen => {
-                            if let Some(value) = mailbox_state.total_unseen {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
-                            } else {
-                                items_update.push_unique(*item);
-                            }
+                            items_response
+                                .push((*item, StatusItemType::Number(mailbox_state.total_unseen)));
                         }
                         Status::Deleted => {
-                            if let Some(value) = mailbox_state.total_deleted {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
+                            items_response
+                                .push((*item, StatusItemType::Number(mailbox_state.total_deleted)));
+                        }
+                        Status::DeletedStorage => {
+                            if let Some(value) = mailbox_state.total_deleted_storage {
+                                items_response.push((*item, StatusItemType::Number(value)));
                             } else {
                                 items_update.push_unique(*item);
                             }
                         }
                         Status::Size => {
                             if let Some(value) = mailbox_state.size {
-                                items_response.push((*item, StatusItemType::Number(value as u64)));
+                                items_response.push((*item, StatusItemType::Number(value)));
                             } else {
                                 items_update.push_unique(*item);
                             }
@@ -178,7 +185,7 @@ impl<T: SessionStream> SessionData<T> {
                         Status::HighestModSeq => {
                             items_response.push((
                                 *item,
-                                StatusItemType::Number(account.state_email.to_modseq()),
+                                StatusItemType::Number(account.last_change_id.to_modseq()),
                             ));
                         }
                         Status::MailboxId => {
@@ -191,11 +198,7 @@ impl<T: SessionStream> SessionData<T> {
                             ));
                         }
                         Status::Recent => {
-                            if !update_recent {
-                                items_response.push((*item, StatusItemType::Number(0)));
-                            } else {
-                                items_update.push_unique(*item);
-                            }
+                            items_response.push((*item, StatusItemType::Number(0)));
                         }
                     }
                 }
@@ -206,125 +209,43 @@ impl<T: SessionStream> SessionData<T> {
         if !items_update.is_empty() {
             // Retrieve latest values
             let mut values_update = Vec::with_capacity(items_update.len());
-            let mailbox_message_ids = self
-                .jmap
-                .get_tag(
-                    mailbox.account_id,
-                    Collection::Email,
-                    Property::MailboxIds,
-                    mailbox.mailbox_id,
-                )
-                .await
-                .caused_by(trc::location!())?
-                .map(Arc::new);
-            let message_ids = self
-                .jmap
-                .get_document_ids(mailbox.account_id, Collection::Email)
+
+            let cache = self
+                .server
+                .get_cached_messages(mailbox.account_id)
                 .await
                 .caused_by(trc::location!())?;
 
             for item in items_update {
                 let result = match item {
-                    Status::Messages => mailbox_message_ids.as_ref().map(|v| v.len()).unwrap_or(0),
-                    Status::UidNext => {
-                        (self
-                            .jmap
-                            .core
-                            .storage
-                            .data
-                            .get_counter(ValueKey {
-                                account_id: mailbox.account_id,
-                                collection: Collection::Mailbox.into(),
-                                document_id: mailbox.mailbox_id,
-                                class: ValueClass::Property(Property::EmailIds.into()),
-                            })
-                            .await
-                            .caused_by(trc::location!())?
-                            + 1) as u64
-                    }
-                    Status::UidValidity => self
-                        .jmap
-                        .get_property::<Object<Value>>(
+                    Status::DeletedStorage => self
+                        .calculate_mailbox_size(
                             mailbox.account_id,
-                            Collection::Mailbox,
-                            mailbox.mailbox_id,
-                            &Property::Value,
+                            &RoaringBitmap::from_iter(
+                                cache
+                                    .in_mailbox_with_keyword(mailbox.mailbox_id, &Keyword::Deleted)
+                                    .map(|x| x.document_id),
+                            ),
                         )
-                        .await?
-                        .and_then(|obj| obj.get(&Property::Cid).as_uint())
-                        .ok_or_else(|| {
-                            trc::StoreEvent::UnexpectedError
-                                .into_err()
-                                .details("Mailbox unavailable")
-                                .ctx(trc::Key::Reason, "Failed to obtain uid validity")
-                                .caused_by(trc::location!())
-                                .account_id(mailbox.account_id)
-                                .document_id(mailbox.mailbox_id)
-                        })?,
-                    Status::Unseen => {
-                        if let (Some(message_ids), Some(mailbox_message_ids)) =
-                            (&message_ids, &mailbox_message_ids)
-                        {
-                            if let Some(mut seen) = self
-                                .jmap
-                                .get_tag(
-                                    mailbox.account_id,
-                                    Collection::Email,
-                                    Property::Keywords,
-                                    Keyword::Seen,
-                                )
-                                .await
-                                .caused_by(trc::location!())?
-                            {
-                                seen ^= message_ids;
-                                seen &= mailbox_message_ids.as_ref();
-                                seen.len()
-                            } else {
-                                mailbox_message_ids.len()
-                            }
-                        } else {
-                            0
-                        }
-                    }
-                    Status::Deleted => {
-                        if let (Some(mailbox_message_ids), Some(mut deleted)) = (
-                            &mailbox_message_ids,
-                            self.jmap
-                                .get_tag(
-                                    mailbox.account_id,
-                                    Collection::Email,
-                                    Property::Keywords,
-                                    Keyword::Deleted,
-                                )
-                                .await
-                                .caused_by(trc::location!())?,
-                        ) {
-                            deleted &= mailbox_message_ids.as_ref();
-                            deleted.len()
-                        } else {
-                            0
-                        }
-                    }
-                    Status::Size => {
-                        if let Some(mailbox_message_ids) = &mailbox_message_ids {
-                            self.calculate_mailbox_size(mailbox.account_id, mailbox_message_ids)
-                                .await
-                                .caused_by(trc::location!())? as u64
-                        } else {
-                            0
-                        }
-                    }
-                    Status::Recent => {
-                        self.fetch_messages(&mailbox).await?;
-                        0
-                    }
-                    Status::HighestModSeq | Status::MailboxId => {
+                        .await
+                        .caused_by(trc::location!())?,
+                    Status::Size => self
+                        .calculate_mailbox_size(
+                            mailbox.account_id,
+                            &RoaringBitmap::from_iter(
+                                cache.in_mailbox(mailbox.mailbox_id).map(|x| x.document_id),
+                            ),
+                        )
+                        .await
+                        .caused_by(trc::location!())?,
+
+                    _ => {
                         unreachable!()
                     }
                 };
 
                 items_response.push((item, StatusItemType::Number(result)));
-                values_update.push((item, result as u32));
+                values_update.push((item, result));
             }
 
             // Update cache
@@ -337,11 +258,9 @@ impl<T: SessionStream> SessionData<T> {
 
                     for (item, value) in values_update {
                         match item {
-                            Status::Messages => mailbox_state.total_messages = value.into(),
-                            Status::UidNext => mailbox_state.uid_next = value.into(),
-                            Status::UidValidity => mailbox_state.uid_validity = value.into(),
-                            Status::Unseen => mailbox_state.total_unseen = value.into(),
-                            Status::Deleted => mailbox_state.total_deleted = value.into(),
+                            Status::DeletedStorage => {
+                                mailbox_state.total_deleted_storage = value.into()
+                            }
                             Status::Size => mailbox_state.size = value.into(),
                             Status::Recent => {
                                 items_response
@@ -350,7 +269,7 @@ impl<T: SessionStream> SessionData<T> {
                                     .unwrap()
                                     .1 = StatusItemType::Number(0);
                             }
-                            Status::HighestModSeq | Status::MailboxId => {
+                            _ => {
                                 unreachable!()
                             }
                         }
@@ -371,10 +290,10 @@ impl<T: SessionStream> SessionData<T> {
     async fn calculate_mailbox_size(
         &self,
         account_id: u32,
-        message_ids: &Arc<RoaringBitmap>,
-    ) -> trc::Result<u32> {
-        let mut total_size = 0u32;
-        self.jmap
+        message_ids: &RoaringBitmap,
+    ) -> trc::Result<u64> {
+        let mut total_size = 0u64;
+        self.server
             .core
             .storage
             .data
@@ -402,7 +321,7 @@ impl<T: SessionStream> SessionData<T> {
                             .ok_or_else(|| trc::Error::corrupted_key(key, None, trc::location!()))
                             .and_then(u32::deserialize)
                             .map(|size| {
-                                total_size += size;
+                                total_size += size as u64;
                             })?;
                     }
                     Ok(true)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -60,7 +60,7 @@ pub async fn test(imap: &mut ImapConnection, _imap_check: &mut ImapConnection, h
         .assert_contains("UIDNEXT 11");
 
     // Store using saved searches
-    wait_for_index(&handle.jmap).await;
+    wait_for_index(&handle.server).await;
     imap.send("SEARCH RETURN (SAVE) FROM nathaniel").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok).await;
     imap.send("UID STORE $ +FLAGS (\\Answered)").await;

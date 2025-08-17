@@ -1,20 +1,31 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::QueryBy;
+use common::Server;
+use directory::QueryParams;
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, RequestArguments},
-    object::Object,
-    types::{collection::Collection, property::Property, state::State, value::Value},
+    types::{
+        collection::Collection,
+        property::Property,
+        state::State,
+        value::{Object, Value},
+    },
 };
+use std::future::Future;
 
-use crate::JMAP;
+pub trait PrincipalGet: Sync + Send {
+    fn principal_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+}
 
-impl JMAP {
-    pub async fn principal_get(
+impl PrincipalGet for Server {
+    async fn principal_get(
         &self,
         mut request: GetRequest<RequestArguments>,
     ) -> trc::Result<GetResponse> {
@@ -28,14 +39,14 @@ impl JMAP {
             //Property::Timezone,
             //Property::Capabilities,
         ]);
-        let email_submission_ids = self
-            .get_document_ids(u32::MAX, Collection::EmailSubmission)
+        let principal_ids = self
+            .get_document_ids(u32::MAX, Collection::Principal)
             .await?
             .unwrap_or_default();
         let ids = if let Some(ids) = ids {
             ids
         } else {
-            email_submission_ids
+            principal_ids
                 .iter()
                 .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
@@ -54,7 +65,7 @@ impl JMAP {
                 .core
                 .storage
                 .directory
-                .query(QueryBy::Id(id.document_id()), false)
+                .query(QueryParams::id(id.document_id()).with_return_member_of(false))
                 .await?
             {
                 principal
@@ -67,17 +78,16 @@ impl JMAP {
             for property in &properties {
                 let value = match property {
                     Property::Id => Value::Id(id),
-                    Property::Type => Value::Text(principal.typ.to_jmap().to_string()),
-                    Property::Name => Value::Text(principal.name.clone()),
+                    Property::Type => Value::Text(principal.typ().to_jmap().to_string()),
+                    Property::Name => Value::Text(principal.name().to_string()),
                     Property::Description => principal
-                        .description
-                        .clone()
-                        .map(Value::Text)
+                        .description()
+                        .map(|v| Value::Text(v.to_string()))
                         .unwrap_or(Value::Null),
                     Property::Email => principal
                         .emails
                         .first()
-                        .map(|email| Value::Text(email.clone()))
+                        .map(|email| Value::Text(email.to_string()))
                         .unwrap_or(Value::Null),
                     _ => Value::Null,
                 };

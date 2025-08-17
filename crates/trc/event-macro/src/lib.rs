@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,7 +7,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse::Parse, parse_macro_input, Data, DeriveInput, Expr, ExprPath, Fields, Ident, Token,
+    Data, DeriveInput, Expr, ExprPath, Fields, Ident, Token, parse::Parse, parse_macro_input,
 };
 
 static mut GLOBAL_ID_COUNTER: usize = 0;
@@ -303,7 +303,7 @@ pub fn event(input: TokenStream) -> TokenStream {
             (trc::Key::#key, trc::Value::from(#value))
         }
     });
-    // This avoid having to evaluate expensive values when we know we are not interested in the event
+    // This avoids having to evaluate expensive values when we know we are not interested in the event
     let key_value_metric_tokens = key_values.iter().filter_map(|(key, value)| {
         if key.is_metric_key() {
             Some(quote! {

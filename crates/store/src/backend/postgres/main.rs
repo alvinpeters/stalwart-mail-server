@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::{backend::postgres::tls::MakeRustlsConnect, *};
 
-use super::{into_error, PostgresStore};
+use super::{PostgresStore, into_error};
 
 use deadpool_postgres::{Config, ManagerConfig, PoolConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
@@ -80,10 +80,10 @@ impl PostgresStore {
         for table in [
             SUBSPACE_ACL,
             SUBSPACE_DIRECTORY,
-            SUBSPACE_FTS_QUEUE,
+            SUBSPACE_TASK_QUEUE,
             SUBSPACE_BLOB_RESERVE,
             SUBSPACE_BLOB_LINK,
-            SUBSPACE_LOOKUP_VALUE,
+            SUBSPACE_IN_MEMORY_VALUE,
             SUBSPACE_PROPERTY,
             SUBSPACE_SETTINGS,
             SUBSPACE_QUEUE_MESSAGE,
@@ -130,7 +130,7 @@ impl PostgresStore {
             .map_err(into_error)?;
         }
 
-        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA] {
+        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
             conn.execute(
                 &format!(
                     "CREATE TABLE IF NOT EXISTS {} (

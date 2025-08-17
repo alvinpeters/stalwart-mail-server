@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,7 +7,8 @@
 use std::{fs, path::PathBuf};
 
 use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, wait_for_index};
-use jmap::mailbox::INBOX_ID;
+
+use email::mailbox::INBOX_ID;
 use jmap_client::{core::query, email::query::Filter};
 use jmap_proto::types::id::Id;
 use store::ahash::AHashMap;
@@ -118,10 +119,11 @@ pub async fn test(params: &mut JMAPTest) {
             "html",
             Some("Die Hasen und die <mark>Frösche</mark>"),
             Some(concat!(
-            "und die <mark>Frösche</mark> Die Hasen klagten einst über ihre mißliche Lage; ",
-            "&quot;wir leben&quot;, sprach ein Redner, &quot;in steter Furcht vor Menschen und ",
-            "Tieren, eine Beute der Hunde, der Adler, ja fast aller Raubtiere! ",
-            "Unsere stete Angst ist är")),
+                "und die <mark>Frösche</mark> Die Hasen klagten einst über ihre mißliche Lage; ",
+                "&quot;wir leben&quot;, sprach ein Redner, &quot;in steter Furcht vor Menschen und ",
+                "Tieren, eine Beute der Hunde, der Adler, ja fast aller Raubtiere! ",
+                "Unsere stete Angst ist är"
+            )),
         ),
         (
             Filter::text("es:galería vasto biblioteca").into(),

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -99,7 +99,6 @@ impl r2d2::ManageConnection for SqliteConnectionManager {
             Source::File(ref path) => Connection::open_with_flags(path, self.flags),
             Source::Memory => Connection::open_in_memory_with_flags(self.flags),
         }
-        .map_err(Into::into)
         .and_then(|mut c| {
             c.busy_handler(Some(sleeper))?;
             match self.init {
@@ -110,7 +109,7 @@ impl r2d2::ManageConnection for SqliteConnectionManager {
     }
 
     fn is_valid(&self, conn: &mut Connection) -> Result<(), Error> {
-        conn.execute_batch("").map_err(Into::into)
+        conn.execute_batch("")
     }
 
     fn has_broken(&self, _: &mut Connection) -> bool {

@@ -1,38 +1,44 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{borrow::Cow, sync::Arc, time::Instant};
-
-use common::scripts::plugins::PluginContext;
+use crate::{
+    inbound::DkimSign,
+    queue::{MessageSource, quota::HasQueueQuota, spool::SmtpSpool},
+};
+use common::{Server, config::smtp::queue::QueueExpiry, scripts::plugins::PluginContext};
 use mail_auth::common::headers::HeaderWriter;
+use mail_parser::{Encoding, Message, MessagePart, PartType};
 use sieve::{
-    compiler::grammar::actions::action_redirect::{ByMode, ByTime, Notify, NotifyItem, Ret},
     Event, Input, MatchAs, Recipient, Sieve,
+    compiler::grammar::actions::action_redirect::{ByMode, ByTime, Notify, NotifyItem, Ret},
 };
 use smtp_proto::{
     MAIL_BY_TRACE, MAIL_RET_FULL, MAIL_RET_HDRS, RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE,
     RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS,
 };
+use std::{borrow::Cow, future::Future, sync::Arc, time::Instant};
 use trc::SieveEvent;
-
-use crate::{
-    core::SMTP,
-    inbound::DkimSign,
-    queue::{DomainPart, MessageSource},
-};
 
 use super::{ScriptModification, ScriptParameters, ScriptResult};
 
-impl SMTP {
-    pub async fn run_script(
+pub trait RunScript: Sync + Send {
+    fn run_script(
         &self,
         script_id: String,
         script: Arc<Sieve>,
         params: ScriptParameters<'_>,
-        session_id: u64,
+    ) -> impl Future<Output = ScriptResult> + Send;
+}
+
+impl RunScript for Server {
+    async fn run_script(
+        &self,
+        script_id: String,
+        script: Arc<Sieve>,
+        params: ScriptParameters<'_>,
     ) -> ScriptResult {
         // Create filter instance
         let time = Instant::now();
@@ -40,13 +46,26 @@ impl SMTP {
             .core
             .sieve
             .trusted_runtime
-            .filter(params.message.unwrap_or_default())
+            .filter_parsed(params.message.unwrap_or_else(|| Message {
+                parts: vec![MessagePart {
+                    headers: vec![],
+                    is_encoding_problem: false,
+                    body: PartType::Text("".into()),
+                    encoding: Encoding::None,
+                    offset_header: 0,
+                    offset_body: 0,
+                    offset_end: 0,
+                }],
+                raw_message: b""[..].into(),
+                ..Default::default()
+            }))
             .with_vars_env(params.variables)
             .with_envelope_list(params.envelope)
             .with_user_address(&params.from_addr)
             .with_user_full_name(&params.from_name);
         let mut input = Input::script("__script", script);
         let mut messages: Vec<Vec<u8>> = Vec::new();
+        let session_id = params.session_id;
 
         let mut reject_reason = None;
         let mut modifications = vec![];
@@ -57,7 +76,8 @@ impl SMTP {
             match result {
                 Ok(event) => match event {
                     Event::IncludeScript { name, optional } => {
-                        if let Some(script) = self.core.sieve.scripts.get(name.as_str()) {
+                        let name_ = name.as_str().to_lowercase();
+                        if let Some(script) = self.core.sieve.trusted_scripts.get(&name_) {
                             input = Input::script(name, script.clone());
                         } else if optional {
                             input = false.into();
@@ -66,7 +86,7 @@ impl SMTP {
                                 Sieve(SieveEvent::ScriptNotFound),
                                 Id = script_id.clone(),
                                 SpanId = session_id,
-                                Details = name.as_str().to_string(),
+                                Details = name_,
                             );
                             break;
                         }
@@ -81,14 +101,11 @@ impl SMTP {
                             if let Some(store) = self.core.storage.lookups.get(&list) {
                                 for value in &values {
                                     if let Ok(true) = store
-                                        .key_exists(
-                                            if !matches!(match_as, MatchAs::Lowercase) {
-                                                value.clone()
-                                            } else {
-                                                value.to_lowercase()
-                                            }
-                                            .into_bytes(),
-                                        )
+                                        .key_exists(if !matches!(match_as, MatchAs::Lowercase) {
+                                            value.clone()
+                                        } else {
+                                            value.to_lowercase()
+                                        })
                                         .await
                                     {
                                         input = true.into();
@@ -112,10 +129,10 @@ impl SMTP {
                                 id,
                                 PluginContext {
                                     session_id,
-                                    core: &self.core,
-                                    cache: &self.inner.script_cache,
+                                    server: self,
                                     message: instance.message(),
                                     modifications: &mut modifications,
+                                    access_token: params.access_token,
                                     arguments,
                                 },
                             )
@@ -141,14 +158,7 @@ impl SMTP {
                         message_id,
                     } => {
                         // Build message
-                        let return_path_lcase = params.return_path.to_lowercase();
-                        let return_path_domain = return_path_lcase.domain_part().to_string();
-                        let mut message = self.new_message(
-                            params.return_path.clone(),
-                            return_path_lcase,
-                            return_path_domain,
-                            session_id,
-                        );
+                        let mut message = self.new_message(params.return_path.as_str(), session_id);
                         match recipient {
                             Recipient::Address(rcpt) => {
                                 message.add_recipient(rcpt, self).await;
@@ -187,7 +197,7 @@ impl SMTP {
                             Notify::Default => (),
                         }
                         if flags > 0 {
-                            for rcpt in &mut message.recipients {
+                            for rcpt in &mut message.message.recipients {
                                 rcpt.flags |= flags;
                             }
                         }
@@ -200,16 +210,16 @@ impl SMTP {
                                 trace,
                             } => {
                                 if trace {
-                                    message.flags |= MAIL_BY_TRACE;
+                                    message.message.flags |= MAIL_BY_TRACE;
                                 }
                                 match mode {
                                     ByMode::Notify => {
-                                        for domain in &mut message.domains {
+                                        for domain in &mut message.message.recipients {
                                             domain.notify.due += rlimit;
                                         }
                                     }
                                     ByMode::Return => {
-                                        for domain in &mut message.domains {
+                                        for domain in &mut message.message.recipients {
                                             domain.notify.due += rlimit;
                                         }
                                     }
@@ -222,17 +232,21 @@ impl SMTP {
                                 trace,
                             } => {
                                 if trace {
-                                    message.flags |= MAIL_BY_TRACE;
+                                    message.message.flags |= MAIL_BY_TRACE;
                                 }
                                 match mode {
                                     ByMode::Notify => {
-                                        for domain in &mut message.domains {
+                                        for domain in &mut message.message.recipients {
                                             domain.notify.due = alimit as u64;
                                         }
                                     }
                                     ByMode::Return => {
-                                        for domain in &mut message.domains {
-                                            domain.expires = alimit as u64;
+                                        let expires =
+                                            (alimit as u64).saturating_sub(message.message.created);
+                                        if expires > 0 {
+                                            for domain in &mut message.message.recipients {
+                                                domain.expires = QueueExpiry::Ttl(expires);
+                                            }
                                         }
                                     }
                                     ByMode::Default => (),
@@ -244,10 +258,10 @@ impl SMTP {
                         // Set ret
                         match return_of_content {
                             Ret::Full => {
-                                message.flags |= MAIL_RET_FULL;
+                                message.message.flags |= MAIL_RET_FULL;
                             }
                             Ret::Hdrs => {
-                                message.flags |= MAIL_RET_HDRS;
+                                message.message.flags |= MAIL_RET_HDRS;
                             }
                             Ret::Default => (),
                         }
@@ -264,17 +278,18 @@ impl SMTP {
                                 let mut headers = Vec::new();
 
                                 for dkim in &params.sign {
-                                    if let Some(dkim) = self.core.get_dkim_signer(dkim, session_id)
-                                    {
+                                    if let Some(dkim) = self.get_dkim_signer(dkim, session_id) {
                                         match dkim.sign(raw_message) {
                                             Ok(signature) => {
                                                 signature.write_header(&mut headers);
                                             }
                                             Err(err) => {
-                                                trc::error!(trc::Event::from(err)
-                                                    .span_id(session_id)
-                                                    .caused_by(trc::location!())
-                                                    .details("DKIM sign failed"));
+                                                trc::error!(
+                                                    trc::Error::from(err)
+                                                        .span_id(session_id)
+                                                        .caused_by(trc::location!())
+                                                        .details("DKIM sign failed")
+                                                );
                                             }
                                         }
                                     }
@@ -306,11 +321,12 @@ impl SMTP {
                                     Sieve(SieveEvent::QuotaExceeded),
                                     SpanId = session_id,
                                     Id = script_id.clone(),
-                                    From = message.return_path_lcase,
+                                    From = message.message.return_path,
                                     To = message
+                                        .message
                                         .recipients
                                         .into_iter()
-                                        .map(|r| trc::Value::from(r.address_lcase))
+                                        .map(|r| trc::Value::from(r.address().to_string()))
                                         .collect::<Vec<_>>(),
                                 );
                             }
@@ -348,33 +364,6 @@ impl SMTP {
                         Reason = err.to_string(),
                     );
                     break;
-                }
-            }
-        }
-
-        // Assert global variables
-        #[cfg(feature = "test_mode")]
-        if let Some(expected_variables) = params.expected_variables {
-            for var_name in instance.global_variable_names() {
-                if instance.global_variable(var_name).unwrap().to_bool()
-                    && !expected_variables.contains_key(var_name)
-                {
-                    panic!(
-                        "Unexpected variable {var_name:?} with value {:?}\nExpected {:?}\nFound: {:?}",
-                        instance.global_variable(var_name).unwrap(),
-                        expected_variables.keys().collect::<Vec<_>>(),
-                        instance.global_variable_names().collect::<Vec<_>>()
-                    );
-                }
-            }
-
-            for (name, expected) in &expected_variables {
-                if let Some(value) = instance.global_variable(name.as_str()) {
-                    assert_eq!(value, expected, "Variable {name:?} has unexpected value");
-                } else {
-                    panic!("Missing variable {name:?} with value {expected:?}\nExpected {:?}\nFound: {:?}", 
-                    expected_variables.keys().collect::<Vec<_>>(),
-                    instance.global_variable_names().collect::<Vec<_>>());
                 }
             }
         }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub mod account;
 pub mod cli;
 pub mod database;
+pub mod dkim;
 pub mod domain;
 pub mod export;
 pub mod group;
@@ -235,13 +236,16 @@ pub async fn name_to_id(client: &Client, name: &str) -> String {
     }
 }
 
-pub fn is_localhost(url: &str) -> bool {
+pub fn host(url: &str) -> Option<&str> {
     url.split_once("://")
         .map(|(_, url)| url.split_once('/').map_or(url, |(host, _)| host))
-        .map_or(false, |host| {
-            let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
-        })
+}
+
+pub fn is_localhost(url: &str) -> bool {
+    host(url).is_some_and(|host| {
+        let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+        host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+    })
 }
 
 pub trait OAuthResponse {

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -11,20 +11,21 @@ use std::{
 };
 
 use ahash::AHashSet;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
+
 use hyper::{
-    header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
     HeaderMap,
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue},
 };
 use smtp_proto::*;
-use utils::config::{utils::ParseValue, Config};
+use utils::config::{Config, utils::ParseValue};
 
 use crate::{
     config::CONNECTION_VARS,
     expr::{if_block::IfBlock, tokenizer::TokenMap, *},
 };
 
-use self::{resolver::Policy, throttle::parse_throttle};
+use self::resolver::Policy;
 
 use super::*;
 
@@ -33,7 +34,6 @@ pub struct SessionConfig {
     pub timeout: IfBlock,
     pub duration: IfBlock,
     pub transfer_limit: IfBlock,
-    pub throttle: SessionThrottle,
 
     pub connect: Connect,
     pub ehlo: Ehlo,
@@ -46,13 +46,6 @@ pub struct SessionConfig {
 
     pub milters: Vec<Milter>,
     pub hooks: Vec<MTAHook>,
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct SessionThrottle {
-    pub connect: Vec<Throttle>,
-    pub mail_from: Vec<Throttle>,
-    pub rcpt_to: Vec<Throttle>,
 }
 
 #[derive(Clone)]
@@ -130,7 +123,7 @@ pub enum AddressMapping {
 #[derive(Clone)]
 pub struct Data {
     pub script: IfBlock,
-    pub pipe_commands: Vec<Pipe>,
+    pub spam_filter: IfBlock,
 
     // Limits
     pub max_messages: IfBlock,
@@ -144,14 +137,7 @@ pub struct Data {
     pub add_auth_results: IfBlock,
     pub add_message_id: IfBlock,
     pub add_date: IfBlock,
-}
-
-// Ceci n'est pas une pipe
-#[derive(Clone)]
-pub struct Pipe {
-    pub command: IfBlock,
-    pub arguments: IfBlock,
-    pub timeout: IfBlock,
+    pub add_delivered_to: bool,
 }
 
 #[derive(Clone)]
@@ -217,26 +203,14 @@ impl SessionConfig {
         session.rcpt.subaddressing = AddressMapping::parse(config, "session.rcpt.sub-addressing");
         session.milters = config
             .sub_keys("session.milter", ".hostname")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
             .into_iter()
             .filter_map(|id| parse_milter(config, &id, &has_rcpt_vars))
             .collect();
         session.hooks = config
             .sub_keys("session.hook", ".url")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
             .into_iter()
             .filter_map(|id| parse_hooks(config, &id, &has_rcpt_vars))
             .collect();
-        session.data.pipe_commands = config
-            .sub_keys("session.data.pipe", "")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .filter_map(|id| parse_pipe(config, &id, &has_rcpt_vars))
-            .collect();
-        session.throttle = SessionThrottle::parse(config);
         session.mta_sts_policy = Policy::try_parse(config);
 
         for (value, key, token_map) in [
@@ -428,6 +402,11 @@ impl SessionConfig {
                 &has_rcpt_vars,
             ),
             (
+                &mut session.data.spam_filter,
+                "session.data.spam-filter",
+                &has_rcpt_vars,
+            ),
+            (
                 &mut session.data.add_received,
                 "session.data.add-headers.received",
                 &has_rcpt_vars,
@@ -462,72 +441,11 @@ impl SessionConfig {
                 *value = if_block;
             }
         }
-
+        session.data.add_delivered_to = config
+            .property_or_default("session.data.add-headers.delivered-to", "true")
+            .unwrap_or(true);
         session
     }
-}
-
-impl SessionThrottle {
-    pub fn parse(config: &mut Config) -> Self {
-        let mut throttle = SessionThrottle::default();
-        let all_throttles = parse_throttle(
-            config,
-            "session.throttle",
-            &TokenMap::default().with_variables(SMTP_RCPT_TO_VARS),
-            THROTTLE_LISTENER
-                | THROTTLE_REMOTE_IP
-                | THROTTLE_LOCAL_IP
-                | THROTTLE_AUTH_AS
-                | THROTTLE_HELO_DOMAIN
-                | THROTTLE_RCPT
-                | THROTTLE_RCPT_DOMAIN
-                | THROTTLE_SENDER
-                | THROTTLE_SENDER_DOMAIN,
-        );
-        for t in all_throttles {
-            if (t.keys & (THROTTLE_RCPT | THROTTLE_RCPT_DOMAIN)) != 0
-                || t.expr.items().iter().any(|c| {
-                    matches!(
-                        c,
-                        ExpressionItem::Variable(V_RECIPIENT | V_RECIPIENT_DOMAIN)
-                    )
-                })
-            {
-                throttle.rcpt_to.push(t);
-            } else if (t.keys
-                & (THROTTLE_SENDER
-                    | THROTTLE_SENDER_DOMAIN
-                    | THROTTLE_HELO_DOMAIN
-                    | THROTTLE_AUTH_AS))
-                != 0
-                || t.expr.items().iter().any(|c| {
-                    matches!(
-                        c,
-                        ExpressionItem::Variable(
-                            V_SENDER | V_SENDER_DOMAIN | V_HELO_DOMAIN | V_AUTHENTICATED_AS
-                        )
-                    )
-                })
-            {
-                throttle.mail_from.push(t);
-            } else {
-                throttle.connect.push(t);
-            }
-        }
-
-        throttle
-    }
-}
-
-fn parse_pipe(config: &mut Config, id: &str, token_map: &TokenMap) -> Option<Pipe> {
-    Some(Pipe {
-        command: IfBlock::try_parse(config, ("session.data.pipe", id, "command"), token_map)?,
-        arguments: IfBlock::try_parse(config, ("session.data.pipe", id, "arguments"), token_map)?,
-        timeout: IfBlock::try_parse(config, ("session.data.pipe", id, "timeout"), token_map)
-            .unwrap_or_else(|| {
-                IfBlock::new::<()>(format!("session.data.pipe.{id}.timeout"), [], "30s")
-            }),
-    })
 }
 
 fn parse_milter(config: &mut Config, id: &str, token_map: &TokenMap) -> Option<Milter> {
@@ -540,7 +458,7 @@ fn parse_milter(config: &mut Config, id: &str, token_map: &TokenMap) -> Option<M
             .unwrap_or_else(|| {
                 IfBlock::new::<()>(format!("session.milter.{id}.enable"), [], "false")
             }),
-        id: id.to_string().into(),
+        id: Arc::new(id.into()),
         addrs: format!("{}:{}", hostname, port)
             .to_socket_addrs()
             .map_err(|err| {
@@ -711,22 +629,17 @@ impl Default for SessionConfig {
             timeout: IfBlock::new::<()>("session.timeout", [], "5m"),
             duration: IfBlock::new::<()>("session.duration", [], "10m"),
             transfer_limit: IfBlock::new::<()>("session.transfer-limit", [], "262144000"),
-            throttle: SessionThrottle {
-                connect: Default::default(),
-                mail_from: Default::default(),
-                rcpt_to: Default::default(),
-            },
             connect: Connect {
                 hostname: IfBlock::new::<()>(
                     "server.connect.hostname",
                     [],
-                    "key_get('default', 'hostname')",
+                    "config_get('server.hostname')",
                 ),
                 script: IfBlock::empty("session.connect.script"),
                 greeting: IfBlock::new::<()>(
                     "session.connect.greeting",
                     [],
-                    "key_get('default', 'hostname') + ' Stalwart ESMTP at your service'",
+                    "config_get('server.hostname') + ' Stalwart ESMTP at your service'",
                 ),
             },
             ehlo: Ehlo {
@@ -749,7 +662,13 @@ impl Default for SessionConfig {
                 ),
                 mechanisms: IfBlock::new::<Mechanism>(
                     "session.auth.mechanisms",
-                    [("local_port != 25 && is_tls", "[plain, login]")],
+                    [
+                        (
+                            "local_port != 25 && is_tls",
+                            "[plain, login, oauthbearer, xoauth2]",
+                        ),
+                        ("local_port != 25", "[oauthbearer, xoauth2]"),
+                    ],
                     "false",
                 ),
                 require: IfBlock::new::<()>(
@@ -770,7 +689,7 @@ impl Default for SessionConfig {
                 is_allowed: IfBlock::new::<()>(
                     "session.mail.is-allowed",
                     [],
-                    "!is_empty(authenticated_as) || !key_exists('spam-block', sender_domain)",
+                    "!is_empty(authenticated_as) || !key_exists('blocked-domains', sender_domain)",
                 ),
             },
             rcpt: Rcpt {
@@ -796,15 +715,8 @@ impl Default for SessionConfig {
                 subaddressing: AddressMapping::Enable,
             },
             data: Data {
-                #[cfg(feature = "test_mode")]
                 script: IfBlock::empty("session.data.script"),
-                #[cfg(not(feature = "test_mode"))]
-                script: IfBlock::new::<()>(
-                    "session.data.script",
-                    [("is_empty(authenticated_as)", "'spam-filter'")],
-                    "'track-replies'",
-                ),
-                pipe_commands: Default::default(),
+                spam_filter: IfBlock::new::<()>("session.data.spam-filter", [], "true"),
                 max_messages: IfBlock::new::<()>("session.data.limits.messages", [], "10"),
                 max_message_size: IfBlock::new::<()>("session.data.limits.size", [], "104857600"),
                 max_received_headers: IfBlock::new::<()>(
@@ -842,6 +754,7 @@ impl Default for SessionConfig {
                     [("local_port == 25", "true")],
                     "false",
                 ),
+                add_delivered_to: false,
             },
             extensions: Extensions {
                 pipelining: IfBlock::new::<()>("session.extensions.pipelining", [], "true"),
@@ -1001,7 +914,7 @@ impl<'x> TryFrom<Variable<'x>> for MtPriority {
                 4 => Ok(MtPriority::Nsep),
                 _ => Err(()),
             },
-            Variable::String(value) => MtPriority::parse_value(&value).map_err(|_| ()),
+            Variable::String(value) => MtPriority::parse_value(value.as_str()).map_err(|_| ()),
             _ => Err(()),
         }
     }

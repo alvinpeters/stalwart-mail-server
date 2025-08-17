@@ -1,16 +1,16 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{Event, EventDetails, EventType, Key, Value};
+use crate::{Error, Event, EventDetails, Key, Value};
 use ahash::AHashSet;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use mail_parser::DateTime;
 use serde::{
-    ser::{SerializeMap, SerializeSeq},
     Serialize, Serializer,
+    ser::{SerializeMap, SerializeSeq},
 };
 
 struct Keys<'x> {
@@ -127,7 +127,7 @@ impl<T: AsRef<Event<EventDetails>>> Serialize for JsonEventSerializer<T> {
     }
 }
 
-impl<'x> Serialize for JsonEventSerializer<Keys<'x>> {
+impl Serialize for JsonEventSerializer<Keys<'_>> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -135,7 +135,7 @@ impl<'x> Serialize for JsonEventSerializer<Keys<'x>> {
         let keys_len = self.inner.keys.len() + self.inner.span_keys.len();
         let mut seen_keys = AHashSet::with_capacity(keys_len);
         let mut keys = serializer.serialize_map(Some(keys_len))?;
-        for (key, value) in self.inner.span_keys.iter().chain(self.inner.keys.iter()) {
+        for (key, value) in self.inner.keys.iter().chain(self.inner.span_keys.iter()) {
             if !matches!(value, Value::None)
                 && (self.with_spans || !matches!(key, Key::SpanId))
                 && seen_keys.insert(*key)
@@ -156,24 +156,24 @@ impl<'x> Serialize for JsonEventSerializer<Keys<'x>> {
     }
 }
 
-impl Serialize for JsonEventSerializer<&Event<EventType>> {
+impl Serialize for JsonEventSerializer<&Error> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("type", self.inner.inner.name())?;
+        map.serialize_entry("type", self.inner.0.inner.name())?;
         if self.with_description {
-            map.serialize_entry("text", self.inner.inner.description())?;
+            map.serialize_entry("text", self.inner.0.inner.description())?;
         }
         if self.with_explanation {
-            map.serialize_entry("details", self.inner.inner.explain())?;
+            map.serialize_entry("details", self.inner.0.inner.explain())?;
         }
         map.serialize_entry(
             "data",
             &JsonEventSerializer {
                 inner: Keys {
-                    keys: self.inner.keys.as_slice(),
+                    keys: self.inner.0.keys.as_slice(),
                     span_keys: &[],
                 },
                 with_spans: self.with_spans,
@@ -192,7 +192,6 @@ impl Serialize for JsonEventSerializer<&Value> {
         S: Serializer,
     {
         match &self.inner {
-            Value::Static(value) => value.serialize(serializer),
             Value::String(value) => value.serialize(serializer),
             Value::UInt(value) => value.serialize(serializer),
             Value::Int(value) => value.serialize(serializer),

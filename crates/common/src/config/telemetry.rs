@@ -1,31 +1,27 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-
+use super::parse_http_headers;
 use ahash::{AHashMap, AHashSet};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use hyper::{
-    header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
-    HeaderMap,
+use base64::{Engine, engine::general_purpose::STANDARD};
+use hyper::{HeaderMap, header::CONTENT_TYPE};
+use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig,
 };
-use opentelemetry::{InstrumentationLibrary, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    export::{logs::LogExporter, trace::SpanExporter},
-    metrics::{
-        exporter::PushMetricsExporter,
-        reader::{DefaultAggregationSelector, DefaultTemporalitySelector},
-    },
     Resource,
+    logs::{SdkLogger, SdkLoggerProvider},
+    metrics::Temporality,
 };
-use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
+use opentelemetry_semantic_conventions::resource::SERVICE_VERSION;
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use store::Stores;
-use trc::{ipc::subscriber::Interests, EventType, Level, TelemetryEvent};
-use utils::config::{utils::ParseValue, Config};
+use trc::{EventType, Level, TelemetryEvent, ipc::subscriber::Interests};
+use utils::config::{Config, utils::ParseValue};
 
 #[derive(Debug)]
 pub struct TelemetrySubscriber {
@@ -35,6 +31,7 @@ pub struct TelemetrySubscriber {
     pub lossy: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum TelemetrySubscriberType {
     ConsoleTracer(ConsoleTracer),
@@ -43,23 +40,28 @@ pub enum TelemetrySubscriberType {
     Webhook(WebhookTracer),
     #[cfg(unix)]
     JournalTracer(crate::telemetry::tracers::journald::Subscriber),
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
     #[cfg(feature = "enterprise")]
     StoreTracer(StoreTracer),
+    // SPDX-SnippetEnd
 }
 
 #[derive(Debug)]
 pub struct OtelTracer {
-    pub span_exporter: Box<dyn SpanExporter>,
+    pub span_exporter: SpanExporter,
     pub span_exporter_enable: bool,
-    pub log_exporter: Box<dyn LogExporter>,
+    pub log_exporter: LogExporter,
+    pub log_provider: SdkLogger,
     pub log_exporter_enable: bool,
     pub throttle: Duration,
 }
 
 pub struct OtelMetrics {
     pub resource: Resource,
-    pub instrumentation: InstrumentationLibrary,
-    pub exporter: Box<dyn PushMetricsExporter>,
+    pub instrumentation: InstrumentationScope,
+    pub exporter: MetricExporter,
     pub interval: Duration,
 }
 
@@ -90,11 +92,15 @@ pub struct WebhookTracer {
     pub headers: HeaderMap,
 }
 
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
 #[derive(Debug)]
 #[cfg(feature = "enterprise")]
 pub struct StoreTracer {
     pub store: store::Store,
 }
+// SPDX-SnippetEnd
 
 #[derive(Debug)]
 pub enum RotationStrategy {
@@ -177,11 +183,7 @@ impl Tracers {
         // Parse tracers
         let mut tracers: Vec<TelemetrySubscriber> = Vec::new();
         let mut global_interests = Interests::default();
-        for tracer_id in config
-            .sub_keys("tracer", ".type")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for tracer_id in config.sub_keys("tracer", ".type") {
             let id = tracer_id.as_str();
 
             // Skip disabled tracers
@@ -260,9 +262,7 @@ impl Tracers {
                 "otel" | "open-telemetry" => {
                     let timeout = config
                         .property::<Duration>(("tracer", id, "timeout"))
-                        .unwrap_or(Duration::from_secs(
-                            opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-                        ));
+                        .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT);
                     let throttle = config
                         .property_or_default(("tracer", id, "throttle"), "1s")
                         .unwrap_or_else(|| Duration::from_secs(1));
@@ -278,12 +278,12 @@ impl Tracers {
                         .unwrap_or_default()
                     {
                         "grpc" => {
-                            let mut span_exporter = opentelemetry_otlp::new_exporter()
-                                .tonic()
+                            let mut span_exporter = SpanExporter::builder()
+                                .with_tonic()
                                 .with_protocol(opentelemetry_otlp::Protocol::Grpc)
                                 .with_timeout(timeout);
-                            let mut log_exporter = opentelemetry_otlp::new_exporter()
-                                .tonic()
+                            let mut log_exporter = LogExporter::builder()
+                                .with_tonic()
                                 .with_protocol(opentelemetry_otlp::Protocol::Grpc)
                                 .with_timeout(timeout);
                             if let Some(endpoint) = config.value(("tracer", id, "endpoint")) {
@@ -291,17 +291,17 @@ impl Tracers {
                                 log_exporter = log_exporter.with_endpoint(endpoint);
                             }
 
-                            match (
-                                span_exporter.build_span_exporter(),
-                                log_exporter.build_log_exporter(),
-                            ) {
+                            match (span_exporter.build(), log_exporter.build()) {
                                 (Ok(span_exporter), Ok(log_exporter)) => {
                                     TelemetrySubscriberType::OtelTracer(OtelTracer {
-                                        span_exporter: Box::new(span_exporter),
-                                        log_exporter: Box::new(log_exporter),
+                                        span_exporter,
+                                        log_exporter,
                                         throttle,
                                         span_exporter_enable,
                                         log_exporter_enable,
+                                        log_provider: SdkLoggerProvider::builder()
+                                            .build()
+                                            .logger("stalwart"),
                                     })
                                 }
                                 (Err(err), _) => {
@@ -347,12 +347,12 @@ impl Tracers {
                                     config.new_parse_error(("tracer", id, "headers"), err);
                                 }
 
-                                let mut span_exporter = opentelemetry_otlp::new_exporter()
-                                    .http()
+                                let mut span_exporter = SpanExporter::builder()
+                                    .with_http()
                                     .with_endpoint(&endpoint)
                                     .with_timeout(timeout);
-                                let mut log_exporter = opentelemetry_otlp::new_exporter()
-                                    .http()
+                                let mut log_exporter = LogExporter::builder()
+                                    .with_http()
                                     .with_endpoint(&endpoint)
                                     .with_timeout(timeout);
                                 if !headers.is_empty() {
@@ -360,17 +360,17 @@ impl Tracers {
                                     log_exporter = log_exporter.with_headers(headers);
                                 }
 
-                                match (
-                                    span_exporter.build_span_exporter(),
-                                    log_exporter.build_log_exporter(),
-                                ) {
+                                match (span_exporter.build(), log_exporter.build()) {
                                     (Ok(span_exporter), Ok(log_exporter)) => {
                                         TelemetrySubscriberType::OtelTracer(OtelTracer {
-                                            span_exporter: Box::new(span_exporter),
-                                            log_exporter: Box::new(log_exporter),
+                                            span_exporter,
+                                            log_exporter,
                                             throttle,
                                             span_exporter_enable,
                                             log_exporter_enable,
+                                            log_provider: SdkLoggerProvider::builder()
+                                                .build()
+                                                .logger("stalwart"),
                                         })
                                     }
                                     (Err(err), _) => {
@@ -485,8 +485,12 @@ impl Tracers {
                 TelemetrySubscriberType::JournalTracer(_) => {
                     EventType::Telemetry(TelemetryEvent::JournalError).into()
                 }
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
                 #[cfg(feature = "enterprise")]
                 TelemetrySubscriberType::StoreTracer(_) => None,
+                // SPDX-SnippetEnd
             };
 
             // Parse disabled events
@@ -516,6 +520,10 @@ impl Tracers {
                 config.new_build_warning(("tracer", "id"), "No events enabled for tracer");
             }
         }
+
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
 
         // Parse tracing history
         #[cfg(feature = "enterprise")]
@@ -548,13 +556,10 @@ impl Tracers {
                 }
             }
         }
+        // SPDX-SnippetEnd
 
         // Parse webhooks
-        for id in config
-            .sub_keys("webhook", ".url")
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-        {
+        for id in config.sub_keys("webhook", ".url") {
             if let Some(webhook) = parse_webhook(config, &id, &mut global_interests) {
                 tracers.push(webhook);
             }
@@ -603,6 +608,7 @@ impl Metrics {
 
         // Obtain log path
         for tracer_id in config.sub_keys("tracer", ".type") {
+            let tracer_id = tracer_id.as_str();
             if config
                 .value(("tracer", tracer_id, "enable"))
                 .unwrap_or("true")
@@ -654,36 +660,32 @@ impl Metrics {
         if let Some(is_grpc) = otel_enabled {
             let timeout = config
                 .property::<Duration>("metrics.open-telemetry.timeout")
-                .unwrap_or(Duration::from_secs(
-                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-                ));
+                .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT);
             let interval = config
                 .property_or_default("metrics.open-telemetry.interval", "1m")
                 .unwrap_or_else(|| Duration::from_secs(60));
-            let resource = Resource::new([
-                KeyValue::new(SERVICE_NAME, "stalwart-mail"),
-                KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-            ]);
-            let instrumentation = InstrumentationLibrary::builder("stalwart-mail")
+            let resource = Resource::builder()
+                .with_service_name("stalwart")
+                .with_attribute(KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")))
+                .build();
+            let instrumentation = InstrumentationScope::builder("stalwart")
                 .with_version(env!("CARGO_PKG_VERSION"))
                 .build();
 
             if is_grpc {
-                let mut exporter = opentelemetry_otlp::new_exporter()
-                    .tonic()
+                let mut exporter = MetricExporter::builder()
+                    .with_temporality(Temporality::Delta)
+                    .with_tonic()
                     .with_protocol(opentelemetry_otlp::Protocol::Grpc)
                     .with_timeout(timeout);
                 if let Some(endpoint) = config.value("metrics.open-telemetry.endpoint") {
                     exporter = exporter.with_endpoint(endpoint);
                 }
 
-                match exporter.build_metrics_exporter(
-                    Box::new(DefaultAggregationSelector::new()),
-                    Box::new(DefaultTemporalitySelector::new()),
-                ) {
+                match exporter.build() {
                     Ok(exporter) => {
                         metrics.otel = Some(Arc::new(OtelMetrics {
-                            exporter: Box::new(exporter),
+                            exporter,
                             interval,
                             resource,
                             instrumentation,
@@ -714,21 +716,19 @@ impl Metrics {
                     config.new_parse_error("metrics.open-telemetry.headers", err);
                 }
 
-                let mut exporter = opentelemetry_otlp::new_exporter()
-                    .http()
+                let mut exporter = MetricExporter::builder()
+                    .with_temporality(Temporality::Delta)
+                    .with_http()
                     .with_endpoint(&endpoint)
                     .with_timeout(timeout);
                 if !headers.is_empty() {
                     exporter = exporter.with_headers(headers);
                 }
 
-                match exporter.build_metrics_exporter(
-                    Box::new(DefaultAggregationSelector::new()),
-                    Box::new(DefaultTemporalitySelector::new()),
-                ) {
+                match exporter.build() {
                     Ok(exporter) => {
                         metrics.otel = Some(Arc::new(OtelMetrics {
-                            exporter: Box::new(exporter),
+                            exporter,
                             interval,
                             resource,
                             instrumentation,
@@ -753,45 +753,8 @@ fn parse_webhook(
     id: &str,
     global_interests: &mut Interests,
 ) -> Option<TelemetrySubscriber> {
-    let mut headers = HeaderMap::new();
-
-    for (header, value) in config
-        .values(("webhook", id, "headers"))
-        .map(|(_, v)| {
-            if let Some((k, v)) = v.split_once(':') {
-                Ok((
-                    HeaderName::from_str(k.trim()).map_err(|err| {
-                        format!("Invalid header found in property \"webhook.{id}.headers\": {err}",)
-                    })?,
-                    HeaderValue::from_str(v.trim()).map_err(|err| {
-                        format!("Invalid header found in property \"webhook.{id}.headers\": {err}",)
-                    })?,
-                ))
-            } else {
-                Err(format!(
-                    "Invalid header found in property \"webhook.{id}.headers\": {v}",
-                ))
-            }
-        })
-        .collect::<Result<Vec<(HeaderName, HeaderValue)>, String>>()
-        .map_err(|e| config.new_parse_error(("webhook", id, "headers"), e))
-        .unwrap_or_default()
-    {
-        headers.insert(header, value);
-    }
-
+    let mut headers = parse_http_headers(config, ("webhook", id));
     headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    if let (Some(name), Some(secret)) = (
-        config.value(("webhook", id, "auth.username")),
-        config.value(("webhook", id, "auth.secret")),
-    ) {
-        headers.insert(
-            AUTHORIZATION,
-            format!("Basic {}", STANDARD.encode(format!("{}:{}", name, secret)))
-                .parse()
-                .unwrap(),
-        );
-    }
 
     // Build tracer
     let mut tracer = TelemetrySubscriber {

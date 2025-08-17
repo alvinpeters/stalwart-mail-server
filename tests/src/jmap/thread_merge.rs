@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -10,10 +10,12 @@ use crate::{
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes},
     store::deflate_test_resource,
 };
-use jmap::email::ingest::{IngestEmail, IngestSource};
+use common::auth::AccessToken;
+
+use ::email::message::ingest::{EmailIngest, IngestEmail, IngestSource};
 use jmap_client::{email, mailbox::Role};
 use jmap_proto::types::{collection::Collection, id::Id};
-use mail_parser::{mailbox::mbox::MessageIterator, MessageParser};
+use mail_parser::{MessageParser, mailbox::mbox::MessageIterator};
 use store::{
     ahash::{AHashMap, AHashSet},
     rand::{self, Rng},
@@ -242,13 +244,16 @@ async fn test_multi_thread(params: &mut JMAPTest) {
                     .email_ingest(IngestEmail {
                         raw_message: message.contents(),
                         message: MessageParser::new().parse(message.contents()),
-                        account_id: 0,
-                        account_quota: 0,
+                        access_token: &AccessToken::from_id(0),
                         mailbox_ids: vec![mailbox_id],
                         keywords: vec![],
                         received_at: None,
-                        source: IngestSource::Smtp,
-                        encrypt: false,
+                        source: IngestSource::Smtp {
+                            deliver_to: "test@domain.org",
+                            is_sender_authenticated: true,
+                        },
+                        spam_classify: false,
+                        spam_train: false,
                         session_id: 0,
                     })
                     .await
@@ -257,7 +262,7 @@ async fn test_multi_thread(params: &mut JMAPTest) {
                     Err(err) => {
                         if err.is_assertion_failure() && retry_count < 10 {
                             //println!("Retrying ingest for {}...", message.from());
-                            let backoff = rand::thread_rng().gen_range(50..=300);
+                            let backoff = rand::rng().random_range(50..=300);
                             tokio::time::sleep(Duration::from_millis(backoff)).await;
                             retry_count += 1;
                             continue;

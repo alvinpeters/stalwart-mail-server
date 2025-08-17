@@ -1,23 +1,24 @@
 // Adapted from rustls-acme (https://github.com/FlorianUekermann/rustls-acme), licensed under MIT/Apache-2.0.
 
-use std::time::Duration;
-
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use super::AcmeProvider;
+use super::jose::{
+    Body, eab_sign, key_authorization, key_authorization_sha256, key_authorization_sha256_base64,
+    sign,
+};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hyper::header::USER_AGENT;
 use rcgen::{Certificate, CustomExtension, PKCS_ECDSA_P256_SHA256};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, Response};
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm};
 use serde::Deserialize;
-use serde_json::json;
-use store::write::Bincode;
+use std::time::Duration;
 use store::Serialize;
+use store::write::Archiver;
+use trc::AddContext;
 use trc::event::conv::AssertSuccess;
-
-use super::jose::{
-    key_authorization, key_authorization_sha256, key_authorization_sha256_base64, sign,
-};
 
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
     "https://acme-staging-v02.api.letsencrypt.org/directory";
@@ -32,6 +33,16 @@ pub struct Account {
     pub kid: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct NewAccountPayload<'x> {
+    #[serde(rename = "termsOfServiceAgreed")]
+    tos_agreed: bool,
+    contact: &'x [String],
+    #[serde(rename = "externalAccountBinding")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eab: Option<Body>,
+}
+
 static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
 
 impl Account {
@@ -42,35 +53,39 @@ impl Account {
             .to_vec()
     }
 
-    pub async fn create<'a, S, I>(directory: Directory, contact: I) -> trc::Result<Self>
-    where
-        S: AsRef<str> + 'a,
-        I: IntoIterator<Item = &'a S>,
-    {
-        Self::create_with_keypair(directory, contact, &Self::generate_key_pair()).await
+    pub async fn create(directory: Directory, provider: &AcmeProvider) -> trc::Result<Self> {
+        Self::create_with_keypair(directory, provider).await
     }
 
-    pub async fn create_with_keypair<'a, S, I>(
+    pub async fn create_with_keypair(
         directory: Directory,
-        contact: I,
-        key_pair: &[u8],
-    ) -> trc::Result<Self>
-    where
-        S: AsRef<str> + 'a,
-        I: IntoIterator<Item = &'a S>,
-    {
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(ALG, key_pair, &SystemRandom::new()).map_err(|err| {
-                trc::EventType::Acme(trc::AcmeEvent::Error)
-                    .reason(err)
-                    .caused_by(trc::location!())
-            })?;
-        let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
-        let payload = json!({
-            "termsOfServiceAgreed": true,
-            "contact": contact,
+        provider: &AcmeProvider,
+    ) -> trc::Result<Self> {
+        let key_pair = EcdsaKeyPair::from_pkcs8(
+            ALG,
+            provider.account_key.load().as_slice(),
+            &SystemRandom::new(),
+        )
+        .map_err(|err| {
+            trc::EventType::Acme(trc::AcmeEvent::Error)
+                .reason(err)
+                .caused_by(trc::location!())
+        })?;
+        let eab = if let Some(eab) = &provider.eab {
+            eab_sign(&key_pair, &eab.kid, &eab.hmac_key, &directory.new_account)
+                .caused_by(trc::location!())?
+                .into()
+        } else {
+            None
+        };
+
+        let payload = serde_json::to_string(&NewAccountPayload {
+            tos_agreed: true,
+            contact: &provider.contact,
+            eab,
         })
-        .to_string();
+        .unwrap_or_default();
+
         let body = sign(
             &key_pair,
             None,
@@ -155,13 +170,11 @@ impl Account {
     }
 
     pub fn http_proof(&self, challenge: &Challenge) -> trc::Result<Vec<u8>> {
-        key_authorization(&self.key_pair, &challenge.token)
-            .map(|key| key.into_bytes())
-            .map_err(Into::into)
+        key_authorization(&self.key_pair, &challenge.token).map(|key| key.into_bytes())
     }
 
     pub fn dns_proof(&self, challenge: &Challenge) -> trc::Result<String> {
-        key_authorization_sha256_base64(&self.key_pair, &challenge.token).map_err(Into::into)
+        key_authorization_sha256_base64(&self.key_pair, &challenge.token)
     }
 
     pub fn tls_alpn_key(&self, challenge: &Challenge, domain: String) -> trc::Result<Vec<u8>> {
@@ -175,7 +188,7 @@ impl Account {
                 .reason(err)
         })?;
 
-        Ok(Bincode::new(SerializedCert {
+        Archiver::new(SerializedCert {
             certificate: cert.serialize_der().map_err(|err| {
                 trc::EventType::Acme(trc::AcmeEvent::Error)
                     .caused_by(trc::location!())
@@ -183,11 +196,14 @@ impl Account {
             })?,
             private_key: cert.serialize_private_key_der(),
         })
-        .serialize())
+        .untrusted()
+        .serialize()
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[derive(
+    rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, Debug, Clone, serde::Serialize, Deserialize,
+)]
 pub struct SerializedCert {
     pub certificate: Vec<u8>,
     pub private_key: Vec<u8>,
@@ -228,6 +244,8 @@ pub enum ChallengeType {
     Dns01,
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,7 +332,8 @@ async fn https(
     let mut request = builder
         .build()
         .map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).from_http_error(err))?
-        .request(method, url);
+        .request(method, url)
+        .header(USER_AGENT, crate::USER_AGENT);
 
     if let Some(body) = body {
         request = request
@@ -331,7 +350,7 @@ async fn https(
 }
 
 fn get_header(response: &Response, header: &'static str) -> trc::Result<String> {
-    match response.headers().get_all(header).iter().last() {
+    match response.headers().get_all(header).iter().next_back() {
         Some(value) => Ok(value
             .to_str()
             .map_err(|err| trc::EventType::Acme(trc::AcmeEvent::Error).from_http_str_error(err))?
@@ -349,6 +368,7 @@ impl ChallengeType {
             Self::Http01 => "http-01",
             Self::Dns01 => "dns-01",
             Self::TlsAlpn01 => "tls-alpn-01",
+            Self::Unknown => "unknown",
         }
     }
 }

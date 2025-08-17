@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -14,7 +14,7 @@ pub struct WordTokenizer<'x> {
     iterator: CharIndices<'x>,
 }
 
-impl<'x> WordTokenizer<'x> {
+impl WordTokenizer<'_> {
     pub fn new(text: &str, max_token_length: usize) -> WordTokenizer {
         WordTokenizer {
             max_token_length,

@@ -1,18 +1,22 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::time::Duration;
 
-use crate::jmap::{
-    assert_is_empty, delivery::SmtpConnection, mailbox::destroy_all_mailboxes, test_account_login,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{
+        assert_is_empty, delivery::SmtpConnection, mailbox::destroy_all_mailboxes,
+        test_account_login,
+    },
 };
-use directory::backend::internal::manage::ManageDirectory;
+use email::mailbox::INBOX_ID;
 use futures::StreamExt;
-use jmap::mailbox::INBOX_ID;
-use jmap_client::{event_source::Changes, mailbox::Role, TypeState};
+
+use jmap_client::{TypeState, event_source::Changes, mailbox::Role};
 use jmap_proto::types::id::Id;
 use store::ahash::AHashSet;
 
@@ -25,20 +29,21 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
+
     let client = test_account_login("jdoe@example.com", "12345").await;
 
     let mut changes = client

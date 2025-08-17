@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -13,7 +13,7 @@ pub mod resolver;
 pub mod session;
 pub mod throttle;
 
-use crate::expr::{tokenizer::TokenMap, Expression};
+use crate::expr::{Expression, tokenizer::TokenMap};
 
 use self::{
     auth::MailAuthConfig, queue::QueueConfig, report::ReportConfig, resolver::Resolvers,
@@ -33,12 +33,11 @@ pub struct SmtpConfig {
 
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(feature = "test_mode", derive(PartialEq, Eq))]
-pub struct Throttle {
+pub struct QueueRateLimiter {
     pub id: String,
     pub expr: Expression,
     pub keys: u16,
-    pub concurrency: Option<u64>,
-    pub rate: Option<Rate>,
+    pub rate: Rate,
 }
 
 pub const THROTTLE_RCPT: u16 = 1 << 0;
@@ -54,7 +53,7 @@ pub const THROTTLE_HELO_DOMAIN: u16 = 1 << 9;
 
 pub(crate) const RCPT_DOMAIN_VARS: &[u32; 1] = &[V_RECIPIENT_DOMAIN];
 
-pub(crate) const SMTP_EHLO_VARS: &[u32; 8] = &[
+pub(crate) const SMTP_EHLO_VARS: &[u32; 10] = &[
     V_LISTENER,
     V_REMOTE_IP,
     V_REMOTE_PORT,
@@ -63,8 +62,10 @@ pub(crate) const SMTP_EHLO_VARS: &[u32; 8] = &[
     V_PROTOCOL,
     V_TLS,
     V_HELO_DOMAIN,
+    V_ASN,
+    V_COUNTRY,
 ];
-pub(crate) const SMTP_MAIL_FROM_VARS: &[u32; 10] = &[
+pub(crate) const SMTP_MAIL_FROM_VARS: &[u32; 12] = &[
     V_LISTENER,
     V_REMOTE_IP,
     V_REMOTE_PORT,
@@ -75,8 +76,10 @@ pub(crate) const SMTP_MAIL_FROM_VARS: &[u32; 10] = &[
     V_SENDER,
     V_SENDER_DOMAIN,
     V_AUTHENTICATED_AS,
+    V_ASN,
+    V_COUNTRY,
 ];
-pub(crate) const SMTP_RCPT_TO_VARS: &[u32; 15] = &[
+pub(crate) const SMTP_RCPT_TO_VARS: &[u32; 17] = &[
     V_SENDER,
     V_SENDER_DOMAIN,
     V_RECIPIENTS,
@@ -92,8 +95,10 @@ pub(crate) const SMTP_RCPT_TO_VARS: &[u32; 15] = &[
     V_TLS,
     V_PRIORITY,
     V_HELO_DOMAIN,
+    V_ASN,
+    V_COUNTRY,
 ];
-pub(crate) const SMTP_QUEUE_HOST_VARS: &[u32; 14] = &[
+pub(crate) const SMTP_QUEUE_HOST_VARS: &[u32; 20] = &[
     V_SENDER,
     V_SENDER_DOMAIN,
     V_RECIPIENT_DOMAIN,
@@ -108,8 +113,15 @@ pub(crate) const SMTP_QUEUE_HOST_VARS: &[u32; 14] = &[
     V_QUEUE_EXPIRES_IN,
     V_QUEUE_LAST_STATUS,
     V_QUEUE_LAST_ERROR,
+    V_QUEUE_NAME,
+    V_QUEUE_AGE,
+    V_RECEIVED_FROM_IP,
+    V_RECEIVED_VIA_PORT,
+    V_SOURCE,
+    V_SIZE,
 ];
-pub(crate) const SMTP_QUEUE_RCPT_VARS: &[u32; 10] = &[
+pub(crate) const SMTP_QUEUE_RCPT_VARS: &[u32; 17] = &[
+    V_RECIPIENT,
     V_RECIPIENT_DOMAIN,
     V_RECIPIENTS,
     V_SENDER,
@@ -120,24 +132,17 @@ pub(crate) const SMTP_QUEUE_RCPT_VARS: &[u32; 10] = &[
     V_QUEUE_EXPIRES_IN,
     V_QUEUE_LAST_STATUS,
     V_QUEUE_LAST_ERROR,
+    V_QUEUE_NAME,
+    V_QUEUE_AGE,
+    V_RECEIVED_FROM_IP,
+    V_RECEIVED_VIA_PORT,
+    V_SOURCE,
+    V_SIZE,
 ];
 pub(crate) const SMTP_QUEUE_SENDER_VARS: &[u32; 8] = &[
     V_SENDER,
     V_SENDER_DOMAIN,
     V_PRIORITY,
-    V_QUEUE_RETRY_NUM,
-    V_QUEUE_NOTIFY_NUM,
-    V_QUEUE_EXPIRES_IN,
-    V_QUEUE_LAST_STATUS,
-    V_QUEUE_LAST_ERROR,
-];
-pub(crate) const SMTP_QUEUE_MX_VARS: &[u32; 11] = &[
-    V_RECIPIENT_DOMAIN,
-    V_RECIPIENTS,
-    V_SENDER,
-    V_SENDER_DOMAIN,
-    V_PRIORITY,
-    V_MX,
     V_QUEUE_RETRY_NUM,
     V_QUEUE_NOTIFY_NUM,
     V_QUEUE_EXPIRES_IN,

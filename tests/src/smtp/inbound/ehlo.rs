@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,13 +7,13 @@
 use std::time::{Duration, Instant};
 
 use common::Core;
-use mail_auth::{common::parse::TxtRecordParser, spf::Spf, SpfResult};
+use mail_auth::{SpfResult, common::parse::TxtRecordParser, spf::Spf};
 
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 use utils::config::Config;
 
 use crate::smtp::{
-    build_smtp,
+    DnsCache, TestSMTP,
     session::{TestSession, VerifyResponse},
 };
 
@@ -29,7 +29,7 @@ mt-priority = [{if = "remote_ip = '10.0.0.1'", then = 'nsep'},
                {else = false}]
 
 [session.ehlo]
-reject-non-fqdn = true
+reject-non-fqdn = "starts_with(remote_ip, '10.0.0.')"
 
 [auth.spf.verify]
 ehlo = [{if = "remote_ip = '10.0.0.2'", then = 'strict'},
@@ -38,25 +38,26 @@ ehlo = [{if = "remote_ip = '10.0.0.2'", then = 'strict'},
 
 #[tokio::test]
 async fn ehlo() {
-        // Enable logging
-        crate::enable_logging();
+    // Enable logging
+    crate::enable_logging();
 
     let mut config = Config::new(CONFIG).unwrap();
     let core = Core::parse(&mut config, Default::default(), Default::default()).await;
-    core.smtp.resolvers.dns.txt_add(
+    let server = TestSMTP::from_core(core).server;
+    server.txt_add(
         "mx1.foobar.org",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.smtp.resolvers.dns.txt_add(
+    server.txt_add(
         "mx2.foobar.org",
         Spf::parse(b"v=spf1 ip4:10.0.0.2 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
 
     // Reject non-FQDN domains
-    let mut session = Session::test(build_smtp(core, Inner::default()));
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let mut session = Session::test(server);
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     session.stream.tls = false;
     session.eval_session_params().await;
@@ -78,8 +79,8 @@ async fn ehlo() {
     );
 
     // Test SPF strict mode
-    session.data.helo_domain = String::new();
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    session.data.helo_domain = "".into();
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     session.stream.tls = true;
     session.eval_session_params().await;

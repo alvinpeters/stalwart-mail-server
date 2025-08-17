@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,8 +9,8 @@ use std::fmt::Display;
 use mail_parser::DateTime;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{Event, EventDetails, EventType, Key, Level, Value};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::{Error, Event, EventDetails, Key, Level, Value};
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 pub struct FmtWriter<T: AsyncWrite + Unpin> {
     writer: T,
@@ -176,9 +176,6 @@ impl<T: AsyncWrite + Unpin> FmtWriter<T> {
     async fn write_value(&mut self, value: &Value, indent: usize) -> std::io::Result<()> {
         Box::pin(async move {
             match value {
-                Value::Static(v) => {
-                    self.writer.write_all(v.as_bytes()).await?;
-                }
                 Value::String(v) => {
                     self.writer.write_all("\"".as_bytes()).await?;
                     for ch in v.as_bytes() {
@@ -240,17 +237,17 @@ impl<T: AsyncWrite + Unpin> FmtWriter<T> {
                 }
                 Value::Event(e) => {
                     self.writer
-                        .write_all(e.inner.description().as_bytes())
+                        .write_all(e.0.inner.description().as_bytes())
                         .await?;
                     self.writer.write_all(" (".as_bytes()).await?;
-                    self.writer.write_all(e.inner.name().as_bytes()).await?;
+                    self.writer.write_all(e.0.inner.name().as_bytes()).await?;
                     self.writer.write_all(")".as_bytes()).await?;
-                    if !e.keys.is_empty() {
+                    if !e.0.keys.is_empty() {
                         self.writer
                             .write_all(if self.multiline { "\n" } else { " { " }.as_bytes())
                             .await?;
 
-                        self.write_keys(&e.keys, &[], indent + 1).await?;
+                        self.write_keys(&e.0.keys, &[], indent + 1).await?;
 
                         if !self.multiline {
                             self.writer.write_all(" }".as_bytes()).await?;
@@ -323,7 +320,6 @@ impl Color {
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Static(value) => value.fmt(f),
             Value::String(value) => value.fmt(f),
             Value::UInt(value) => value.fmt(f),
             Value::Int(value) => value.fmt(f),
@@ -354,16 +350,16 @@ impl Display for Value {
     }
 }
 
-impl Display for Event<EventType> {
+impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner.description().fmt(f)?;
+        self.0.inner.description().fmt(f)?;
         " (".fmt(f)?;
-        self.inner.name().fmt(f)?;
+        self.0.inner.name().fmt(f)?;
         ")".fmt(f)?;
 
-        if !self.keys.is_empty() {
+        if !self.0.keys.is_empty() {
             f.write_str(": ")?;
-            for (i, (key, value)) in self.keys.iter().enumerate() {
+            for (i, (key, value)) in self.0.keys.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }

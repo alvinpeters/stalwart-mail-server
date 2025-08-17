@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -12,23 +12,22 @@ use smtp_proto::{RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_SUCCESS};
 use store::Stores;
 use utils::config::Config;
 
-use smtp::core::{Inner, Session, State};
+use smtp::core::{Session, State};
 
 use crate::smtp::{
-    build_smtp,
+    TempDir, TestSMTP,
     session::{TestSession, VerifyResponse},
-    TempDir,
 };
 
 const CONFIG: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
 
 [directory."local"]
@@ -75,7 +74,7 @@ wait = [{if = "remote_ip = '10.0.0.1'", then = '5ms'},
 dsn = [{if = "remote_ip = '10.0.0.1'", then = false},
        {else = true}]
 
-[[session.throttle]]
+[[queue.limiter.inbound]]
 match = "remote_ip = '10.0.0.1' && !is_empty(rcpt)"
 key = 'sender'
 rate = '2/1s'
@@ -90,12 +89,12 @@ async fn rcpt() {
 
     let tmp_dir = TempDir::new("smtp_rcpt_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
 
     // RCPT without MAIL FROM
-    let mut session = Session::test(build_smtp(core, Inner::default()));
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx1.foobar.org").await;
     session.rcpt_to("jane@foobar.org", "503 5.5.1").await;
@@ -119,19 +118,19 @@ async fn rcpt() {
         .ingest(b"RCPT TO:<sam@foobar.org>\r\n")
         .await
         .unwrap_err();
-    session.response().assert_code("421 4.3.0");
+    session.response().assert_code("451 4.3.0");
 
     // Rate limit
     session.data.rcpt_errors = 0;
     session.state = State::default();
     session.rcpt_to("Jane@FooBar.org", "250").await;
     session.rcpt_to("Bill@FooBar.org", "250").await;
-    session.rcpt_to("Mike@FooBar.org", "451 4.4.5").await;
+    session.rcpt_to("Mike@FooBar.org", "452 4.4.5").await;
 
     // Restore rate limit
     tokio::time::sleep(Duration::from_millis(1100)).await;
     session.rcpt_to("Mike@FooBar.org", "250").await;
-    session.rcpt_to("john@foobar.org", "451 4.5.3").await;
+    session.rcpt_to("john@foobar.org", "455 4.5.3").await;
 
     // Check recipients
     assert_eq!(session.data.rcpt_to.len(), 3);
@@ -148,7 +147,7 @@ async fn rcpt() {
     }
 
     // Relaying should be allowed for 10.0.0.2
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.eval_session_params().await;
     session.rset().await;
     session.mail_from("john@example.net", "250").await;

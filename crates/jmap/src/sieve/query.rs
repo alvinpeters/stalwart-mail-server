@@ -1,21 +1,33 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::Server;
 use jmap_proto::{
     method::query::{
         Comparator, Filter, QueryRequest, QueryResponse, RequestArguments, SortProperty,
     },
-    types::{collection::Collection, property::Property},
+    types::{
+        collection::{Collection, SyncCollection},
+        property::Property,
+    },
 };
+use std::future::Future;
 use store::query::{self};
 
-use crate::JMAP;
+use crate::{JmapMethods, changes::state::StateManager};
 
-impl JMAP {
-    pub async fn sieve_script_query(
+pub trait SieveScriptQuery: Sync + Send {
+    fn sieve_script_query(
+        &self,
+        request: QueryRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
+}
+
+impl SieveScriptQuery for Server {
+    async fn sieve_script_query(
         &self,
         mut request: QueryRequest<RequestArguments>,
     ) -> trc::Result<QueryResponse> {
@@ -24,9 +36,9 @@ impl JMAP {
 
         for cond in std::mem::take(&mut request.filter) {
             match cond {
-                Filter::Name(name) => filters.push(query::Filter::has_text(Property::Name, &name)),
+                Filter::Name(name) => filters.push(query::Filter::contains(Property::Name, &name)),
                 Filter::IsActive(is_active) => {
-                    filters.push(query::Filter::eq(Property::IsActive, is_active as u32))
+                    filters.push(query::Filter::eq(Property::IsActive, vec![is_active as u8]))
                 }
                 Filter::And | Filter::Or | Filter::Not | Filter::Close => {
                     filters.push(cond.into());
@@ -34,7 +46,7 @@ impl JMAP {
                 other => {
                     return Err(trc::JmapEvent::UnsupportedFilter
                         .into_err()
-                        .details(other.to_string()))
+                        .details(other.to_string()));
                 }
             }
         }
@@ -43,7 +55,14 @@ impl JMAP {
             .filter(account_id, Collection::SieveScript, filters)
             .await?;
 
-        let (response, paginate) = self.build_query_response(&result_set, &request).await?;
+        let (response, paginate) = self
+            .build_query_response(
+                &result_set,
+                self.get_state(account_id, SyncCollection::SieveScript)
+                    .await?,
+                &request,
+            )
+            .await?;
 
         if let Some(paginate) = paginate {
             // Parse sort criteria
@@ -63,7 +82,7 @@ impl JMAP {
                     other => {
                         return Err(trc::JmapEvent::UnsupportedSort
                             .into_err()
-                            .details(other.to_string()))
+                            .details(other.to_string()));
                     }
                 });
             }

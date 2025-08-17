@@ -1,26 +1,28 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use ahash::AHashSet;
-use directory::backend::internal::manage::ManageDirectory;
 use futures::StreamExt;
 use jmap_client::{
+    TypeState,
     client_ws::WebSocketMessage,
     core::{
         response::{Response, TaggedMethodResponse},
         set::SetObject,
     },
-    TypeState,
 };
 use jmap_proto::types::id::Id;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, test_account_login};
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, test_account_login},
+};
 
 use super::JMAPTest;
 
@@ -29,18 +31,18 @@ pub async fn test(params: &mut JMAPTest) {
     let server = params.server.clone();
 
     // Authenticate all accounts
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
     let client = test_account_login("jdoe@example.com", "12345").await;

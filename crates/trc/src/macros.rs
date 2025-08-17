@@ -1,14 +1,12 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 #[macro_export]
 macro_rules! location {
-    () => {{
-        concat!(file!(), ":", line!())
-    }};
+    () => {{ concat!(file!(), ":", line!()) }};
 }
 
 #[macro_export]
@@ -25,7 +23,7 @@ macro_rules! error {
         let event_id = err.as_ref().id();
 
         if $crate::Collector::is_metric(event_id) {
-            $crate::Collector::record_metric(*err.as_ref(), event_id, &err.keys);
+            $crate::Collector::record_metric(*err.as_ref(), event_id, err.keys());
         }
         if $crate::Collector::has_interest(event_id) {
             err.send();

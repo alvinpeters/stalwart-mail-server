@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: LicenseRef-SEL
  *
@@ -8,9 +8,9 @@
  *
  */
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
 use crate::*;
+use compact_str::format_compact;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 const VERSION: u8 = 1;
 
@@ -35,9 +35,11 @@ pub fn deserialize_events(bytes: &[u8]) -> crate::Result<Vec<Event<EventDetails>
             .details("EOF while reading version")
     })? != VERSION
     {
-        crate::bail!(StoreEvent::DataCorruption
-            .caused_by(crate::location!())
-            .details("Invalid version"));
+        crate::bail!(
+            StoreEvent::DataCorruption
+                .caused_by(crate::location!())
+                .details("Invalid version")
+        );
     }
     let len = leb128_read(&mut iter).ok_or_else(|| {
         StoreEvent::DataCorruption
@@ -49,7 +51,7 @@ pub fn deserialize_events(bytes: &[u8]) -> crate::Result<Vec<Event<EventDetails>
         events.push(Event::deserialize(&mut iter).ok_or_else(|| {
             StoreEvent::DataCorruption
                 .caused_by(crate::location!())
-                .details(format!("Failed to deserialize event {n}"))
+                .details(format_compact!("Failed to deserialize event {n}"))
         })?);
     }
     Ok(events)
@@ -63,9 +65,11 @@ pub fn deserialize_single_event(bytes: &[u8]) -> crate::Result<Event<EventDetail
             .details("EOF while reading version")
     })? != VERSION
     {
-        crate::bail!(StoreEvent::DataCorruption
-            .caused_by(crate::location!())
-            .details("Invalid version"));
+        crate::bail!(
+            StoreEvent::DataCorruption
+                .caused_by(crate::location!())
+                .details("Invalid version")
+        );
     }
     let _ = leb128_read(&mut iter).ok_or_else(|| {
         StoreEvent::DataCorruption
@@ -123,11 +127,6 @@ impl Event<EventDetails> {
 impl Value {
     fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
-            Value::Static(v) => {
-                buf.push(0u8);
-                leb128_write(buf, v.len() as u64);
-                buf.extend(v.as_bytes());
-            }
             Value::String(v) => {
                 buf.push(0u8);
                 leb128_write(buf, v.len() as u64);
@@ -174,9 +173,9 @@ impl Value {
             }
             Value::Event(v) => {
                 buf.push(11u8);
-                leb128_write(buf, v.inner.code());
-                leb128_write(buf, v.keys.len() as u64);
-                for (k, v) in &v.keys {
+                leb128_write(buf, v.0.inner.code());
+                leb128_write(buf, v.0.keys.len() as u64);
+                for (k, v) in &v.0.keys {
                     leb128_write(buf, k.code());
                     v.serialize(buf);
                 }
@@ -201,7 +200,7 @@ impl Value {
                 for byte in buf.iter_mut() {
                     *byte = *iter.next()?;
                 }
-                Some(Value::String(String::from_utf8(buf).ok()?))
+                Some(Value::String(CompactString::from_utf8(buf).ok()?))
             }
             1 => Some(Value::UInt(leb128_read(iter)?)),
             2 => {
@@ -258,7 +257,9 @@ impl Value {
                     let value = Value::deserialize(iter)?;
                     keys.push((key, value));
                 }
-                Some(Value::Event(Event::with_keys(code, keys)))
+                Some(Value::Event(Error(
+                    Event::with_keys(code, keys).into_boxed(),
+                )))
             }
             12 => {
                 let len = leb128_read(iter)?;
@@ -345,25 +346,20 @@ impl EventType {
             EventType::Auth(AuthEvent::MissingTotp) => 36,
             EventType::Auth(AuthEvent::Success) => 37,
             EventType::Auth(AuthEvent::TooManyAttempts) => 38,
-            EventType::Cluster(ClusterEvent::DecryptionError) => 39,
-            EventType::Cluster(ClusterEvent::EmptyPacket) => 40,
-            EventType::Cluster(ClusterEvent::Error) => 41,
-            EventType::Cluster(ClusterEvent::InvalidPacket) => 42,
-            EventType::Cluster(ClusterEvent::OneOrMorePeersOffline) => 43,
-            EventType::Cluster(ClusterEvent::PeerAlive) => 44,
-            EventType::Cluster(ClusterEvent::PeerBackOnline) => 45,
-            EventType::Cluster(ClusterEvent::PeerDiscovered) => 46,
-            EventType::Cluster(ClusterEvent::PeerHasConfigChanges) => 47,
-            EventType::Cluster(ClusterEvent::PeerHasListChanges) => 48,
-            EventType::Cluster(ClusterEvent::PeerLeaving) => 49,
-            EventType::Cluster(ClusterEvent::PeerOffline) => 50,
-            EventType::Cluster(ClusterEvent::PeerSuspected) => 51,
-            EventType::Cluster(ClusterEvent::PeerSuspectedIsAlive) => 52,
+            EventType::Cluster(ClusterEvent::SubscriberStart) => 39,
+            EventType::Cluster(ClusterEvent::SubscriberStop) => 40,
+            EventType::Cluster(ClusterEvent::SubscriberError) => 41,
+            EventType::Cluster(ClusterEvent::SubscriberDisconnected) => 42,
+            EventType::Cluster(ClusterEvent::PublisherStart) => 43,
+            EventType::Cluster(ClusterEvent::PublisherStop) => 44,
+            EventType::Cluster(ClusterEvent::PublisherError) => 45,
+            EventType::Cluster(ClusterEvent::MessageReceived) => 46,
+            EventType::Cluster(ClusterEvent::MessageSkipped) => 47,
+            EventType::Cluster(ClusterEvent::MessageInvalid) => 49,
             EventType::Config(ConfigEvent::AlreadyUpToDate) => 53,
             EventType::Config(ConfigEvent::BuildError) => 54,
             EventType::Config(ConfigEvent::BuildWarning) => 55,
             EventType::Config(ConfigEvent::DefaultApplied) => 56,
-            EventType::Config(ConfigEvent::ExternalKeyIgnored) => 57,
             EventType::Config(ConfigEvent::FetchError) => 58,
             EventType::Config(ConfigEvent::ImportExternal) => 59,
             EventType::Config(ConfigEvent::MacroError) => 60,
@@ -447,14 +443,12 @@ impl EventType {
             EventType::Eval(EvalEvent::Error) => 138,
             EventType::Eval(EvalEvent::Result) => 139,
             EventType::Eval(EvalEvent::StoreNotFound) => 140,
-            EventType::FtsIndex(FtsIndexEvent::BlobNotFound) => 141,
-            EventType::FtsIndex(FtsIndexEvent::Index) => 142,
-            EventType::FtsIndex(FtsIndexEvent::LockBusy) => 143,
-            EventType::FtsIndex(FtsIndexEvent::Locked) => 144,
-            EventType::FtsIndex(FtsIndexEvent::MetadataNotFound) => 145,
-            EventType::Housekeeper(HousekeeperEvent::PurgeAccounts) => 146,
-            EventType::Housekeeper(HousekeeperEvent::PurgeSessions) => 147,
-            EventType::Housekeeper(HousekeeperEvent::PurgeStore) => 148,
+            EventType::TaskQueue(TaskQueueEvent::BlobNotFound) => 141,
+            EventType::MessageIngest(MessageIngestEvent::FtsIndex) => 142,
+            EventType::Spam(SpamEvent::TrainAccount) => 143,
+            EventType::TaskQueue(TaskQueueEvent::TaskLocked) => 144,
+            EventType::TaskQueue(TaskQueueEvent::MetadataNotFound) => 145,
+            EventType::Housekeeper(HousekeeperEvent::Run) => 146,
             EventType::Housekeeper(HousekeeperEvent::Schedule) => 149,
             EventType::Housekeeper(HousekeeperEvent::Start) => 150,
             EventType::Housekeeper(HousekeeperEvent::Stop) => 151,
@@ -641,8 +635,6 @@ impl EventType {
             EventType::OutgoingReport(OutgoingReportEvent::DmarcRateLimited) => 332,
             EventType::OutgoingReport(OutgoingReportEvent::DmarcReport) => 333,
             EventType::OutgoingReport(OutgoingReportEvent::HttpSubmission) => 334,
-            EventType::OutgoingReport(OutgoingReportEvent::LockBusy) => 335,
-            EventType::OutgoingReport(OutgoingReportEvent::LockDeleted) => 336,
             EventType::OutgoingReport(OutgoingReportEvent::Locked) => 337,
             EventType::OutgoingReport(OutgoingReportEvent::NoRecipientsFound) => 338,
             EventType::OutgoingReport(OutgoingReportEvent::NotFound) => 339,
@@ -673,7 +665,7 @@ impl EventType {
             EventType::Purge(PurgeEvent::AutoExpunge) => 364,
             EventType::Purge(PurgeEvent::Error) => 365,
             EventType::Purge(PurgeEvent::Finished) => 366,
-            EventType::Purge(PurgeEvent::PurgeActive) => 367,
+            EventType::Purge(PurgeEvent::InProgress) => 367,
             EventType::Purge(PurgeEvent::Running) => 368,
             EventType::Purge(PurgeEvent::Started) => 369,
             EventType::Purge(PurgeEvent::TombstoneCleanup) => 370,
@@ -682,7 +674,6 @@ impl EventType {
             EventType::PushSubscription(PushSubscriptionEvent::Success) => 373,
             EventType::Queue(QueueEvent::BlobNotFound) => 374,
             EventType::Queue(QueueEvent::ConcurrencyLimitExceeded) => 375,
-            EventType::Queue(QueueEvent::LockBusy) => 376,
             EventType::Queue(QueueEvent::Locked) => 377,
             EventType::Queue(QueueEvent::QueueAutogenerated) => 378,
             EventType::Queue(QueueEvent::QueueDsn) => 379,
@@ -764,8 +755,6 @@ impl EventType {
             EventType::Smtp(SmtpEvent::MtPriorityInvalid) => 455,
             EventType::Smtp(SmtpEvent::MultipleMailFrom) => 456,
             EventType::Smtp(SmtpEvent::Noop) => 457,
-            EventType::Smtp(SmtpEvent::PipeError) => 458,
-            EventType::Smtp(SmtpEvent::PipeSuccess) => 459,
             EventType::Smtp(SmtpEvent::Quit) => 460,
             EventType::Smtp(SmtpEvent::RateLimitExceeded) => 461,
             EventType::Smtp(SmtpEvent::RawInput) => 462,
@@ -775,7 +764,7 @@ impl EventType {
             EventType::Smtp(SmtpEvent::RcptToMissing) => 466,
             EventType::Smtp(SmtpEvent::RcptToRewritten) => 467,
             EventType::Smtp(SmtpEvent::RelayNotAllowed) => 468,
-            EventType::Smtp(SmtpEvent::RemoteIdNotFound) => 469,
+            EventType::Smtp(SmtpEvent::IdNotFound) => 469,
             EventType::Smtp(SmtpEvent::RequestTooLarge) => 470,
             EventType::Smtp(SmtpEvent::RequireTlsDisabled) => 471,
             EventType::Smtp(SmtpEvent::Rset) => 472,
@@ -798,8 +787,8 @@ impl EventType {
             EventType::Smtp(SmtpEvent::VrfyNotFound) => 489,
             EventType::Spam(SpamEvent::Classify) => 490,
             EventType::Spam(SpamEvent::ClassifyError) => 491,
-            EventType::Spam(SpamEvent::ListUpdated) => 492,
-            EventType::Spam(SpamEvent::NotEnoughTrainingData) => 493,
+            EventType::Store(StoreEvent::HttpStoreFetch) => 492,
+            EventType::Store(StoreEvent::HttpStoreError) => 493,
             EventType::Spam(SpamEvent::PyzorError) => 494,
             EventType::Spam(SpamEvent::Train) => 495,
             EventType::Spam(SpamEvent::TrainBalance) => 496,
@@ -825,7 +814,7 @@ impl EventType {
             EventType::Store(StoreEvent::ElasticsearchError) => 516,
             EventType::Store(StoreEvent::FilesystemError) => 517,
             EventType::Store(StoreEvent::FoundationdbError) => 518,
-            EventType::Store(StoreEvent::LdapBind) => 519,
+            EventType::Store(StoreEvent::LdapWarning) => 519,
             EventType::Store(StoreEvent::LdapError) => 520,
             EventType::Store(StoreEvent::LdapQuery) => 521,
             EventType::Store(StoreEvent::MysqlError) => 522,
@@ -855,9 +844,55 @@ impl EventType {
             EventType::Tls(TlsEvent::NoCertificatesAvailable) => 546,
             EventType::Tls(TlsEvent::NotConfigured) => 547,
             EventType::Telemetry(TelemetryEvent::Alert) => 548,
-            EventType::Security(SecurityEvent::BruteForceBan) => 549,
+            EventType::Security(SecurityEvent::AbuseBan) => 549,
             EventType::Security(SecurityEvent::LoiterBan) => 550,
             EventType::Smtp(SmtpEvent::MailFromNotAllowed) => 551,
+            EventType::Security(SecurityEvent::Unauthorized) => 552,
+            EventType::Limit(LimitEvent::TenantQuota) => 553,
+            EventType::Auth(AuthEvent::TokenExpired) => 554,
+            EventType::Auth(AuthEvent::ClientRegistration) => 555,
+            EventType::Ai(AiEvent::LlmResponse) => 556,
+            EventType::Ai(AiEvent::ApiError) => 557,
+            EventType::Security(SecurityEvent::ScanBan) => 558,
+            EventType::Store(StoreEvent::AzureError) => 559,
+            EventType::TlsRpt(TlsRptEvent::RecordNotFound) => 560,
+            EventType::Smtp(SmtpEvent::RcptToGreylisted) => 561,
+            EventType::Spam(SpamEvent::Dnsbl) => 562,
+            EventType::Spam(SpamEvent::DnsblError) => 563,
+            EventType::Spam(SpamEvent::Pyzor) => 564,
+            EventType::Queue(QueueEvent::BackPressure) => 48,
+            EventType::Imap(ImapEvent::GetQuota) => 57,
+            EventType::WebDav(WebDavEvent::Propfind) => 147,
+            EventType::WebDav(WebDavEvent::Proppatch) => 148,
+            EventType::WebDav(WebDavEvent::Get) => 335,
+            EventType::WebDav(WebDavEvent::Report) => 336,
+            EventType::WebDav(WebDavEvent::Mkcol) => 376,
+            EventType::WebDav(WebDavEvent::Delete) => 458,
+            EventType::WebDav(WebDavEvent::Put) => 459,
+            EventType::WebDav(WebDavEvent::Post) => 565,
+            EventType::WebDav(WebDavEvent::Patch) => 566,
+            EventType::WebDav(WebDavEvent::Copy) => 567,
+            EventType::WebDav(WebDavEvent::Move) => 568,
+            EventType::WebDav(WebDavEvent::Lock) => 569,
+            EventType::WebDav(WebDavEvent::Unlock) => 570,
+            EventType::WebDav(WebDavEvent::Acl) => 571,
+            EventType::WebDav(WebDavEvent::Error) => 572,
+            EventType::WebDav(WebDavEvent::Options) => 573,
+            EventType::WebDav(WebDavEvent::Head) => 574,
+            EventType::WebDav(WebDavEvent::Mkcalendar) => 575,
+            EventType::Calendar(CalendarEvent::RuleExpansionError) => 576,
+            EventType::Store(StoreEvent::CacheMiss) => 50,
+            EventType::Store(StoreEvent::CacheHit) => 51,
+            EventType::Store(StoreEvent::CacheStale) => 52,
+            EventType::Store(StoreEvent::CacheUpdate) => 577,
+            EventType::TaskQueue(TaskQueueEvent::TaskAcquired) => 578,
+            EventType::Calendar(CalendarEvent::AlarmSent) => 579,
+            EventType::Calendar(CalendarEvent::AlarmSkipped) => 580,
+            EventType::Calendar(CalendarEvent::AlarmRecipientOverride) => 581,
+            EventType::Calendar(CalendarEvent::AlarmFailed) => 582,
+            EventType::Calendar(CalendarEvent::ItipMessageSent) => 583,
+            EventType::Calendar(CalendarEvent::ItipMessageReceived) => 584,
+            EventType::Calendar(CalendarEvent::ItipMessageError) => 585,
         }
     }
 
@@ -902,25 +937,20 @@ impl EventType {
             36 => Some(EventType::Auth(AuthEvent::MissingTotp)),
             37 => Some(EventType::Auth(AuthEvent::Success)),
             38 => Some(EventType::Auth(AuthEvent::TooManyAttempts)),
-            39 => Some(EventType::Cluster(ClusterEvent::DecryptionError)),
-            40 => Some(EventType::Cluster(ClusterEvent::EmptyPacket)),
-            41 => Some(EventType::Cluster(ClusterEvent::Error)),
-            42 => Some(EventType::Cluster(ClusterEvent::InvalidPacket)),
-            43 => Some(EventType::Cluster(ClusterEvent::OneOrMorePeersOffline)),
-            44 => Some(EventType::Cluster(ClusterEvent::PeerAlive)),
-            45 => Some(EventType::Cluster(ClusterEvent::PeerBackOnline)),
-            46 => Some(EventType::Cluster(ClusterEvent::PeerDiscovered)),
-            47 => Some(EventType::Cluster(ClusterEvent::PeerHasConfigChanges)),
-            48 => Some(EventType::Cluster(ClusterEvent::PeerHasListChanges)),
-            49 => Some(EventType::Cluster(ClusterEvent::PeerLeaving)),
-            50 => Some(EventType::Cluster(ClusterEvent::PeerOffline)),
-            51 => Some(EventType::Cluster(ClusterEvent::PeerSuspected)),
-            52 => Some(EventType::Cluster(ClusterEvent::PeerSuspectedIsAlive)),
+            39 => Some(EventType::Cluster(ClusterEvent::SubscriberStart)),
+            40 => Some(EventType::Cluster(ClusterEvent::SubscriberStop)),
+            41 => Some(EventType::Cluster(ClusterEvent::SubscriberError)),
+            42 => Some(EventType::Cluster(ClusterEvent::SubscriberDisconnected)),
+            43 => Some(EventType::Cluster(ClusterEvent::PublisherStart)),
+            44 => Some(EventType::Cluster(ClusterEvent::PublisherStop)),
+            45 => Some(EventType::Cluster(ClusterEvent::PublisherError)),
+            46 => Some(EventType::Cluster(ClusterEvent::MessageReceived)),
+            47 => Some(EventType::Cluster(ClusterEvent::MessageSkipped)),
+            49 => Some(EventType::Cluster(ClusterEvent::MessageInvalid)),
             53 => Some(EventType::Config(ConfigEvent::AlreadyUpToDate)),
             54 => Some(EventType::Config(ConfigEvent::BuildError)),
             55 => Some(EventType::Config(ConfigEvent::BuildWarning)),
             56 => Some(EventType::Config(ConfigEvent::DefaultApplied)),
-            57 => Some(EventType::Config(ConfigEvent::ExternalKeyIgnored)),
             58 => Some(EventType::Config(ConfigEvent::FetchError)),
             59 => Some(EventType::Config(ConfigEvent::ImportExternal)),
             60 => Some(EventType::Config(ConfigEvent::MacroError)),
@@ -1004,14 +1034,12 @@ impl EventType {
             138 => Some(EventType::Eval(EvalEvent::Error)),
             139 => Some(EventType::Eval(EvalEvent::Result)),
             140 => Some(EventType::Eval(EvalEvent::StoreNotFound)),
-            141 => Some(EventType::FtsIndex(FtsIndexEvent::BlobNotFound)),
-            142 => Some(EventType::FtsIndex(FtsIndexEvent::Index)),
-            143 => Some(EventType::FtsIndex(FtsIndexEvent::LockBusy)),
-            144 => Some(EventType::FtsIndex(FtsIndexEvent::Locked)),
-            145 => Some(EventType::FtsIndex(FtsIndexEvent::MetadataNotFound)),
-            146 => Some(EventType::Housekeeper(HousekeeperEvent::PurgeAccounts)),
-            147 => Some(EventType::Housekeeper(HousekeeperEvent::PurgeSessions)),
-            148 => Some(EventType::Housekeeper(HousekeeperEvent::PurgeStore)),
+            141 => Some(EventType::TaskQueue(TaskQueueEvent::BlobNotFound)),
+            142 => Some(EventType::MessageIngest(MessageIngestEvent::FtsIndex)),
+            143 => Some(EventType::Spam(SpamEvent::TrainAccount)),
+            144 => Some(EventType::TaskQueue(TaskQueueEvent::TaskLocked)),
+            145 => Some(EventType::TaskQueue(TaskQueueEvent::MetadataNotFound)),
+            146 => Some(EventType::Housekeeper(HousekeeperEvent::Run)),
             149 => Some(EventType::Housekeeper(HousekeeperEvent::Schedule)),
             150 => Some(EventType::Housekeeper(HousekeeperEvent::Start)),
             151 => Some(EventType::Housekeeper(HousekeeperEvent::Stop)),
@@ -1224,8 +1252,6 @@ impl EventType {
             334 => Some(EventType::OutgoingReport(
                 OutgoingReportEvent::HttpSubmission,
             )),
-            335 => Some(EventType::OutgoingReport(OutgoingReportEvent::LockBusy)),
-            336 => Some(EventType::OutgoingReport(OutgoingReportEvent::LockDeleted)),
             337 => Some(EventType::OutgoingReport(OutgoingReportEvent::Locked)),
             338 => Some(EventType::OutgoingReport(
                 OutgoingReportEvent::NoRecipientsFound,
@@ -1266,7 +1292,7 @@ impl EventType {
             364 => Some(EventType::Purge(PurgeEvent::AutoExpunge)),
             365 => Some(EventType::Purge(PurgeEvent::Error)),
             366 => Some(EventType::Purge(PurgeEvent::Finished)),
-            367 => Some(EventType::Purge(PurgeEvent::PurgeActive)),
+            367 => Some(EventType::Purge(PurgeEvent::InProgress)),
             368 => Some(EventType::Purge(PurgeEvent::Running)),
             369 => Some(EventType::Purge(PurgeEvent::Started)),
             370 => Some(EventType::Purge(PurgeEvent::TombstoneCleanup)),
@@ -1275,7 +1301,6 @@ impl EventType {
             373 => Some(EventType::PushSubscription(PushSubscriptionEvent::Success)),
             374 => Some(EventType::Queue(QueueEvent::BlobNotFound)),
             375 => Some(EventType::Queue(QueueEvent::ConcurrencyLimitExceeded)),
-            376 => Some(EventType::Queue(QueueEvent::LockBusy)),
             377 => Some(EventType::Queue(QueueEvent::Locked)),
             378 => Some(EventType::Queue(QueueEvent::QueueAutogenerated)),
             379 => Some(EventType::Queue(QueueEvent::QueueDsn)),
@@ -1357,8 +1382,6 @@ impl EventType {
             455 => Some(EventType::Smtp(SmtpEvent::MtPriorityInvalid)),
             456 => Some(EventType::Smtp(SmtpEvent::MultipleMailFrom)),
             457 => Some(EventType::Smtp(SmtpEvent::Noop)),
-            458 => Some(EventType::Smtp(SmtpEvent::PipeError)),
-            459 => Some(EventType::Smtp(SmtpEvent::PipeSuccess)),
             460 => Some(EventType::Smtp(SmtpEvent::Quit)),
             461 => Some(EventType::Smtp(SmtpEvent::RateLimitExceeded)),
             462 => Some(EventType::Smtp(SmtpEvent::RawInput)),
@@ -1368,7 +1391,7 @@ impl EventType {
             466 => Some(EventType::Smtp(SmtpEvent::RcptToMissing)),
             467 => Some(EventType::Smtp(SmtpEvent::RcptToRewritten)),
             468 => Some(EventType::Smtp(SmtpEvent::RelayNotAllowed)),
-            469 => Some(EventType::Smtp(SmtpEvent::RemoteIdNotFound)),
+            469 => Some(EventType::Smtp(SmtpEvent::IdNotFound)),
             470 => Some(EventType::Smtp(SmtpEvent::RequestTooLarge)),
             471 => Some(EventType::Smtp(SmtpEvent::RequireTlsDisabled)),
             472 => Some(EventType::Smtp(SmtpEvent::Rset)),
@@ -1391,8 +1414,8 @@ impl EventType {
             489 => Some(EventType::Smtp(SmtpEvent::VrfyNotFound)),
             490 => Some(EventType::Spam(SpamEvent::Classify)),
             491 => Some(EventType::Spam(SpamEvent::ClassifyError)),
-            492 => Some(EventType::Spam(SpamEvent::ListUpdated)),
-            493 => Some(EventType::Spam(SpamEvent::NotEnoughTrainingData)),
+            492 => Some(EventType::Store(StoreEvent::HttpStoreFetch)),
+            493 => Some(EventType::Store(StoreEvent::HttpStoreError)),
             494 => Some(EventType::Spam(SpamEvent::PyzorError)),
             495 => Some(EventType::Spam(SpamEvent::Train)),
             496 => Some(EventType::Spam(SpamEvent::TrainBalance)),
@@ -1418,7 +1441,7 @@ impl EventType {
             516 => Some(EventType::Store(StoreEvent::ElasticsearchError)),
             517 => Some(EventType::Store(StoreEvent::FilesystemError)),
             518 => Some(EventType::Store(StoreEvent::FoundationdbError)),
-            519 => Some(EventType::Store(StoreEvent::LdapBind)),
+            519 => Some(EventType::Store(StoreEvent::LdapWarning)),
             520 => Some(EventType::Store(StoreEvent::LdapError)),
             521 => Some(EventType::Store(StoreEvent::LdapQuery)),
             522 => Some(EventType::Store(StoreEvent::MysqlError)),
@@ -1452,9 +1475,55 @@ impl EventType {
             546 => Some(EventType::Tls(TlsEvent::NoCertificatesAvailable)),
             547 => Some(EventType::Tls(TlsEvent::NotConfigured)),
             548 => Some(EventType::Telemetry(TelemetryEvent::Alert)),
-            549 => Some(EventType::Security(SecurityEvent::BruteForceBan)),
+            549 => Some(EventType::Security(SecurityEvent::AbuseBan)),
             550 => Some(EventType::Security(SecurityEvent::LoiterBan)),
             551 => Some(EventType::Smtp(SmtpEvent::MailFromNotAllowed)),
+            552 => Some(EventType::Security(SecurityEvent::Unauthorized)),
+            553 => Some(EventType::Limit(LimitEvent::TenantQuota)),
+            554 => Some(EventType::Auth(AuthEvent::TokenExpired)),
+            555 => Some(EventType::Auth(AuthEvent::ClientRegistration)),
+            556 => Some(EventType::Ai(AiEvent::LlmResponse)),
+            557 => Some(EventType::Ai(AiEvent::ApiError)),
+            558 => Some(EventType::Security(SecurityEvent::ScanBan)),
+            559 => Some(EventType::Store(StoreEvent::AzureError)),
+            560 => Some(EventType::TlsRpt(TlsRptEvent::RecordNotFound)),
+            561 => Some(EventType::Smtp(SmtpEvent::RcptToGreylisted)),
+            562 => Some(EventType::Spam(SpamEvent::Dnsbl)),
+            563 => Some(EventType::Spam(SpamEvent::DnsblError)),
+            564 => Some(EventType::Spam(SpamEvent::Pyzor)),
+            48 => Some(EventType::Queue(QueueEvent::BackPressure)),
+            57 => Some(EventType::Imap(ImapEvent::GetQuota)),
+            147 => Some(EventType::WebDav(WebDavEvent::Propfind)),
+            148 => Some(EventType::WebDav(WebDavEvent::Proppatch)),
+            335 => Some(EventType::WebDav(WebDavEvent::Get)),
+            336 => Some(EventType::WebDav(WebDavEvent::Report)),
+            376 => Some(EventType::WebDav(WebDavEvent::Mkcol)),
+            458 => Some(EventType::WebDav(WebDavEvent::Delete)),
+            459 => Some(EventType::WebDav(WebDavEvent::Put)),
+            565 => Some(EventType::WebDav(WebDavEvent::Post)),
+            566 => Some(EventType::WebDav(WebDavEvent::Patch)),
+            567 => Some(EventType::WebDav(WebDavEvent::Copy)),
+            568 => Some(EventType::WebDav(WebDavEvent::Move)),
+            569 => Some(EventType::WebDav(WebDavEvent::Lock)),
+            570 => Some(EventType::WebDav(WebDavEvent::Unlock)),
+            571 => Some(EventType::WebDav(WebDavEvent::Acl)),
+            572 => Some(EventType::WebDav(WebDavEvent::Error)),
+            573 => Some(EventType::WebDav(WebDavEvent::Options)),
+            574 => Some(EventType::WebDav(WebDavEvent::Head)),
+            575 => Some(EventType::WebDav(WebDavEvent::Mkcalendar)),
+            576 => Some(EventType::Calendar(CalendarEvent::RuleExpansionError)),
+            50 => Some(EventType::Store(StoreEvent::CacheMiss)),
+            51 => Some(EventType::Store(StoreEvent::CacheHit)),
+            52 => Some(EventType::Store(StoreEvent::CacheStale)),
+            577 => Some(EventType::Store(StoreEvent::CacheUpdate)),
+            578 => Some(EventType::TaskQueue(TaskQueueEvent::TaskAcquired)),
+            579 => Some(EventType::Calendar(CalendarEvent::AlarmSent)),
+            580 => Some(EventType::Calendar(CalendarEvent::AlarmSkipped)),
+            581 => Some(EventType::Calendar(CalendarEvent::AlarmRecipientOverride)),
+            582 => Some(EventType::Calendar(CalendarEvent::AlarmFailed)),
+            583 => Some(EventType::Calendar(CalendarEvent::ItipMessageSent)),
+            584 => Some(EventType::Calendar(CalendarEvent::ItipMessageReceived)),
+            585 => Some(EventType::Calendar(CalendarEvent::ItipMessageError)),
             _ => None,
         }
     }
@@ -1528,6 +1597,7 @@ impl Key {
             Key::ValidTo => 62,
             Key::Value => 63,
             Key::Version => 64,
+            Key::QueueName => 65,
         }
     }
 
@@ -1598,6 +1668,7 @@ impl Key {
             62 => Some(Key::ValidTo),
             63 => Some(Key::Value),
             64 => Some(Key::Version),
+            65 => Some(Key::QueueName),
             _ => None,
         }
     }

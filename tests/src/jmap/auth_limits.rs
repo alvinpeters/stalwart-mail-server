@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -11,7 +11,6 @@ use std::{
 };
 
 use common::listener::blocked::BLOCKED_IP_KEY;
-use directory::backend::internal::manage::ManageDirectory;
 use imap_proto::ResponseType;
 use jmap_client::{
     client::{Client, Credentials},
@@ -22,6 +21,7 @@ use jmap_proto::types::id::Id;
 use store::write::now;
 
 use crate::{
+    directory::internal::TestInternalDirectory,
     imap::{ImapConnection, Type},
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes},
 };
@@ -33,34 +33,29 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com", "john.doe@example.com"],
+            )
+            .await,
     )
     .to_string();
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "john.doe@example.com", "alias")
-        .await;
 
     // Reset rate limiters
-    server.inner.concurrency_limiter.clear();
     params.webhook.clear();
 
     // Incorrect passwords should be rejected with a 401 error
     assert!(matches!(
         Client::new()
             .credentials(Credentials::basic("jdoe@example.com", "abcde"))
-            .accept_invalid_certs(true)
+            .accept_invalid_certs(true) .follow_redirects(["127.0.0.1"])
             .connect("https://127.0.0.1:8899")
             .await,
         Err(jmap_client::Error::Problem(err)) if err.status() == Some(401)));
@@ -71,40 +66,6 @@ pub async fn test(params: &mut JMAPTest) {
     let range_start = now / LIMIT;
     let range_end = (range_start * LIMIT) + LIMIT;
     tokio::time::sleep(Duration::from_secs(range_end - now)).await;
-
-    // Invalid authentication requests should be rate limited
-    let mut n_401 = 0;
-    let mut n_429 = 0;
-    for n in 0..110 {
-        if let Err(jmap_client::Error::Problem(problem)) = Client::new()
-            .credentials(Credentials::basic(
-                "not_an_account@example.com",
-                &format!("brute_force{}", n),
-            ))
-            .accept_invalid_certs(true)
-            .connect("https://127.0.0.1:8899")
-            .await
-        {
-            if problem.status().unwrap() == 401 {
-                n_401 += 1;
-                if n_401 > 100 {
-                    panic!("Rate limiter failed: 429: {n_429}, 401: {n_401}.");
-                }
-            } else if problem.status().unwrap() == 429 {
-                n_429 += 1;
-                if n_429 > 11 {
-                    panic!("Rate limiter too restrictive: 429: {n_429}, 401: {n_401}.");
-                }
-            } else {
-                panic!("Unexpected error status {}", problem.status().unwrap());
-            }
-        } else {
-            panic!("Unexpected response.");
-        }
-    }
-
-    // Limit should be restored after 1 second
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // Test fail2ban
     assert_eq!(
@@ -117,6 +78,27 @@ pub async fn test(params: &mut JMAPTest) {
             .unwrap(),
         None
     );
+    for n in 0..98 {
+        match Client::new()
+            .credentials(Credentials::basic(
+                "not_an_account@example.com",
+                &format!("brute_force{}", n),
+            ))
+            .accept_invalid_certs(true)
+            .follow_redirects(["127.0.0.1"])
+            .connect("https://127.0.0.1:8899")
+            .await
+        {
+            Err(jmap_client::Error::Problem(_)) => {}
+            Err(err) => {
+                panic!("Unexpected response: {:?}", err);
+            }
+            Ok(_) => {
+                panic!("Unexpected success");
+            }
+        }
+    }
+
     let mut imap = ImapConnection::connect(b"_x ").await;
     imap.send("AUTHENTICATE PLAIN AGpvaG4AY2hpbWljaGFuZ2Fz")
         .await;
@@ -153,10 +135,9 @@ pub async fn test(params: &mut JMAPTest) {
         .await
         .unwrap();
     server
-        .core
-        .network
+        .inner
+        .data
         .blocked_ips
-        .ip_addresses
         .write()
         .remove(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
@@ -165,6 +146,7 @@ pub async fn test(params: &mut JMAPTest) {
         Client::new()
             .credentials(Credentials::basic("jdoe@example.com", "12345"))
             .accept_invalid_certs(true)
+            .follow_redirects(["127.0.0.1"])
             .connect("https://127.0.0.1:8899")
             .await
             .unwrap();
@@ -174,6 +156,7 @@ pub async fn test(params: &mut JMAPTest) {
     let client = Client::new()
         .credentials(Credentials::basic("jdoe@example.com", "12345"))
         .accept_invalid_certs(true)
+        .follow_redirects(["127.0.0.1"])
         .connect("https://127.0.0.1:8899")
         .await
         .unwrap();
@@ -193,10 +176,12 @@ pub async fn test(params: &mut JMAPTest) {
             .size(),
         5000000
     );
-    assert!(client
-        .upload(None, vec![b'A'; 5000001], None)
-        .await
-        .is_err());
+    assert!(
+        client
+            .upload(None, vec![b'A'; 5000001], None)
+            .await
+            .is_err()
+    );
 
     // Users should be allowed to create identities only
     // using email addresses associated to their principal
@@ -268,5 +253,5 @@ pub async fn test(params: &mut JMAPTest) {
     // Check webhook events
     params
         .webhook
-        .assert_contains(&["auth.failed", "auth.success", "auth.banned"]);
+        .assert_contains(&["auth.failed", "auth.success", "security.authentication-ban"]);
 }

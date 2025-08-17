@@ -1,18 +1,18 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use trc::AddContext;
 use utils::config::ConfigKey;
 
-use crate::Core;
+use crate::Server;
 
 use super::AcmeProvider;
 
-impl Core {
+impl Server {
     pub(crate) async fn load_cert(&self, provider: &AcmeProvider) -> trc::Result<Option<Vec<u8>>> {
         self.read_if_exists(provider, "cert", provider.domains.as_slice())
             .await
@@ -68,6 +68,7 @@ impl Core {
         items: &[String],
     ) -> trc::Result<Option<Vec<u8>>> {
         if let Some(content) = self
+            .core
             .storage
             .config
             .get(self.build_key(provider, class, items))
@@ -94,12 +95,16 @@ impl Core {
         items: &[String],
         contents: impl AsRef<[u8]>,
     ) -> trc::Result<()> {
-        self.storage
+        self.core
+            .storage
             .config
-            .set([ConfigKey {
-                key: self.build_key(provider, class, items),
-                value: URL_SAFE_NO_PAD.encode(contents.as_ref()),
-            }])
+            .set(
+                [ConfigKey {
+                    key: self.build_key(provider, class, items),
+                    value: URL_SAFE_NO_PAD.encode(contents.as_ref()),
+                }],
+                true,
+            )
             .await
     }
 

@@ -1,134 +1,138 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{DeliveryEvent, DeliveryResult, IngestMessage};
-use smtp_proto::Response;
-use tokio::sync::{mpsc, oneshot};
-use trc::ServerEvent;
-
-use crate::queue::{
-    Error, ErrorDetails, HostResponse, Message, Recipient, Status, RCPT_STATUS_CHANGED,
+use crate::{
+    outbound::DeliveryResult,
+    queue::{
+        Error, ErrorDetails, FROM_AUTHENTICATED, FROM_UNAUTHENTICATED_DMARC, HostResponse,
+        MessageSource, MessageWrapper, Status, UnexpectedResponse, quota::HasQueueQuota,
+        spool::SmtpSpool,
+    },
+    reporting::SmtpReporting,
 };
+use common::Server;
+use email::message::delivery::{IngestMessage, LocalDeliveryStatus, MailDelivery};
+use smtp_proto::Response;
+use trc::SieveEvent;
 
-impl Message {
-    pub async fn deliver_local(
+impl MessageWrapper {
+    pub(super) async fn deliver_local(
         &self,
-        recipients: impl Iterator<Item = &mut Recipient>,
-        delivery_tx: &mpsc::Sender<DeliveryEvent>,
-    ) -> Status<(), Error> {
+        rcpt_idxs: &[usize],
+        statuses: &mut Vec<DeliveryResult>,
+        server: &Server,
+    ) {
         // Prepare recipients list
-        let mut total_rcpt = 0;
-        let mut total_completed = 0;
         let mut pending_recipients = Vec::new();
         let mut recipient_addresses = Vec::new();
-        for rcpt in recipients {
-            total_rcpt += 1;
-            if matches!(
-                &rcpt.status,
-                Status::Completed(_) | Status::PermanentFailure(_)
-            ) {
-                total_completed += 1;
-                continue;
-            }
-            recipient_addresses.push(rcpt.address_lcase.clone());
-            pending_recipients.push(rcpt);
+        for &rcpt_idx in rcpt_idxs {
+            let rcpt_addr = self.message.recipients[rcpt_idx].address();
+            recipient_addresses.push(rcpt_addr.to_lowercase());
+            pending_recipients.push((rcpt_idx, rcpt_addr));
         }
 
-        // Create oneshot channel
-        let (result_tx, result_rx) = oneshot::channel();
-
-        // Deliver message to JMAP server
-        let delivery_result = match delivery_tx
-            .send(DeliveryEvent::Ingest {
-                message: IngestMessage {
-                    sender_address: self.return_path_lcase.clone(),
-                    recipients: recipient_addresses,
-                    message_blob: self.blob_hash.clone(),
-                    message_size: self.size,
-                    session_id: self.span_id,
-                },
-                result_tx,
+        // Deliver message
+        let delivery_result = server
+            .deliver_message(IngestMessage {
+                sender_address: self.message.return_path.clone(),
+                sender_authenticated: self.message.flags
+                    & (FROM_UNAUTHENTICATED_DMARC | FROM_AUTHENTICATED)
+                    != 0,
+                recipients: recipient_addresses,
+                message_blob: self.message.blob_hash.clone(),
+                message_size: self.message.size,
+                session_id: self.span_id,
             })
-            .await
-        {
-            Ok(_) => {
-                // Wait for result
-                match result_rx.await {
-                    Ok(delivery_result) => delivery_result,
-                    Err(_) => {
-                        trc::event!(
-                            Server(ServerEvent::ThreadError),
-                            CausedBy = trc::location!(),
-                            SpanId = self.span_id,
-                            Reason = "Result channel closed",
-                        );
-                        return Status::local_error();
-                    }
-                }
-            }
-            Err(_) => {
-                trc::event!(
-                    Server(ServerEvent::ThreadError),
-                    CausedBy = trc::location!(),
-                    SpanId = self.span_id,
-                    Reason = "TX channel closed",
-                );
-                return Status::local_error();
-            }
-        };
+            .await;
 
         // Process delivery results
-        for (rcpt, result) in pending_recipients.into_iter().zip(delivery_result) {
-            rcpt.flags |= RCPT_STATUS_CHANGED;
-            match result {
-                DeliveryResult::Success => {
-                    rcpt.status = Status::Completed(HostResponse {
-                        hostname: "localhost".to_string(),
-                        response: Response {
-                            code: 250,
-                            esc: [2, 1, 5],
-                            message: "OK".to_string(),
-                        },
-                    });
-                    total_completed += 1;
+        for ((rcpt_idx, rcpt_addr), result) in
+            pending_recipients.into_iter().zip(delivery_result.status)
+        {
+            let status = match result {
+                LocalDeliveryStatus::Success => Status::Completed(HostResponse {
+                    hostname: "localhost".into(),
+                    response: Response {
+                        code: 250,
+                        esc: [2, 1, 5],
+                        message: "OK".into(),
+                    },
+                }),
+                LocalDeliveryStatus::TemporaryFailure { reason } => {
+                    Status::TemporaryFailure(ErrorDetails {
+                        entity: "localhost".into(),
+                        details: Error::UnexpectedResponse(UnexpectedResponse {
+                            command: format!("RCPT TO:<{rcpt_addr}>"),
+                            response: Response {
+                                code: 451,
+                                esc: [4, 3, 0],
+                                message: reason.into(),
+                            },
+                        }),
+                    })
                 }
-                DeliveryResult::TemporaryFailure { reason } => {
-                    rcpt.status = Status::TemporaryFailure(HostResponse {
-                        hostname: ErrorDetails {
-                            entity: "localhost".to_string(),
-                            details: format!("RCPT TO:<{}>", rcpt.address),
-                        },
-                        response: Response {
-                            code: 451,
-                            esc: [4, 3, 0],
-                            message: reason.into_owned(),
-                        },
-                    });
+                LocalDeliveryStatus::PermanentFailure { code, reason } => {
+                    Status::PermanentFailure(ErrorDetails {
+                        entity: "localhost".into(),
+                        details: Error::UnexpectedResponse(UnexpectedResponse {
+                            command: format!("RCPT TO:<{rcpt_addr}>"),
+                            response: Response {
+                                code: 550,
+                                esc: code,
+                                message: reason.into(),
+                            },
+                        }),
+                    })
                 }
-                DeliveryResult::PermanentFailure { code, reason } => {
-                    total_completed += 1;
-                    rcpt.status = Status::PermanentFailure(HostResponse {
-                        hostname: ErrorDetails {
-                            entity: "localhost".to_string(),
-                            details: format!("RCPT TO:<{}>", rcpt.address),
-                        },
-                        response: Response {
-                            code: 550,
-                            esc: code,
-                            message: reason.into_owned(),
-                        },
-                    });
-                }
-            }
+            };
+            statuses.push(DeliveryResult::account(status, rcpt_idx));
         }
 
-        if total_completed == total_rcpt {
-            Status::Completed(())
-        } else {
-            Status::Scheduled
+        // Process autogenerated messages
+        for autogenerated in delivery_result.autogenerated {
+            let mut message = server.new_message(autogenerated.sender_address, self.span_id);
+            for rcpt in autogenerated.recipients {
+                message.add_recipient(rcpt, server).await;
+            }
+
+            // Sign message
+            let signature = server
+                .sign_message(
+                    &mut message,
+                    &server.core.sieve.sign,
+                    &autogenerated.message,
+                )
+                .await;
+
+            // Queue Message
+            message.message.size =
+                (autogenerated.message.len() + signature.as_ref().map_or(0, |s| s.len())) as u64;
+            if server.has_quota(&mut message).await {
+                message
+                    .queue(
+                        signature.as_deref(),
+                        &autogenerated.message,
+                        self.span_id,
+                        server,
+                        MessageSource::Autogenerated,
+                    )
+                    .await;
+            } else {
+                trc::event!(
+                    Sieve(SieveEvent::QuotaExceeded),
+                    SpanId = self.span_id,
+                    From = message.message.return_path,
+                    To = message
+                        .message
+                        .recipients
+                        .into_iter()
+                        .map(|r| trc::Value::from(r.address().to_string()))
+                        .collect::<Vec<_>>(),
+                );
+            }
         }
     }
 }

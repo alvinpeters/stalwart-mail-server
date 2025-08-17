@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: LicenseRef-SEL
  *
@@ -11,19 +11,20 @@
 use std::{sync::Arc, time::Duration};
 
 use common::{
+    Core, Server,
     config::telemetry::{StoreTracer, TelemetrySubscriberType},
+    core::BuildServer,
     enterprise::{
-        config::parse_metric_alerts, license::LicenseKey, undelete::DeletedBlob, Enterprise,
-        MetricStore, TraceStore, Undelete,
+        Enterprise, MetricStore, TraceStore, Undelete, config::parse_metric_alerts,
+        license::LicenseKey, undelete::DeletedBlob,
     },
     telemetry::{
         metrics::store::{Metric, MetricsStore, SharedMetricHistory},
         tracers::store::{TracingQuery, TracingStore},
     },
-    Core,
 };
+use http::management::enterprise::undelete::{UndeleteRequest, UndeleteResponse};
 use imap_proto::ResponseType;
-use jmap::api::management::enterprise::undelete::{UndeleteRequest, UndeleteResponse};
 use store::{
     rand::{self, Rng},
     write::now,
@@ -32,36 +33,37 @@ use trc::{
     ipc::{bitset::Bitset, subscriber::SubscriberBuilder},
     *,
 };
-use utils::config::{cron::SimpleCron, Config};
+use utils::config::{Config, cron::SimpleCron};
 
 use crate::{
+    AssertConfig,
+    directory::internal::TestInternalDirectory,
     imap::{ImapConnection, Type},
     jmap::delivery::SmtpConnection,
-    AssertConfig,
 };
 
-use super::{delivery::AssertResult, JMAPTest, ManagementApi};
+use super::{JMAPTest, ManagementApi, delivery::AssertResult};
 
 const METRICS_CONFIG: &str = r#"
 [metrics.alerts.expected]
 enable = true
-condition = "domain_count > 1 && cluster_error > 3"
+condition = "domain_count > 1 && cluster_publisher_error > 3"
 
 [metrics.alerts.expected.notify.event]
 enable = true
-message = "Yikes! Found %{cluster.error}% cluster errors!"
+message = "Yikes! Found %{cluster.publisher-error}% cluster errors!"
 
 [metrics.alerts.expected.notify.email]
 enable = true
 from-name = "Alert Subsystem"
 from-addr = "alert@example.com"
 to = ["jdoe@example.com"]
-subject = "Found %{cluster.error}% cluster errors"
-body = "Sorry for the bad news, but we found %{domain.count}% domains and %{cluster.error}% cluster errors."
+subject = "Found %{cluster.publisher-error}% cluster errors"
+body = "Sorry for the bad news, but we found %{domain.count}% domains and %{cluster.publisher-error}% cluster errors."
 
 [metrics.alerts.unexpected]
 enable = true
-condition = "domain_count < 1 || cluster_error < 3"
+condition = "domain_count < 1 || cluster_publisher_error < 3"
 
 [metrics.alerts.unexpected.notify.event]
 enable = true
@@ -78,13 +80,14 @@ test
 
 pub async fn test(params: &mut JMAPTest) {
     // Enable Enterprise
-    let mut core = params.server.shared_core.load_full().as_ref().clone();
+    println!("Running Enterprise tests...");
+    let mut core = params.server.inner.shared_core.load_full().as_ref().clone();
     let mut config = Config::new(METRICS_CONFIG).unwrap();
     core.enterprise = Enterprise {
         license: LicenseKey {
             valid_to: now() + 3600,
             valid_from: now() - 3600,
-            hostname: String::new(),
+            domain: String::new(),
             accounts: 100,
         },
         undelete: Undelete {
@@ -103,34 +106,93 @@ pub async fn test(params: &mut JMAPTest) {
         }
         .into(),
         metrics_alerts: parse_metric_alerts(&mut config),
+        logo_url: None,
+        ai_apis: Default::default(),
+        spam_filter_llm: None,
+        template_calendar_alarm: None,
+        template_scheduling_email: None,
+        template_scheduling_web: None,
     }
     .into();
     config.assert_no_errors();
     assert_ne!(core.enterprise.as_ref().unwrap().metrics_alerts.len(), 0);
-    params.server.shared_core.store(core.into());
-    assert!(params.server.shared_core.load().is_enterprise_edition());
+    params.server.inner.shared_core.store(core.into());
+    assert!(
+        params
+            .server
+            .inner
+            .shared_core
+            .load()
+            .is_enterprise_edition()
+    );
 
     // Create test account
     params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "secret", "John Doe")
+        .server
+        .inner
+        .shared_core
+        .load()
+        .storage
+        .data
+        .create_test_user(
+            "jdoe@example.com",
+            "secret",
+            "John Doe",
+            &["jdoe@example.com"],
+        )
         .await;
 
-    alerts(&params.server.shared_core.load()).await;
+    alerts(&params.server.inner.build_server()).await;
     undelete(params).await;
     tracing(params).await;
     metrics(params).await;
 
-    // Disable Enterprise
-    let mut core = params.server.shared_core.load_full().as_ref().clone();
-    core.enterprise = None;
-    params.server.shared_core.store(core.into());
+    params.server.inner.shared_core.store(
+        params
+            .server
+            .inner
+            .shared_core
+            .load_full()
+            .as_ref()
+            .clone()
+            .enable_enterprise()
+            .into(),
+    );
 }
 
-async fn alerts(core: &Core) {
+pub trait EnterpriseCore {
+    fn enable_enterprise(self) -> Self;
+}
+
+impl EnterpriseCore for Core {
+    fn enable_enterprise(mut self) -> Self {
+        self.enterprise = Enterprise {
+            license: LicenseKey {
+                valid_to: now() + 3600,
+                valid_from: now() - 3600,
+                domain: String::new(),
+                accounts: 100,
+            },
+            undelete: None,
+            trace_store: None,
+            metrics_store: None,
+            metrics_alerts: vec![],
+            logo_url: None,
+            ai_apis: Default::default(),
+            spam_filter_llm: None,
+            template_calendar_alarm: None,
+            template_scheduling_email: None,
+            template_scheduling_web: None,
+        }
+        .into();
+        self
+    }
+}
+
+async fn alerts(server: &Server) {
     // Make sure the required metrics are set to 0
     assert_eq!(
-        Collector::read_event_metric(EventType::Cluster(ClusterEvent::Error).id()),
+        Collector::read_event_metric(EventType::Cluster(ClusterEvent::PublisherError).id()),
         0
     );
     assert_eq!(Collector::read_metric(MetricType::DomainCount), 0.0);
@@ -140,18 +202,18 @@ async fn alerts(core: &Core) {
     );
 
     // Increment metrics to trigger alerts
-    Collector::update_event_counter(EventType::Cluster(ClusterEvent::Error), 5);
+    Collector::update_event_counter(EventType::Cluster(ClusterEvent::PublisherError), 5);
     Collector::update_gauge(MetricType::DomainCount, 3);
 
     // Make sure the values were set
     assert_eq!(
-        Collector::read_event_metric(EventType::Cluster(ClusterEvent::Error).id()),
+        Collector::read_event_metric(EventType::Cluster(ClusterEvent::PublisherError).id()),
         5
     );
     assert_eq!(Collector::read_metric(MetricType::DomainCount), 3.0);
 
     // Process alerts
-    let message = core.process_alerts().await.unwrap().pop().unwrap();
+    let message = server.process_alerts().await.unwrap().pop().unwrap();
     assert_eq!(message.from, "alert@example.com");
     assert_eq!(message.to, vec!["jdoe@example.com".to_string()]);
     let body = String::from_utf8(message.body).unwrap();
@@ -408,7 +470,8 @@ pub async fn insert_test_metrics(core: Arc<Core>) {
             EventType::MessageIngest(MessageIngestEvent::Spam),
             EventType::Auth(AuthEvent::Failed),
             EventType::Security(SecurityEvent::AuthenticationBan),
-            EventType::Security(SecurityEvent::BruteForceBan),
+            EventType::Security(SecurityEvent::ScanBan),
+            EventType::Security(SecurityEvent::AbuseBan),
             EventType::Security(SecurityEvent::LoiterBan),
             EventType::Security(SecurityEvent::IpBlocked),
             EventType::IncomingReport(IncomingReportEvent::DmarcReport),
@@ -417,16 +480,13 @@ pub async fn insert_test_metrics(core: Arc<Core>) {
             EventType::IncomingReport(IncomingReportEvent::TlsReportWithWarnings),
         ] {
             // Generate a random value between 0 and 100
-            Collector::update_event_counter(event_type, rand::thread_rng().gen_range(0..=100))
+            Collector::update_event_counter(event_type, rand::rng().random_range(0..=100))
         }
 
-        Collector::update_gauge(
-            MetricType::QueueCount,
-            rand::thread_rng().gen_range(0..=1000),
-        );
+        Collector::update_gauge(MetricType::QueueCount, rand::rng().random_range(0..=1000));
         Collector::update_gauge(
             MetricType::ServerMemory,
-            rand::thread_rng().gen_range(100 * 1024 * 1024..=300 * 1024 * 1024),
+            rand::rng().random_range(100 * 1024 * 1024..=300 * 1024 * 1024),
         );
 
         for metric_type in [
@@ -435,11 +495,11 @@ pub async fn insert_test_metrics(core: Arc<Core>) {
             MetricType::DeliveryTime,
             MetricType::DnsLookupTime,
         ] {
-            Collector::update_histogram(metric_type, rand::thread_rng().gen_range(2..=1000))
+            Collector::update_histogram(metric_type, rand::rng().random_range(2..=1000))
         }
         Collector::update_histogram(
             MetricType::DeliveryTotalTime,
-            rand::thread_rng().gen_range(1000..=5000),
+            rand::rng().random_range(1000..=5000),
         );
 
         store

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -12,6 +12,7 @@ pub mod utils;
 use std::{collections::BTreeMap, time::Duration};
 
 use ahash::AHashMap;
+use compact_str::CompactString;
 use serde::Serialize;
 
 #[derive(Debug, Default, Serialize)]
@@ -27,6 +28,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
 pub enum ConfigWarning {
     Missing,
     AppliedDefault { default: String },
@@ -37,6 +39,7 @@ pub enum ConfigWarning {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
 pub enum ConfigError {
     Parse { error: String },
     Build { error: String },
@@ -55,7 +58,7 @@ pub struct Rate {
     pub period: Duration,
 }
 
-pub(crate) type Result<T> = std::result::Result<T, String>;
+pub type Result<T> = std::result::Result<T, String>;
 
 impl Config {
     pub async fn resolve_macros(&mut self, classes: &[&str]) {
@@ -188,7 +191,11 @@ impl Config {
                 ),
             };
 
-            trc::error!(trc::EventType::Config(cause).into_err().details(message));
+            trc::error!(
+                trc::EventType::Config(cause)
+                    .into_err()
+                    .details(CompactString::from(message))
+            );
         }
     }
 
@@ -220,7 +227,11 @@ impl Config {
                 ),
             };
 
-            trc::error!(trc::EventType::Config(cause).into_err().details(message));
+            trc::error!(
+                trc::EventType::Config(cause)
+                    .into_err()
+                    .details(CompactString::from(message))
+            );
         }
     }
 }

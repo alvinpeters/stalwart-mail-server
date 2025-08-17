@@ -1,16 +1,16 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::time::Duration;
 
-use crate::smtp::{inbound::TestQueueEvent, outbound::TestServer, session::TestSession};
+use crate::smtp::{TestSMTP, inbound::TestQueueEvent, session::TestSession};
 
 use store::{
-    write::{ReportClass, ValueClass},
     IterateParams, ValueKey,
+    write::{ReportClass, ValueClass},
 };
 
 const CONFIG: &str = r#"
@@ -28,16 +28,16 @@ store = "1s"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn report_analyze() {
-        // Enable logging
-        crate::enable_logging();
+    // Enable logging
+    crate::enable_logging();
 
     // Create temp dir for queue
-    let mut local = TestServer::new("smtp_analyze_report_test", CONFIG, true).await;
+    let mut local = TestSMTP::new("smtp_analyze_report_test", CONFIG).await;
 
     // Create test message
     let mut session = local.new_session();
-    let qr = &mut local.qr;
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let qr = &mut local.queue_receiver;
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx.test.org").await;
 
@@ -116,6 +116,6 @@ async fn report_analyze() {
     session
         .send_message("john@test.org", &["bill@foobar.org"], "test:no_dkim", "250")
         .await;
-    qr.read_event().await.assert_reload();
+    qr.read_event().await.assert_refresh();
     qr.last_queued_message().await;
 }

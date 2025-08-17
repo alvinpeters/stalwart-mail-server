@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,22 +9,25 @@ use common::Core;
 use store::Stores;
 use utils::config::Config;
 
-use crate::smtp::{
-    build_smtp,
-    session::{TestSession, VerifyResponse},
-    TempDir,
+use crate::{
+    AssertConfig,
+    smtp::{
+        TempDir, TestSMTP,
+        session::{TestSession, VerifyResponse},
+    },
 };
-use smtp::core::{Inner, Session, State};
+use smtp::core::{Session, State};
 
 const CONFIG: &str = r#"
 [storage]
-data = "sqlite"
-lookup = "sqlite"
-blob = "sqlite"
-fts = "sqlite"
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+directory = "local"
 
-[store."sqlite"]
-type = "sqlite"
+[store."rocksdb"]
+type = "rocksdb"
 path = "{TMP}/queue.db"
 
 [directory."local"]
@@ -72,12 +75,13 @@ async fn auth() {
 
     let tmp_dir = TempDir::new("smtp_auth_test", true);
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
-    let stores = Stores::parse_all(&mut config).await;
+    let stores = Stores::parse_all(&mut config, false).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // EHLO should not advertise plain text auth without TLS
-    let mut session = Session::test(build_smtp(core, Inner::default()));
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.stream.tls = false;
     session
@@ -106,7 +110,7 @@ async fn auth() {
         .ingest(b"AUTH PLAIN AGpvaG4AY2hpbWljaGFuZ2Fz\r\n")
         .await
         .unwrap_err();
-    session.response().assert_code("421 4.3.0");
+    session.response().assert_code("455 4.3.0");
 
     // Should not be able to send without authenticating
     session.state = State::default();
@@ -138,13 +142,13 @@ async fn auth() {
         .assert_contains("FUTURERELEASE 86400");
 
     // Successful LOGIN authentication
-    session.data.authenticated_as.clear();
+    session.data.authenticated_as.take();
     session.cmd("AUTH LOGIN", "334").await;
     session.cmd("amFuZQ==", "334").await;
     session.cmd("cDRzc3cwcmQ=", "235 2.7.0").await;
 
     // Login should not be advertised to 10.0.0.2
-    session.data.remote_ip_str = "10.0.0.2".to_string();
+    session.data.remote_ip_str = "10.0.0.2".into();
     session.eval_session_params().await;
     session.stream.tls = true;
     session

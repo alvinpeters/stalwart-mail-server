@@ -1,15 +1,14 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::backend::internal::manage::ManageDirectory;
 use jmap_client::{
+    Error,
     core::set::{SetError, SetErrorType},
     email, mailbox,
     sieve::query::{Comparator, Filter},
-    Error,
 };
 use jmap_proto::types::id::Id;
 use std::{
@@ -18,11 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::jmap::{
-    assert_is_empty,
-    delivery::SmtpConnection,
-    email_submission::{assert_message_delivery, spawn_mock_smtp_server, MockMessage},
-    mailbox::destroy_all_mailboxes,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{
+        assert_is_empty,
+        delivery::SmtpConnection,
+        email_submission::{MockMessage, assert_message_delivery, spawn_mock_smtp_server},
+        mailbox::destroy_all_mailboxes,
+    },
+    smtp::DnsCache,
 };
 
 use super::JMAPTest;
@@ -33,18 +36,18 @@ pub async fn test(params: &mut JMAPTest) {
     let client = &mut params.client;
 
     // Create test account
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
     client.set_default_account_id(&account_id);
@@ -274,7 +277,7 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Start mock SMTP server
     let (mut smtp_rx, smtp_settings) = spawn_mock_smtp_server();
-    server.core.smtp.resolvers.dns.ipv4_add(
+    server.ipv4_add(
         "localhost",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + Duration::from_secs(10),
@@ -343,6 +346,40 @@ pub async fn test(params: &mut JMAPTest) {
             "<>",
             ["<bill@remote.org>"],
             "@Rejected from an included script",
+        ),
+    )
+    .await;
+
+    // Run include global tests
+    client
+        .sieve_script_create(
+            "test_include_global",
+            get_script("test_include_global"),
+            true,
+        )
+        .await
+        .unwrap();
+    lmtp.ingest(
+        "bill@remote.org",
+        &["jdoe@example.com"],
+        concat!(
+            "From: bill@remote.org\r\n",
+            "Bcc: Undisclosed recipients;\r\n",
+            "Message-ID: <1234@example.com>\r\n",
+            "Subject: Holidays\r\n",
+            "\r\n",
+            "Remember to file your T.P.S. reports before ",
+            "going on holidays."
+        ),
+    )
+    .await;
+
+    assert_message_delivery(
+        &mut smtp_rx,
+        MockMessage::new(
+            "<>",
+            ["<bill@remote.org>"],
+            "@Rejected from a global script",
         ),
     )
     .await;

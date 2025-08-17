@@ -1,41 +1,38 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use base64::{engine::general_purpose, Engine};
-use common::{config::server::Servers, listener::SessionData, Core};
-use directory::backend::internal::manage::ManageDirectory;
+use base64::{Engine, engine::general_purpose};
+use common::{Caches, Core, Data, Inner, config::server::Listeners, listener::SessionData};
 use ece::EcKeyComponents;
-use hyper::{body, header::CONTENT_ENCODING, server::conn::http1, service::service_fn, StatusCode};
+use http_proto::{HtmlResponse, ToHttpResponse, request::fetch_body};
+use hyper::{StatusCode, body, header::CONTENT_ENCODING, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use jmap::{
-    api::{
-        http::{fetch_body, ToHttpResponse},
-        HtmlResponse, StateChangeResponse,
-    },
-    push::ece::ece_encrypt,
-};
 use jmap_client::{mailbox::Role, push_subscription::Keys};
-use jmap_proto::types::{id::Id, type_state::DataType};
+use jmap_proto::{
+    response::status::StateChangeResponse,
+    types::{id::Id, type_state::DataType},
+};
+use services::state_manager::ece::ece_encrypt;
 use store::ahash::AHashSet;
 
 use tokio::sync::mpsc;
 use utils::config::Config;
 
 use crate::{
-    add_test_certs,
+    AssertConfig, add_test_certs,
+    directory::internal::TestInternalDirectory,
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, test_account_login},
-    AssertConfig,
 };
 
 use super::JMAPTest;
@@ -43,7 +40,9 @@ use super::JMAPTest;
 const SERVER: &str = r#"
 [server]
 hostname = "'jmap-push.example.org'"
-http.url = "'https://127.0.0.1:9000'"
+
+[http]
+url = "'https://127.0.0.1:9000'"
 
 [server.listener.jmap]
 bind = ['127.0.0.1:9000']
@@ -64,19 +63,20 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     );
+
     params.client.set_default_account_id(account_id);
     let client = test_account_login("jdoe@example.com", "12345").await;
 
@@ -98,20 +98,29 @@ pub async fn test(params: &mut JMAPTest) {
     // Start mock push server
     let mut settings = Config::new(add_test_certs(SERVER)).unwrap();
     settings.resolve_all_macros().await;
-    let mock_core = Core::parse(&mut settings, Default::default(), Default::default())
-        .await
-        .into_shared();
+    let mock_inner = Arc::new(Inner {
+        shared_core: Core::parse(&mut settings, Default::default(), Default::default())
+            .await
+            .into_shared(),
+        data: Data::parse(&mut settings),
+        cache: Caches::parse(&mut settings),
+        ..Default::default()
+    });
     settings.errors.clear();
     settings.warnings.clear();
-    let mut servers = Servers::parse(&mut settings);
-    servers.parse_tcp_acceptors(&mut settings, mock_core.clone());
+    let mut servers = Listeners::parse(&mut settings);
+    servers.parse_tcp_acceptors(&mut settings, mock_inner.clone());
 
     // Start JMAP server
-    let manager = SessionManager::from(push_server.clone());
     servers.bind_and_drop_priv(&mut settings);
     settings.assert_no_errors();
     let _shutdown_tx = servers.spawn(|server, acceptor, shutdown_rx| {
-        server.spawn(manager.clone(), mock_core.clone(), acceptor, shutdown_rx);
+        server.spawn(
+            SessionManager::from(push_server.clone()),
+            mock_inner.clone(),
+            acceptor,
+            shutdown_rx,
+        );
     });
 
     // Register push notification (no encryption)
@@ -303,9 +312,7 @@ impl common::listener::SessionManager for SessionManager {
                             let is_encrypted = req
                                 .headers()
                                 .get(CONTENT_ENCODING)
-                                .map_or(false, |encoding| {
-                                    encoding.to_str().unwrap() == "aes128gcm"
-                                });
+                                .is_some_and(|encoding| encoding.to_str().unwrap() == "aes128gcm");
                             let body = fetch_body(&mut req, 1024 * 1024, 0).await.unwrap();
                             let message = serde_json::from_slice::<PushMessage>(&if is_encrypted {
                                 ece::decrypt(

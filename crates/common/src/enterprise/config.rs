@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: LicenseRef-SEL
  *
@@ -8,49 +8,121 @@
  *
  */
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use jmap_proto::types::collection::Collection;
-use store::{BitmapKey, Store, Stores};
+use ahash::AHashMap;
+use directory::{Type, backend::internal::manage::ManageDirectory};
+use store::{Store, Stores};
 use trc::{EventType, MetricType, TOTAL_EVENT_COUNT};
-use utils::config::{
-    cron::SimpleCron,
-    utils::{AsKey, ParseValue},
-    Config,
+use utils::{
+    config::{
+        Config, ConfigKey,
+        cron::SimpleCron,
+        utils::{AsKey, ParseValue},
+    },
+    template::Template,
 };
 
-use crate::expr::{tokenizer::TokenMap, Expression};
+use crate::{
+    expr::{Expression, tokenizer::TokenMap},
+    manager::config::ConfigManager,
+};
 
 use super::{
-    license::LicenseValidator, AlertContent, AlertContentToken, AlertMethod, Enterprise,
-    MetricAlert, MetricStore, TraceStore, Undelete,
+    AlertContent, AlertContentToken, AlertMethod, Enterprise, MetricAlert, MetricStore,
+    SpamFilterLlmConfig, TraceStore, Undelete, license::LicenseKey, llm::AiApiConfig,
 };
 
 impl Enterprise {
-    pub async fn parse(config: &mut Config, stores: &Stores, data: &Store) -> Option<Self> {
-        let license = match LicenseValidator::new()
-            .try_parse(config.value("enterprise.license-key")?)
-            .and_then(|key| {
-                key.into_validated_key(config.value("lookup.default.hostname").unwrap_or_default())
-            }) {
-            Ok(key) => key,
+    pub async fn parse(
+        config: &mut Config,
+        config_manager: &ConfigManager,
+        stores: &Stores,
+        data: &Store,
+    ) -> Option<Self> {
+        let server_hostname = config
+            .value("server.hostname")
+            .or_else(|| config.value("lookup.default.hostname"))?;
+        let mut update_license = None;
+
+        let license_result = match (
+            config.value("enterprise.license-key"),
+            config.value("enterprise.api-key"),
+        ) {
+            (Some(license_key), maybe_api_key) => {
+                match (LicenseKey::new(license_key, server_hostname), maybe_api_key) {
+                    (Ok(license), Some(api_key)) if license.is_near_expiration() => Ok(license
+                        .try_renew(api_key)
+                        .await
+                        .map(|result| {
+                            update_license = Some(result.encoded_key);
+                            result.key
+                        })
+                        .unwrap_or(license)),
+                    (Ok(license), None) => Ok(license),
+                    (Err(_), Some(api_key)) => LicenseKey::invalid(server_hostname)
+                        .try_renew(api_key)
+                        .await
+                        .map(|result| {
+                            update_license = Some(result.encoded_key);
+                            result.key
+                        }),
+                    (maybe_license, _) => maybe_license,
+                }
+            }
+            (None, Some(api_key)) => LicenseKey::invalid(server_hostname)
+                .try_renew(api_key)
+                .await
+                .map(|result| {
+                    update_license = Some(result.encoded_key);
+                    result.key
+                }),
+            (None, None) => {
+                return None;
+            }
+        };
+
+        // Report error
+        let license = match license_result {
+            Ok(license) => license,
             Err(err) => {
                 config.new_build_warning("enterprise.license-key", err.to_string());
                 return None;
             }
         };
 
+        // Update the license if a new one was obtained
+        if let Some(license) = update_license {
+            config
+                .keys
+                .insert("enterprise.license-key".to_string(), license.clone());
+            if let Err(err) = config_manager
+                .set(
+                    [ConfigKey {
+                        key: "enterprise.license-key".to_string(),
+                        value: license.to_string(),
+                    }],
+                    true,
+                )
+                .await
+            {
+                trc::error!(
+                    err.caused_by(trc::location!())
+                        .details("Failed to update license key")
+                );
+            }
+        }
+
         match data
-            .get_bitmap(BitmapKey::document_ids(u32::MAX, Collection::Principal))
+            .count_principals(None, Type::Individual.into(), None)
             .await
         {
-            Ok(Some(bitmap)) if bitmap.len() > license.accounts as u64 => {
+            Ok(total) if total > license.accounts as u64 => {
                 config.new_build_warning(
                     "enterprise.license-key",
                     format!(
                         "License key is valid but only allows {} accounts, found {}.",
-                        license.accounts,
-                        bitmap.len()
+                        license.accounts, total
                     ),
                 );
                 return None;
@@ -112,27 +184,127 @@ impl Enterprise {
             None
         };
 
-        Some(Enterprise {
+        // Parse AI APIs
+        let mut ai_apis = AHashMap::new();
+        for id in config.sub_keys("enterprise.ai", ".url") {
+            if let Some(api) = AiApiConfig::parse(config, &id) {
+                ai_apis.insert(id, api.into());
+            }
+        }
+
+        // Build the enterprise configuration
+        let mut enterprise = Enterprise {
             license,
             undelete: config
                 .property_or_default::<Option<Duration>>("storage.undelete.retention", "false")
                 .unwrap_or_default()
                 .map(|retention| Undelete { retention }),
+            logo_url: config.value("enterprise.logo-url").map(|s| s.to_string()),
             trace_store,
             metrics_store,
             metrics_alerts: parse_metric_alerts(config),
-        })
+            spam_filter_llm: SpamFilterLlmConfig::parse(config, &ai_apis),
+            ai_apis,
+            template_calendar_alarm: None,
+            template_scheduling_email: None,
+            template_scheduling_web: None,
+        };
+
+        // Parse templates
+        for (key, value) in [
+            (
+                "calendar.alarms.template",
+                &mut enterprise.template_calendar_alarm,
+            ),
+            (
+                "calendar.scheduling.template.email",
+                &mut enterprise.template_scheduling_email,
+            ),
+            (
+                "calendar.scheduling.template.web",
+                &mut enterprise.template_scheduling_web,
+            ),
+        ] {
+            if let Some(template) = config.value(key) {
+                match Template::parse(template) {
+                    Ok(template) => *value = Some(template),
+                    Err(err) => {
+                        config.new_build_error(key, format!("Invalid template: {err}"));
+                    }
+                }
+            }
+        }
+
+        Some(enterprise)
+    }
+}
+
+impl SpamFilterLlmConfig {
+    pub fn parse(config: &mut Config, models: &AHashMap<String, Arc<AiApiConfig>>) -> Option<Self> {
+        if !config
+            .property_or_default::<bool>("spam-filter.llm.enable", "false")
+            .unwrap_or_default()
+        {
+            return None;
+        }
+        let model = config.value_require_non_empty("spam-filter.llm.model")?;
+        let model = if let Some(model) = models.get(model) {
+            model.clone()
+        } else {
+            let message = format!("Model {model:?} not found in AI API configuration");
+            config.new_build_error("spam-filter.llm.model", message);
+            return None;
+        };
+
+        let llm = SpamFilterLlmConfig {
+            model,
+            temperature: config
+                .property_or_default("spam-filter.llm.temperature", "0.5")
+                .unwrap_or(0.5),
+            prompt: config
+                .value_require_non_empty("spam-filter.llm.prompt")?
+                .to_string(),
+            separator: config
+                .value_require_non_empty("spam-filter.llm.separator")
+                .unwrap_or_default()
+                .chars()
+                .next()
+                .unwrap_or(','),
+            index_category: config
+                .property("spam-filter.llm.index.category")
+                .unwrap_or_default(),
+            index_confidence: config.property("spam-filter.llm.index.confidence"),
+            index_explanation: config.property("spam-filter.llm.index.explanation"),
+            categories: config
+                .values("spam-filter.llm.categories")
+                .map(|(_, v)| v.trim().to_uppercase())
+                .collect(),
+            confidence: config
+                .values("spam-filter.llm.confidence")
+                .map(|(_, v)| v.trim().to_uppercase())
+                .collect(),
+        };
+
+        if llm.categories.is_empty() {
+            config.new_build_error("spam-filter.llm.categories", "No categories defined");
+            return None;
+        }
+        if llm.index_confidence.is_some() && llm.confidence.is_empty() {
+            config.new_build_error(
+                "spam-filter.llm.confidence",
+                "Confidence index is defined but no confidence values are provided",
+            );
+            return None;
+        }
+
+        llm.into()
     }
 }
 
 pub fn parse_metric_alerts(config: &mut Config) -> Vec<MetricAlert> {
     let mut alerts = Vec::new();
 
-    for metric_id in config
-        .sub_keys("metrics.alerts", ".enable")
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-    {
+    for metric_id in config.sub_keys("metrics.alerts", ".enable") {
         if let Some(alert) = parse_metric_alert(config, metric_id) {
             alerts.push(alert);
         }

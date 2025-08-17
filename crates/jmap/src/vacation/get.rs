@@ -1,21 +1,43 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::Server;
+use email::sieve::SieveScript;
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, RequestArguments},
-    object::Object,
     request::reference::MaybeReference,
-    types::{any_id::AnyId, collection::Collection, id::Id, property::Property, value::Value},
+    types::{
+        any_id::AnyId,
+        collection::{Collection, SyncCollection},
+        date::UTCDate,
+        id::Id,
+        property::Property,
+        value::{Object, Value},
+    },
 };
+use std::future::Future;
 use store::query::Filter;
+use trc::AddContext;
 
-use crate::JMAP;
+use crate::{JmapMethods, changes::state::StateManager};
 
-impl JMAP {
-    pub async fn vacation_response_get(
+pub trait VacationResponseGet: Sync + Send {
+    fn vacation_response_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn get_vacation_sieve_script_id(
+        &self,
+        account_id: u32,
+    ) -> impl Future<Output = trc::Result<Option<u32>>> + Send;
+}
+
+impl VacationResponseGet for Server {
+    async fn vacation_response_get(
         &self,
         mut request: GetRequest<RequestArguments>,
     ) -> trc::Result<GetResponse> {
@@ -32,7 +54,7 @@ impl JMAP {
         let mut response = GetResponse {
             account_id: request.account_id.into(),
             state: self
-                .get_state(account_id, Collection::SieveScript)
+                .get_state(account_id, SyncCollection::SieveScript)
                 .await?
                 .into(),
             list: Vec::with_capacity(1),
@@ -58,15 +80,14 @@ impl JMAP {
         };
         if do_get {
             if let Some(document_id) = self.get_vacation_sieve_script_id(account_id).await? {
-                if let Some(mut obj) = self
-                    .get_property::<Object<Value>>(
-                        account_id,
-                        Collection::SieveScript,
-                        document_id,
-                        Property::Value,
-                    )
+                if let Some(sieve_) = self
+                    .get_archive(account_id, Collection::SieveScript, document_id)
                     .await?
                 {
+                    let sieve = sieve_
+                        .unarchive::<SieveScript>()
+                        .caused_by(trc::location!())?;
+                    let vacation = sieve.vacation_response.as_ref();
                     let mut result = Object::with_capacity(properties.len());
                     for property in &properties {
                         match property {
@@ -74,14 +95,49 @@ impl JMAP {
                                 result.append(Property::Id, Value::Id(Id::singleton()));
                             }
                             Property::IsEnabled => {
-                                result.append(Property::IsEnabled, obj.remove(&Property::IsActive));
+                                result.append(Property::IsEnabled, sieve.is_active);
                             }
-                            Property::FromDate
-                            | Property::ToDate
-                            | Property::Subject
-                            | Property::TextBody
-                            | Property::HtmlBody => {
-                                result.append(property.clone(), obj.remove(property));
+                            Property::FromDate => {
+                                result.append(
+                                    Property::FromDate,
+                                    vacation.and_then(|r| {
+                                        r.from_date
+                                            .as_ref()
+                                            .map(u64::from)
+                                            .map(UTCDate::from)
+                                            .map(Value::Date)
+                                    }),
+                                );
+                            }
+                            Property::ToDate => {
+                                result.append(
+                                    Property::ToDate,
+                                    vacation.and_then(|r| {
+                                        r.to_date
+                                            .as_ref()
+                                            .map(u64::from)
+                                            .map(UTCDate::from)
+                                            .map(Value::Date)
+                                    }),
+                                );
+                            }
+                            Property::Subject => {
+                                result.append(
+                                    Property::Subject,
+                                    vacation.and_then(|r| r.subject.as_ref().map(Value::from)),
+                                );
+                            }
+                            Property::TextBody => {
+                                result.append(
+                                    Property::TextBody,
+                                    vacation.and_then(|r| r.text_body.as_ref().map(Value::from)),
+                                );
+                            }
+                            Property::HtmlBody => {
+                                result.append(
+                                    Property::HtmlBody,
+                                    vacation.and_then(|r| r.html_body.as_ref().map(Value::from)),
+                                );
                             }
                             property => {
                                 result.append(property.clone(), Value::Null);
@@ -100,11 +156,11 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn get_vacation_sieve_script_id(&self, account_id: u32) -> trc::Result<Option<u32>> {
+    async fn get_vacation_sieve_script_id(&self, account_id: u32) -> trc::Result<Option<u32>> {
         self.filter(
             account_id,
             Collection::SieveScript,
-            vec![Filter::eq(Property::Name, "vacation")],
+            vec![Filter::eq(Property::Name, "vacation".as_bytes().to_vec())],
         )
         .await
         .map(|r| r.results.min())

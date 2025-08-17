@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use rocksdb::{ColumnFamilyDescriptor, MergeOperands, OptimisticTransactionDB, Options};
 
 use tokio::sync::oneshot;
-use utils::config::{utils::AsKey, Config};
+use utils::config::{Config, utils::AsKey};
 
 use crate::*;
 
-use super::{RocksDbStore, CF_BLOBS};
+use super::{CF_BLOBS, RocksDbStore};
 
 impl RocksDbStore {
     pub async fn open(config: &mut Config, prefix: impl AsKey) -> Option<Self> {
@@ -50,7 +50,7 @@ impl RocksDbStore {
         }
 
         // Counters
-        for subspace in [SUBSPACE_COUNTER, SUBSPACE_QUOTA] {
+        for subspace in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
             let mut cf_opts = Options::default();
             cf_opts.set_merge_operator_associative("merge", numeric_value_merge);
             cfs.push(ColumnFamilyDescriptor::new(
@@ -74,10 +74,10 @@ impl RocksDbStore {
             SUBSPACE_INDEXES,
             SUBSPACE_ACL,
             SUBSPACE_DIRECTORY,
-            SUBSPACE_FTS_QUEUE,
+            SUBSPACE_TASK_QUEUE,
             SUBSPACE_BLOB_RESERVE,
             SUBSPACE_BLOB_LINK,
-            SUBSPACE_LOOKUP_VALUE,
+            SUBSPACE_IN_MEMORY_VALUE,
             SUBSPACE_PROPERTY,
             SUBSPACE_SETTINGS,
             SUBSPACE_QUEUE_MESSAGE,

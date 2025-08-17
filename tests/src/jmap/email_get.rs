@@ -1,13 +1,13 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{fs, path::PathBuf};
 
-use jmap::mailbox::INBOX_ID;
-use jmap_client::email::{self, import::EmailImportResponse, Header, HeaderForm};
+use ::email::mailbox::INBOX_ID;
+use jmap_client::email::{self, Header, HeaderForm, import::EmailImportResponse};
 use jmap_proto::types::id::Id;
 use mail_parser::HeaderName;
 
@@ -29,7 +29,7 @@ pub async fn test(params: &mut JMAPTest) {
 
     for file_name in fs::read_dir(&test_dir).unwrap() {
         let mut file_name = file_name.as_ref().unwrap().path();
-        if file_name.extension().map_or(true, |e| e != "eml") {
+        if file_name.extension().is_none_or(|e| e != "eml") {
             continue;
         }
         let is_headers_test = file_name.file_name().unwrap() == "headers.eml";

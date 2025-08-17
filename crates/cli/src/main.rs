@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -15,11 +15,12 @@ use clap::Parser;
 use console::style;
 use jmap_client::client::Credentials;
 use modules::{
+    UnwrapResult,
     cli::{Cli, Client, Commands},
-    is_localhost, UnwrapResult,
+    host, is_localhost,
 };
-use reqwest::{header::AUTHORIZATION, Method, StatusCode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use reqwest::{Method, StatusCode, header::AUTHORIZATION};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::modules::OAuthResponse;
 
@@ -31,6 +32,7 @@ async fn main() -> std::io::Result<()> {
     let url = args
         .url
         .or_else(|| std::env::var("URL").ok())
+        .map(|url| url.trim_end_matches('/').to_string())
         .unwrap_or_else(|| {
             eprintln!("No URL specified. Use --url or set the URL environment variable.");
             std::process::exit(1);
@@ -41,14 +43,20 @@ async fn main() -> std::io::Result<()> {
         } else if let Ok(credentials) = std::env::var("CREDENTIALS") {
             parse_credentials(&credentials)
         } else {
-            let credentials = rpassword::prompt_password(
-                "\nEnter administrator credentials or press [ENTER] to use OAuth: ",
-            )
-            .unwrap();
-            if !credentials.is_empty() {
+            if args.anonymous {
+                let credentials = "anonymous:".to_string();
                 parse_credentials(&credentials)
             } else {
-                oauth(&url).await
+                let credentials = rpassword::prompt_password(
+                    "\nEnter administrator credentials or press [ENTER] to use OAuth: ",
+                )
+                .unwrap();
+
+                if !credentials.is_empty() {
+                    parse_credentials(&credentials)
+                } else {
+                    oauth(&url).await
+                }
             }
         },
         timeout: args.timeout,
@@ -63,10 +71,11 @@ async fn main() -> std::io::Result<()> {
             command.exec(client).await;
         }
         Commands::Server(command) => command.exec(client).await,
-        Commands::Account(command) => command.exec(client).await,
+        /*Commands::Account(command) => command.exec(client).await,
         Commands::Domain(command) => command.exec(client).await,
         Commands::List(command) => command.exec(client).await,
-        Commands::Group(command) => command.exec(client).await,
+        Commands::Group(command) => command.exec(client).await,*/
+        Commands::Dkim(command) => command.exec(client).await,
         Commands::Queue(command) => command.exec(client).await,
         Commands::Report(command) => command.exec(client).await,
     }
@@ -88,7 +97,7 @@ async fn oauth(url: &str) -> Credentials {
             .danger_accept_invalid_certs(is_localhost(url))
             .build()
             .unwrap_or_default()
-            .get(&format!("{}/.well-known/oauth-authorization-server", url))
+            .get(format!("{}/.well-known/oauth-authorization-server", url))
             .send()
             .await
             .unwrap_result("send OAuth GET request")
@@ -169,7 +178,7 @@ async fn oauth(url: &str) -> Credentials {
 #[serde(untagged)]
 pub enum Response<T> {
     Error(ManagementApiError),
-    Data { data: T },
+    Data { data: T }
 }
 
 #[derive(Deserialize)]
@@ -189,6 +198,7 @@ impl Client {
         jmap_client::client::Client::new()
             .credentials(self.credentials)
             .accept_invalid_certs(is_localhost(&self.url))
+            .follow_redirects([host(&self.url).expect("Invalid host").to_owned()])
             .timeout(Duration::from_secs(self.timeout.unwrap_or(60)))
             .connect(&self.url)
             .await
@@ -254,7 +264,9 @@ impl Client {
                 return None;
             }
             StatusCode::UNAUTHORIZED => {
-                eprintln!("Authentication failed. Make sure the credentials are correct and that the account has administrator rights.");
+                eprintln!(
+                    "Authentication failed. Make sure the credentials are correct and that the account has administrator rights."
+                );
                 std::process::exit(1);
             }
             _ => {
@@ -275,7 +287,7 @@ impl Client {
             Response::Error(error) => {
                 eprintln!("Request failed: {error})");
                 std::process::exit(1);
-            }
+            },
         }
     }
 }

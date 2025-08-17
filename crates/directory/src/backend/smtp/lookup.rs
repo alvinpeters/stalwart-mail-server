@@ -1,18 +1,18 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use mail_send::{smtp::AssertReply, Credentials};
+use mail_send::{Credentials, smtp::AssertReply};
 use smtp_proto::Severity;
 
-use crate::{IntoError, Principal, QueryBy};
+use crate::{IntoError, Principal, QueryBy, Type, backend::RcptType};
 
 use super::{SmtpClient, SmtpDirectory};
 
 impl SmtpDirectory {
-    pub async fn query(&self, query: QueryBy<'_>) -> trc::Result<Option<Principal<u32>>> {
+    pub async fn query(&self, query: QueryBy<'_>) -> trc::Result<Option<Principal>> {
         if let QueryBy::Credentials(credentials) = query {
             self.pool
                 .get()
@@ -25,11 +25,11 @@ impl SmtpDirectory {
         }
     }
 
-    pub async fn email_to_ids(&self, _address: &str) -> trc::Result<Vec<u32>> {
+    pub async fn email_to_id(&self, _address: &str) -> trc::Result<Option<u32>> {
         Err(trc::StoreEvent::NotSupported.caused_by(trc::location!()))
     }
 
-    pub async fn rcpt(&self, address: &str) -> trc::Result<bool> {
+    pub async fn rcpt(&self, address: &str) -> trc::Result<RcptType> {
         let mut conn = self
             .pool
             .get()
@@ -57,9 +57,9 @@ impl SmtpDirectory {
                     conn.num_rcpts = 0;
                     conn.sent_mail_from = false;
                 }
-                Ok(true)
+                Ok(RcptType::Mailbox)
             }
-            Severity::PermanentNegativeCompletion => Ok(false),
+            Severity::PermanentNegativeCompletion => Ok(RcptType::Invalid),
             _ => Err(trc::StoreEvent::UnexpectedError
                 .ctx(trc::Key::Code, reply.code())
                 .ctx(trc::Key::Details, reply.message)),
@@ -93,13 +93,13 @@ impl SmtpClient {
     async fn authenticate(
         &mut self,
         credentials: &Credentials<String>,
-    ) -> trc::Result<Option<Principal<u32>>> {
+    ) -> trc::Result<Option<Principal>> {
         match self
             .client
             .authenticate(credentials, &self.capabilities)
             .await
         {
-            Ok(_) => Ok(Some(Principal::default())),
+            Ok(_) => Ok(Some(Principal::new(u32::MAX, Type::Individual))),
             Err(err) => match &err {
                 mail_send::Error::AuthenticationFailed(err) if err.code() == 535 => {
                     self.num_auth_failures += 1;
@@ -120,7 +120,7 @@ impl SmtpClient {
             250 | 251 => Ok(reply
                 .message()
                 .split('\n')
-                .map(|p| p.to_string())
+                .map(|p| p.into())
                 .collect::<Vec<String>>()),
             code @ (550 | 551 | 553 | 500 | 502) => {
                 Err(trc::StoreEvent::NotSupported.ctx(trc::Key::Code, code))

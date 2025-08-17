@@ -1,17 +1,20 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::{iter::Peekable, sync::Arc, vec::IntoIter};
 
-use common::listener::{limiter::ConcurrencyLimiter, SessionResult, SessionStream};
-use imap_proto::{
-    receiver::{self, Request},
-    Command, ResponseType, StatusResponse,
+use common::{
+    KV_RATE_LIMIT_IMAP,
+    listener::{SessionResult, SessionStream},
 };
-use jmap::auth::rate_limit::ConcurrencyLimiters;
+use imap_proto::{
+    Command, ResponseType, StatusResponse,
+    receiver::{self, Request},
+};
+use trc::SecurityEvent;
 
 use super::{SelectedMailbox, Session, SessionData, State};
 
@@ -48,6 +51,35 @@ impl<T: SessionStream> Session<T> {
                     break;
                 }
                 Err(receiver::Error::Error { response }) => {
+                    // Check for port scanners
+                    if matches!(
+                        (&self.state, response.key(trc::Key::Code)),
+                        (
+                            State::NotAuthenticated { .. },
+                            Some(trc::Value::String(v))
+                        ) if v == "PARSE"
+                    ) {
+                        match self.server.is_scanner_fail2banned(self.remote_addr).await {
+                            Ok(true) => {
+                                trc::event!(
+                                    Security(SecurityEvent::ScanBan),
+                                    SpanId = self.session_id,
+                                    RemoteIp = self.remote_addr,
+                                    Reason = "Invalid IMAP command",
+                                );
+
+                                return SessionResult::Close;
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                trc::error!(
+                                    err.span_id(self.session_id)
+                                        .details("Failed to check for fail2ban")
+                                );
+                            }
+                        }
+                    }
+
                     if !self.write_error(response).await {
                         return SessionResult::Close;
                     }
@@ -80,7 +112,7 @@ impl<T: SessionStream> Session<T> {
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Status => self
-                    .handle_status(request)
+                    .handle_status(group_requests(&mut requests, vec![request]))
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Append => self
@@ -103,8 +135,8 @@ impl<T: SessionStream> Session<T> {
                     .handle_search(request, false, is_uid)
                     .await
                     .map(|_| SessionResult::Continue),
-                Command::Fetch(is_uid) => self
-                    .handle_fetch(request, is_uid)
+                Command::Fetch(_) => self
+                    .handle_fetch(group_requests(&mut requests, vec![request]))
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Store(is_uid) => self
@@ -199,6 +231,14 @@ impl<T: SessionStream> Session<T> {
                     .handle_my_rights(request)
                     .await
                     .map(|_| SessionResult::Continue),
+                Command::GetQuota => self
+                    .handle_get_quota(request)
+                    .await
+                    .map(|_| SessionResult::Continue),
+                Command::GetQuotaRoot => self
+                    .handle_get_quota_root(request)
+                    .await
+                    .map(|_| SessionResult::Continue),
                 Command::Unauthenticate => self
                     .handle_unauthenticate(request)
                     .await
@@ -255,13 +295,18 @@ impl<T: SessionStream> Session<T> {
         let state = &self.state;
         // Rate limit request
         if let State::Authenticated { data } | State::Selected { data, .. } = state {
-            if let Some(rate) = &self.jmap.core.imap.rate_requests {
+            if let Some(rate) = &self.server.core.imap.rate_requests {
                 if data
-                    .jmap
+                    .server
                     .core
                     .storage
                     .lookup
-                    .is_rate_allowed(format!("ireq:{}", data.account_id).as_bytes(), rate, true)
+                    .is_rate_allowed(
+                        KV_RATE_LIMIT_IMAP,
+                        &data.account_id.to_be_bytes(),
+                        rate,
+                        true,
+                    )
                     .await?
                     .is_some()
                 {
@@ -301,7 +346,7 @@ impl<T: SessionStream> Session<T> {
             }
             Command::Login => {
                 if let State::NotAuthenticated { .. } = state {
-                    if self.is_tls || self.jmap.core.imap.allow_plain_auth {
+                    if self.is_tls || self.server.core.imap.allow_plain_auth {
                         Ok(request)
                     } else {
                         Err(trc::ImapEvent::Error
@@ -335,7 +380,9 @@ impl<T: SessionStream> Session<T> {
             | Command::GetAcl
             | Command::ListRights
             | Command::MyRights
-            | Command::Unauthenticate => {
+            | Command::Unauthenticate
+            | Command::GetQuota
+            | Command::GetQuotaRoot => {
                 if let State::Authenticated { .. } | State::Selected { .. } = state {
                     Ok(request)
                 } else {
@@ -382,23 +429,6 @@ impl<T: SessionStream> Session<T> {
                     .id(request.tag)),
             },
         }
-    }
-
-    pub fn get_concurrency_limiter(&self, account_id: u32) -> Option<Arc<ConcurrencyLimiters>> {
-        let rate = self.jmap.core.imap.rate_concurrent?;
-        self.imap
-            .rate_limiter
-            .get(&account_id)
-            .map(|limiter| limiter.clone())
-            .unwrap_or_else(|| {
-                let limiter = Arc::new(ConcurrencyLimiters {
-                    concurrent_requests: ConcurrencyLimiter::new(rate),
-                    concurrent_uploads: ConcurrencyLimiter::new(rate),
-                });
-                self.imap.rate_limiter.insert(account_id, limiter.clone());
-                limiter
-            })
-            .into()
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,8 +9,8 @@ use std::borrow::Cow;
 use mail_parser::DateTime;
 
 use super::{
-    literal_string, quoted_or_literal_string, quoted_or_literal_string_or_nil,
-    quoted_rfc2822_or_nil, quoted_timestamp, Flag, ImapResponse, Sequence,
+    Flag, ImapResponse, Sequence, literal_string, quoted_or_literal_string,
+    quoted_or_literal_string_or_nil, quoted_rfc2822_or_nil, quoted_timestamp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +226,7 @@ pub struct BodyPartExtension<'x> {
     pub body_location: Option<Cow<'x, str>>,
 }
 
-impl<'x> Address<'x> {
+impl Address<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
             Address::Single(addr) => addr.serialize(buf),
@@ -242,7 +242,7 @@ impl<'x> Address<'x> {
     }
 }
 
-impl<'x> EmailAddress<'x> {
+impl EmailAddress<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.push(b'(');
         if let Some(name) = &self.name {
@@ -280,7 +280,7 @@ impl<'x> EmailAddress<'x> {
     }
 }
 
-impl<'x> AddressGroup<'x> {
+impl AddressGroup<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(b"(NIL NIL ");
         if let Some(name) = &self.name {
@@ -482,7 +482,7 @@ impl<'x> BodyPart<'x> {
     }
 }
 
-impl<'x> BodyPartFields<'x> {
+impl BodyPartFields<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         quoted_or_literal_string_or_nil(buf, self.body_subtype.as_deref());
         if let Some(body_parameters) = &self.body_parameters {
@@ -523,7 +523,7 @@ impl<'x> BodyPartFields<'x> {
     }
 }
 
-impl<'x> BodyPartExtension<'x> {
+impl BodyPartExtension<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         if let Some((disposition, parameters)) = &self.body_disposition {
             buf.push(b'(');
@@ -588,7 +588,7 @@ impl<'x> BodyPartExtension<'x> {
     }
 }
 
-impl<'x> BodyContents<'x> {
+impl BodyContents<'_> {
     pub fn into_owned<'y>(self) -> BodyContents<'y> {
         match self {
             BodyContents::Text(text) => BodyContents::Text(text.into_owned().into()),
@@ -636,7 +636,7 @@ static DUMMY_ADDRESS: [Address; 1] = [Address::Single(EmailAddress {
     address: Cow::Borrowed("unknown@localhost"),
 })];
 
-impl<'x> Envelope<'x> {
+impl Envelope<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.push(b'(');
         quoted_rfc2822_or_nil(buf, &self.date);
@@ -709,7 +709,7 @@ impl<'x> Envelope<'x> {
     }
 }
 
-impl<'x> DataItem<'x> {
+impl DataItem<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
             DataItem::Binary {
@@ -848,7 +848,7 @@ impl<'x> DataItem<'x> {
     }
 }
 
-impl<'x> FetchItem<'x> {
+impl FetchItem<'_> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(b"* ");
         buf.extend_from_slice(self.id.to_string().as_bytes());
@@ -863,7 +863,7 @@ impl<'x> FetchItem<'x> {
     }
 }
 
-impl<'x> ImapResponse for Response<'x> {
+impl ImapResponse for Response<'_> {
     fn serialize(self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(128);
         for item in &self.items {

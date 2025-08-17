@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -8,50 +8,48 @@ use std::time::Instant;
 
 use common::{
     config::smtp::session::Stage,
+    core::BuildServer,
     listener::{self, SessionManager, SessionStream},
 };
+
 use tokio_rustls::server::TlsStream;
 use trc::{SecurityEvent, SmtpEvent};
 
 use crate::{
     core::{Session, SessionData, SessionParameters, SmtpSessionManager, State},
-    queue, reporting,
     scripts::ScriptResult,
 };
 
 impl SessionManager for SmtpSessionManager {
-    fn handle<T: SessionStream>(
-        self,
-        session: listener::SessionData<T>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        // Create session
+    async fn handle<T: SessionStream>(self, session: listener::SessionData<T>) {
+        // Build server and create session
+        let server = self.inner.build_server();
+        let _in_flight = session.in_flight;
         let mut session = Session {
-            hostname: String::new(),
-            core: self.inner.into(),
-            instance: session.instance,
-            state: State::default(),
-            stream: session.stream,
-            in_flight: vec![session.in_flight],
             data: SessionData::new(
                 session.local_ip,
                 session.local_port,
                 session.remote_ip,
                 session.remote_port,
+                server.lookup_asn_country(session.remote_ip).await,
                 session.session_id,
             ),
+            hostname: "".into(),
+            server,
+            instance: session.instance,
+            state: State::default(),
+            stream: session.stream,
             params: SessionParameters::default(),
         };
 
         // Enforce throttle
-        async {
-            if session.is_allowed().await
-                && session.init_conn().await
-                && session.handle_conn().await
-                && session.instance.acceptor.is_tls()
-            {
-                if let Ok(mut session) = session.into_tls().await {
-                    session.handle_conn().await;
-                }
+        if session.is_allowed().await
+            && session.init_conn().await
+            && session.handle_conn().await
+            && session.instance.acceptor.is_tls()
+        {
+            if let Ok(mut session) = session.into_tls().await {
+                session.handle_conn().await;
             }
         }
     }
@@ -59,19 +57,17 @@ impl SessionManager for SmtpSessionManager {
     #[allow(clippy::manual_async_fn)]
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
         async {
-            let _ = self.inner.inner.queue_tx.send(queue::Event::Stop).await;
             let _ = self
                 .inner
-                .inner
-                .report_tx
-                .send(reporting::Event::Stop)
+                .ipc
+                .queue_tx
+                .send(common::ipc::QueueEvent::Stop)
                 .await;
             let _ = self
                 .inner
-                .inner
                 .ipc
-                .delivery_tx
-                .send(common::DeliveryEvent::Stop)
+                .report_tx
+                .send(common::ipc::ReportingEvent::Stop)
                 .await;
         }
     }
@@ -81,18 +77,16 @@ impl<T: SessionStream> Session<T> {
     pub async fn init_conn(&mut self) -> bool {
         self.eval_session_params().await;
 
-        let config = &self.core.core.smtp.session.connect;
+        let config = &self.server.core.smtp.session.connect;
 
         // Sieve filtering
         if let Some((script, script_id)) = self
-            .core
-            .core
+            .server
             .eval_if::<String, _>(&config.script, self, self.data.session_id)
             .await
             .and_then(|name| {
-                self.core
-                    .core
-                    .get_sieve_script(&name, self.data.session_id)
+                self.server
+                    .get_trusted_sieve_script(&name, self.data.session_id)
                     .map(|s| (s, name))
             })
         {
@@ -123,8 +117,7 @@ impl<T: SessionStream> Session<T> {
 
         // Obtain hostname
         self.hostname = self
-            .core
-            .core
+            .server
             .eval_if::<String, _>(&config.hostname, self, self.data.session_id)
             .await
             .unwrap_or_default();
@@ -133,13 +126,12 @@ impl<T: SessionStream> Session<T> {
                 Smtp(SmtpEvent::MissingLocalHostname),
                 SpanId = self.data.session_id,
             );
-            self.hostname = "localhost".to_string();
+            self.hostname = "localhost".into();
         }
 
         // Obtain greeting
         let greeting = self
-            .core
-            .core
+            .server
             .eval_if::<String, _>(&config.greeting, self, self.data.session_id)
             .await
             .filter(|g| !g.is_empty())
@@ -178,7 +170,7 @@ impl<T: SessionStream> Session<T> {
                                         }
                                     } else if bytes_read > self.data.bytes_left {
                                         self
-                                            .write(format!("451 4.7.28 {} Session exceeded transfer quota.\r\n", self.hostname).as_bytes())
+                                            .write(format!("452 4.7.28 {} Session exceeded transfer quota.\r\n", self.hostname).as_bytes())
                                             .await
                                             .ok();
 
@@ -190,14 +182,11 @@ impl<T: SessionStream> Session<T> {
                                         break;
                                     } else {
                                         self
-                                            .write(format!("453 4.3.2 {} Session open for too long.\r\n", self.hostname).as_bytes())
+                                            .write(format!("421 4.3.2 {} Session open for too long.\r\n", self.hostname).as_bytes())
                                             .await
                                             .ok();
 
-                                        match self
-                                            .core
-                                            .core
-                                            .is_loiter_fail2banned(self.data.remote_ip)
+                                        match self.server.is_loiter_fail2banned(self.data.remote_ip)
                                             .await
                                         {
                                             Ok(true) => {
@@ -258,7 +247,7 @@ impl<T: SessionStream> Session<T> {
                         Reason = "Server shutting down",
                         CausedBy = trc::location!()
                     );
-                    self.write(b"421 4.3.0 Server shutting down.\r\n").await.ok();
+                    self.write(format!("421 4.3.0 {} Server shutting down.\r\n", self.hostname).as_bytes()).await.ok();
                     break;
                 }
             };
@@ -277,8 +266,7 @@ impl<T: SessionStream> Session<T> {
             state: self.state,
             data: self.data,
             instance: self.instance,
-            core: self.core,
-            in_flight: self.in_flight,
+            server: self.server,
             params: self.params,
         })
     }

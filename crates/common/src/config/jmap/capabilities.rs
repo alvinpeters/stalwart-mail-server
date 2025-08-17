@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -24,9 +24,11 @@ impl JmapConfig {
             Capability::Core,
             Capabilities::Core(CoreCapabilities {
                 max_size_upload: self.upload_max_size,
-                max_concurrent_upload: self.upload_max_concurrent as usize,
+                max_concurrent_upload: self.upload_max_concurrent.unwrap_or(u32::MAX as u64)
+                    as usize,
                 max_size_request: self.request_max_size,
-                max_concurrent_requests: self.request_max_concurrent as usize,
+                max_concurrent_requests: self.request_max_concurrent.unwrap_or(u32::MAX as u64)
+                    as usize,
                 max_calls_in_request: self.request_max_calls,
                 max_objects_in_get: self.get_max_objects,
                 max_objects_in_set: self.set_max_objects,

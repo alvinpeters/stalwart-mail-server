@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 
 use crate::scripts::{into_sieve_value, to_store_value};
-use sieve::{runtime::Variable, FunctionMap};
+use sieve::{FunctionMap, runtime::Variable};
 use store::{Rows, Value};
 
 use super::PluginContext;
@@ -19,8 +19,8 @@ pub fn register(plugin_id: u32, fnc_map: &mut FunctionMap) {
 pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     // Obtain store name
     let store = match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.stores.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.data),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -31,9 +31,11 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     // Obtain query string
     let query = ctx.arguments[1].to_string();
     if query.is_empty() {
-        trc::bail!(trc::SieveEvent::RuntimeError
-            .ctx(trc::Key::Id, ctx.arguments[0].to_string().into_owned())
-            .details("Empty query string"));
+        trc::bail!(
+            trc::SieveEvent::RuntimeError
+                .ctx(trc::Key::Id, ctx.arguments[0].to_string().into_owned())
+                .details("Empty query string")
+        );
     }
 
     // Obtain arguments
@@ -46,9 +48,9 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     if query
         .as_bytes()
         .get(..6)
-        .map_or(false, |q| q.eq_ignore_ascii_case(b"SELECT"))
+        .is_some_and(|q| q.eq_ignore_ascii_case(b"SELECT"))
     {
-        let mut rows = store.query::<Rows>(&query, arguments).await?;
+        let mut rows = store.sql_query::<Rows>(&query, arguments).await?;
         Ok(match rows.rows.len().cmp(&1) {
             Ordering::Equal => {
                 let mut row = rows.rows.pop().unwrap().values;
@@ -82,6 +84,10 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
                 .into(),
         })
     } else {
-        Ok(store.query::<usize>(&query, arguments).await.is_ok().into())
+        Ok(store
+            .sql_query::<usize>(&query, arguments)
+            .await
+            .is_ok()
+            .into())
     }
 }

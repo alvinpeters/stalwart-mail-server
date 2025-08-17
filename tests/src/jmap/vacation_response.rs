@@ -1,22 +1,25 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use chrono::{TimeDelta, Utc};
 
-use directory::backend::internal::manage::ManageDirectory;
 use jmap_proto::types::id::Id;
 use std::time::Instant;
 
-use crate::jmap::{
-    assert_is_empty,
-    delivery::SmtpConnection,
-    email_submission::{
-        assert_message_delivery, expect_nothing, spawn_mock_smtp_server, MockMessage,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{
+        assert_is_empty,
+        delivery::SmtpConnection,
+        email_submission::{
+            MockMessage, assert_message_delivery, expect_nothing, spawn_mock_smtp_server,
+        },
+        mailbox::destroy_all_mailboxes,
     },
-    mailbox::destroy_all_mailboxes,
+    smtp::DnsCache,
 };
 
 use super::JMAPTest;
@@ -27,25 +30,25 @@ pub async fn test(params: &mut JMAPTest) {
     // Create test account
     let server = params.server.clone();
     let client = &mut params.client;
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
     client.set_default_account_id(&account_id);
 
     // Start mock SMTP server
     let (mut smtp_rx, smtp_settings) = spawn_mock_smtp_server();
-    server.core.smtp.resolvers.dns.ipv4_add(
+    server.ipv4_add(
         "localhost",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + std::time::Duration::from_secs(10),

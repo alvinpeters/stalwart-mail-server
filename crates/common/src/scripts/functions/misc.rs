@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use mail_auth::common::resolver::ToReverseName;
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
-use sieve::{runtime::Variable, Context};
+use sieve::{Context, runtime::Variable};
 
 use super::ApplyString;
 
@@ -33,14 +33,14 @@ pub fn fn_is_ip_addr<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
 pub fn fn_is_ipv4_addr<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
     v[0].to_string()
         .parse::<std::net::IpAddr>()
-        .map_or(false, |ip| matches!(ip, IpAddr::V4(_)))
+        .is_ok_and(|ip| matches!(ip, IpAddr::V4(_)))
         .into()
 }
 
 pub fn fn_is_ipv6_addr<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
     v[0].to_string()
         .parse::<std::net::IpAddr>()
-        .map_or(false, |ip| matches!(ip, IpAddr::V6(_)))
+        .is_ok_and(|ip| matches!(ip, IpAddr::V6(_)))
         .into()
 }
 
@@ -94,7 +94,7 @@ pub fn fn_hash<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
     })
 }
 
-pub fn fn_is_var_names<'x>(ctx: &'x Context<'x>, _: Vec<Variable>) -> Variable {
+pub fn fn_get_var_names<'x>(ctx: &'x Context<'x>, _: Vec<Variable>) -> Variable {
     Variable::Array(
         ctx.global_variable_names()
             .map(|v| Variable::from(v.to_uppercase()))

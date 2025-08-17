@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -72,6 +72,10 @@ pub enum Command {
 
     // RFC 2971
     Id,
+
+    // RFC 9208
+    GetQuota,
+    GetQuotaRoot,
 }
 
 impl Command {
@@ -170,9 +174,9 @@ pub enum ResponseType {
 }
 
 impl ResponseCode {
-    pub fn highest_modseq(modseq: Option<u64>) -> Self {
+    pub fn highest_modseq(modseq: u64) -> Self {
         ResponseCode::HighestModseq {
-            modseq: modseq.map(|id| id + 1).unwrap_or(0),
+            modseq: if modseq > 0 { modseq + 1 } else { 0 },
         }
     }
 }

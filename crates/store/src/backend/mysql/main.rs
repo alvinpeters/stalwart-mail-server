@@ -1,17 +1,17 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
 use std::time::Duration;
 
-use mysql_async::{prelude::Queryable, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
-use utils::config::{utils::AsKey, Config};
+use mysql_async::{OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
+use utils::config::{Config, utils::AsKey};
 
 use crate::*;
 
-use super::{into_error, MysqlStore};
+use super::{MysqlStore, into_error};
 
 impl MysqlStore {
     pub async fn open(
@@ -93,10 +93,10 @@ impl MysqlStore {
         for table in [
             SUBSPACE_ACL,
             SUBSPACE_DIRECTORY,
-            SUBSPACE_FTS_QUEUE,
+            SUBSPACE_TASK_QUEUE,
             SUBSPACE_BLOB_RESERVE,
             SUBSPACE_BLOB_LINK,
-            SUBSPACE_LOOKUP_VALUE,
+            SUBSPACE_IN_MEMORY_VALUE,
             SUBSPACE_PROPERTY,
             SUBSPACE_SETTINGS,
             SUBSPACE_QUEUE_MESSAGE,
@@ -110,7 +110,7 @@ impl MysqlStore {
             SUBSPACE_TELEMETRY_INDEX,
         ] {
             let table = char::from(table);
-            conn.query_drop(&format!(
+            conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
                     k TINYBLOB,
                     v MEDIUMBLOB NOT NULL,
@@ -121,7 +121,7 @@ impl MysqlStore {
             .map_err(into_error)?;
         }
 
-        conn.query_drop(&format!(
+        conn.query_drop(format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 k TINYBLOB,
                 v LONGBLOB NOT NULL,
@@ -139,7 +139,7 @@ impl MysqlStore {
             SUBSPACE_BITMAP_TEXT,
         ] {
             let table = char::from(table);
-            conn.query_drop(&format!(
+            conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
                     k BLOB,
                     PRIMARY KEY (k(400))
@@ -149,8 +149,8 @@ impl MysqlStore {
             .map_err(into_error)?;
         }
 
-        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA] {
-            conn.query_drop(&format!(
+        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
+            conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {} (
                 k TINYBLOB,
                 v BIGINT NOT NULL DEFAULT 0,

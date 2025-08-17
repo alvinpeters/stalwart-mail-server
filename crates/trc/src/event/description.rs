@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -39,7 +39,7 @@ impl EventType {
             EventType::PushSubscription(event) => event.description(),
             EventType::Cluster(event) => event.description(),
             EventType::Housekeeper(event) => event.description(),
-            EventType::FtsIndex(event) => event.description(),
+            EventType::TaskQueue(event) => event.description(),
             EventType::Milter(event) => event.description(),
             EventType::MtaHook(event) => event.description(),
             EventType::Delivery(event) => event.description(),
@@ -51,6 +51,9 @@ impl EventType {
             EventType::Telemetry(event) => event.description(),
             EventType::MessageIngest(event) => event.description(),
             EventType::Security(event) => event.description(),
+            EventType::Ai(event) => event.description(),
+            EventType::WebDav(event) => event.description(),
+            EventType::Calendar(event) => event.description(),
         }
     }
 
@@ -86,7 +89,7 @@ impl EventType {
             EventType::PushSubscription(event) => event.explain(),
             EventType::Cluster(event) => event.explain(),
             EventType::Housekeeper(event) => event.explain(),
-            EventType::FtsIndex(event) => event.explain(),
+            EventType::TaskQueue(event) => event.explain(),
             EventType::Milter(event) => event.explain(),
             EventType::MtaHook(event) => event.explain(),
             EventType::Delivery(event) => event.explain(),
@@ -98,6 +101,9 @@ impl EventType {
             EventType::Telemetry(event) => event.explain(),
             EventType::MessageIngest(event) => event.explain(),
             EventType::Security(event) => event.explain(),
+            EventType::Ai(event) => event.explain(),
+            EventType::WebDav(event) => event.explain(),
+            EventType::Calendar(event) => event.explain(),
         }
     }
 }
@@ -131,39 +137,33 @@ impl HttpEvent {
 impl ClusterEvent {
     pub fn description(&self) -> &'static str {
         match self {
-            ClusterEvent::PeerAlive => "A peer is alive",
-            ClusterEvent::PeerDiscovered => "A new peer was discovered",
-            ClusterEvent::PeerOffline => "A peer went offline",
-            ClusterEvent::PeerSuspected => "A peer is suspected to be offline",
-            ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
-            ClusterEvent::PeerBackOnline => "A peer came back online",
-            ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasConfigChanges => "A peer has configuration changes",
-            ClusterEvent::PeerHasListChanges => "A peer has list changes",
-            ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
-            ClusterEvent::EmptyPacket => "Received an empty gossip packet",
-            ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
-            ClusterEvent::DecryptionError => "Failed to decrypt a gossip packet",
-            ClusterEvent::Error => "A cluster error occurred",
+            ClusterEvent::SubscriberStart => "PubSub subscriber started",
+            ClusterEvent::SubscriberStop => "PubSub subscriber stopped",
+            ClusterEvent::SubscriberError => "PubSub subscriber error",
+            ClusterEvent::SubscriberDisconnected => "PubSub subscriber disconnected",
+            ClusterEvent::PublisherStart => "PubSub publisher started",
+            ClusterEvent::PublisherStop => "PubSub publisher stopped",
+            ClusterEvent::PublisherError => "PubSub publisher error",
+            ClusterEvent::MessageReceived => "PubSub message received",
+            ClusterEvent::MessageSkipped => "PubSub message skipped",
+            ClusterEvent::MessageInvalid => "Invalid PubSub message",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
-            ClusterEvent::PeerAlive => "A peer is alive and reachable",
-            ClusterEvent::PeerDiscovered => "A new peer was discovered",
-            ClusterEvent::PeerOffline => "A peer is offline",
-            ClusterEvent::PeerSuspected => "A peer is suspected to be offline",
-            ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
-            ClusterEvent::PeerBackOnline => "A peer came back online",
-            ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasConfigChanges => "A peer has configuration changes",
-            ClusterEvent::PeerHasListChanges => "A peer has list changes",
-            ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
-            ClusterEvent::EmptyPacket => "Received an empty gossip packet",
-            ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
-            ClusterEvent::DecryptionError => "Failed to decrypt a gossip packet",
-            ClusterEvent::Error => "An error occurred in the cluster",
+            ClusterEvent::SubscriberStart => "The PubSub subscriber has started",
+            ClusterEvent::SubscriberStop => "The PubSub subscriber has stopped",
+            ClusterEvent::SubscriberError => "An error occurred while subscribing to PubSub",
+            ClusterEvent::SubscriberDisconnected => "The PubSub subscriber has disconnected",
+            ClusterEvent::PublisherStart => "The PubSub publisher has started",
+            ClusterEvent::PublisherStop => "The PubSub publisher has stopped",
+            ClusterEvent::PublisherError => "An error occurred while publishing to PubSub",
+            ClusterEvent::MessageReceived => "A message was received from the PubSub server",
+            ClusterEvent::MessageSkipped => "A message originating from this node was skipped",
+            ClusterEvent::MessageInvalid => {
+                "An invalid message was received from the PubSub server"
+            }
         }
     }
 }
@@ -174,9 +174,7 @@ impl HousekeeperEvent {
             HousekeeperEvent::Start => "Housekeeper process started",
             HousekeeperEvent::Stop => "Housekeeper process stopped",
             HousekeeperEvent::Schedule => "Housekeeper task scheduled",
-            HousekeeperEvent::PurgeAccounts => "Purging accounts",
-            HousekeeperEvent::PurgeSessions => "Purging sessions",
-            HousekeeperEvent::PurgeStore => "Purging store",
+            HousekeeperEvent::Run => "Housekeeper task run",
         }
     }
 
@@ -185,31 +183,27 @@ impl HousekeeperEvent {
             HousekeeperEvent::Start => "The housekeeper process has started",
             HousekeeperEvent::Stop => "The housekeeper process has stopped",
             HousekeeperEvent::Schedule => "A housekeeper task has been scheduled",
-            HousekeeperEvent::PurgeAccounts => "Purging accounts",
-            HousekeeperEvent::PurgeSessions => "Purging sessions",
-            HousekeeperEvent::PurgeStore => "Purging store",
+            HousekeeperEvent::Run => "A housekeeper task is running",
         }
     }
 }
 
-impl FtsIndexEvent {
+impl TaskQueueEvent {
     pub fn description(&self) -> &'static str {
         match self {
-            FtsIndexEvent::Index => "Full-text search index done",
-            FtsIndexEvent::Locked => "Full-text search index is locked",
-            FtsIndexEvent::LockBusy => "Full-text search index lock is busy",
-            FtsIndexEvent::BlobNotFound => "Blob not found for full-text indexing",
-            FtsIndexEvent::MetadataNotFound => "Metadata not found for full-text indexing",
+            TaskQueueEvent::TaskAcquired => "Task acquired from queue",
+            TaskQueueEvent::TaskLocked => "Task is locked by another process",
+            TaskQueueEvent::BlobNotFound => "Blob not found for task",
+            TaskQueueEvent::MetadataNotFound => "Metadata not found for task",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
-            FtsIndexEvent::Index => "The full-text search index has been updated",
-            FtsIndexEvent::Locked => "The full-text search index is locked",
-            FtsIndexEvent::LockBusy => "The full-text search index lock is busy",
-            FtsIndexEvent::BlobNotFound => "The blob was not found for full-text indexing",
-            FtsIndexEvent::MetadataNotFound => "The metadata was not found for full-text indexing",
+            TaskQueueEvent::TaskAcquired => "A task has been acquired from the queue",
+            TaskQueueEvent::TaskLocked => "The task id is locked by another process",
+            TaskQueueEvent::BlobNotFound => "The requested blob was not found for task",
+            TaskQueueEvent::MetadataNotFound => "The metadata was not found for task",
         }
     }
 }
@@ -253,6 +247,7 @@ impl ImapEvent {
             ImapEvent::RawOutput => "Raw IMAP output sent",
             ImapEvent::ConnectionStart => "IMAP connection started",
             ImapEvent::ConnectionEnd => "IMAP connection ended",
+            ImapEvent::GetQuota => "IMAP GETQUOTA command",
         }
     }
 
@@ -294,6 +289,7 @@ impl ImapEvent {
             ImapEvent::RawOutput => "Raw IMAP output sent",
             ImapEvent::ConnectionStart => "IMAP connection started",
             ImapEvent::ConnectionEnd => "IMAP connection ended",
+            ImapEvent::GetQuota => "Client requested mailbox quota",
         }
     }
 }
@@ -400,7 +396,7 @@ impl SmtpEvent {
     pub fn description(&self) -> &'static str {
         match self {
             SmtpEvent::Error => "SMTP error occurred",
-            SmtpEvent::RemoteIdNotFound => "Remote host ID not found",
+            SmtpEvent::IdNotFound => "Strategy not found",
             SmtpEvent::ConcurrencyLimitExceeded => "Concurrency limit exceeded",
             SmtpEvent::TransferLimitExceeded => "Transfer limit exceeded",
             SmtpEvent::RateLimitExceeded => "Rate limit exceeded",
@@ -409,8 +405,6 @@ impl SmtpEvent {
             SmtpEvent::MessageParseFailed => "Message parsing failed",
             SmtpEvent::MessageTooLarge => "Message too large",
             SmtpEvent::LoopDetected => "Mail loop detected",
-            SmtpEvent::PipeSuccess => "Pipe command succeeded",
-            SmtpEvent::PipeError => "Pipe command failed",
             SmtpEvent::DkimPass => "DKIM verification passed",
             SmtpEvent::DkimFail => "DKIM verification failed",
             SmtpEvent::ArcPass => "ARC verification passed",
@@ -442,6 +436,7 @@ impl SmtpEvent {
             SmtpEvent::RcptToDuplicate => "Duplicate RCPT TO",
             SmtpEvent::RcptToRewritten => "RCPT TO address rewritten",
             SmtpEvent::RcptToMissing => "RCPT TO address missing",
+            SmtpEvent::RcptToGreylisted => "RCPT TO greylisted",
             SmtpEvent::TooManyRecipients => "Too many recipients",
             SmtpEvent::TooManyInvalidRcpt => "Too many invalid recipients",
             SmtpEvent::RawInput => "Raw SMTP input received",
@@ -488,9 +483,7 @@ impl SmtpEvent {
     pub fn explain(&self) -> &'static str {
         match self {
             SmtpEvent::Error => "An error occurred during an SMTP command",
-            SmtpEvent::RemoteIdNotFound => {
-                "The remote server ID was not found in the configuration"
-            }
+            SmtpEvent::IdNotFound => "The strategy ID was not found in the configuration",
             SmtpEvent::ConcurrencyLimitExceeded => "The concurrency limit was exceeded",
             SmtpEvent::TransferLimitExceeded => {
                 "The remote host transferred more data than allowed"
@@ -503,8 +496,6 @@ impl SmtpEvent {
             SmtpEvent::LoopDetected => {
                 "A mail loop was detected, the message contains too many Received headers"
             }
-            SmtpEvent::PipeSuccess => "The pipe command succeeded",
-            SmtpEvent::PipeError => "The pipe command failed",
             SmtpEvent::DkimPass => "Successful DKIM verification",
             SmtpEvent::DkimFail => "Failed to verify DKIM signature",
             SmtpEvent::ArcPass => "Successful ARC verification",
@@ -552,6 +543,7 @@ impl SmtpEvent {
             }
             SmtpEvent::RcptToRewritten => "The envelope recipient address was rewritten",
             SmtpEvent::RcptToMissing => "The remote client issued a DATA command before RCPT TO",
+            SmtpEvent::RcptToGreylisted => "The recipient was greylisted",
             SmtpEvent::TooManyRecipients => {
                 "The remote client exceeded the number of recipients allowed"
             }
@@ -716,8 +708,7 @@ impl QueueEvent {
     pub fn description(&self) -> &'static str {
         match self {
             QueueEvent::Rescheduled => "Message rescheduled for delivery",
-            QueueEvent::LockBusy => "Queue lock is busy",
-            QueueEvent::Locked => "Queue is locked",
+            QueueEvent::Locked => "Queue event is locked by another process",
             QueueEvent::BlobNotFound => "Message blob not found",
             QueueEvent::RateLimitExceeded => "Rate limit exceeded",
             QueueEvent::ConcurrencyLimitExceeded => "Concurrency limit exceeded",
@@ -727,14 +718,14 @@ impl QueueEvent {
             QueueEvent::QueueReport => "Queued report for delivery",
             QueueEvent::QueueDsn => "Queued DSN for delivery",
             QueueEvent::QueueAutogenerated => "Queued autogenerated message for delivery",
+            QueueEvent::BackPressure => "Queue backpressure detected",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
             QueueEvent::Rescheduled => "The message was rescheduled for delivery",
-            QueueEvent::LockBusy => "The queue lock is busy",
-            QueueEvent::Locked => "The queue is locked",
+            QueueEvent::Locked => "The queue event is locked by another process",
             QueueEvent::BlobNotFound => "The message blob was not found",
             QueueEvent::RateLimitExceeded => "The queue rate limit was exceeded",
             QueueEvent::ConcurrencyLimitExceeded => "The queue concurrency limit was exceeded",
@@ -746,6 +737,9 @@ impl QueueEvent {
             QueueEvent::QueueReport => "A new report was queued for delivery",
             QueueEvent::QueueDsn => "A delivery status notification was queued for delivery",
             QueueEvent::QueueAutogenerated => "A system generated message was queued for delivery",
+            QueueEvent::BackPressure => {
+                "Queue congested, processing can't keep up with incoming message rate"
+            }
         }
     }
 }
@@ -809,8 +803,8 @@ impl OutgoingReportEvent {
             OutgoingReportEvent::DkimRateLimited => "DKIM report rate limited",
             OutgoingReportEvent::DmarcReport => "DMARC report sent",
             OutgoingReportEvent::DmarcRateLimited => "DMARC report rate limited",
-            OutgoingReportEvent::DmarcAggregateReport => "DMARC aggregate report sent",
-            OutgoingReportEvent::TlsAggregate => "TLS aggregate report sent",
+            OutgoingReportEvent::DmarcAggregateReport => "DMARC aggregate is being prepared",
+            OutgoingReportEvent::TlsAggregate => "TLS aggregate report is being prepared",
             OutgoingReportEvent::HttpSubmission => "Report submitted via HTTP",
             OutgoingReportEvent::UnauthorizedReportingAddress => "Unauthorized reporting address",
             OutgoingReportEvent::ReportingAddressValidationError => {
@@ -819,9 +813,7 @@ impl OutgoingReportEvent {
             OutgoingReportEvent::NotFound => "Report not found",
             OutgoingReportEvent::SubmissionError => "Error submitting report",
             OutgoingReportEvent::NoRecipientsFound => "No recipients found for report",
-            OutgoingReportEvent::LockBusy => "Report lock is busy",
-            OutgoingReportEvent::LockDeleted => "Report lock was deleted",
-            OutgoingReportEvent::Locked => "Report is locked",
+            OutgoingReportEvent::Locked => "Report is locked by another process",
         }
     }
 
@@ -833,8 +825,8 @@ impl OutgoingReportEvent {
             OutgoingReportEvent::DkimRateLimited => "The DKIM report was rate limited",
             OutgoingReportEvent::DmarcReport => "A DMARC report has been sent",
             OutgoingReportEvent::DmarcRateLimited => "The DMARC report was rate limited",
-            OutgoingReportEvent::DmarcAggregateReport => "A DMARC aggregate report has been sent",
-            OutgoingReportEvent::TlsAggregate => "A TLS aggregate report has been sent",
+            OutgoingReportEvent::DmarcAggregateReport => "A DMARC aggregate report will be sent",
+            OutgoingReportEvent::TlsAggregate => "A TLS aggregate report will be sent",
             OutgoingReportEvent::HttpSubmission => "The report was submitted via HTTP",
             OutgoingReportEvent::UnauthorizedReportingAddress => {
                 "The reporting address is not authorized to send reports"
@@ -845,9 +837,7 @@ impl OutgoingReportEvent {
             OutgoingReportEvent::NotFound => "The report was not found",
             OutgoingReportEvent::SubmissionError => "Error submitting the report",
             OutgoingReportEvent::NoRecipientsFound => "No recipients found for the report",
-            OutgoingReportEvent::LockBusy => "The report lock is busy",
-            OutgoingReportEvent::LockDeleted => "The report lock was deleted",
-            OutgoingReportEvent::Locked => "The report is locked",
+            OutgoingReportEvent::Locked => "The report is locked by another process",
         }
     }
 }
@@ -881,6 +871,7 @@ impl TlsRptEvent {
         match self {
             TlsRptEvent::RecordFetch => "Fetched TLS-RPT record",
             TlsRptEvent::RecordFetchError => "Error fetching TLS-RPT record",
+            TlsRptEvent::RecordNotFound => "TLS-RPT record not found",
         }
     }
 
@@ -888,6 +879,7 @@ impl TlsRptEvent {
         match self {
             TlsRptEvent::RecordFetch => "The TLS-RPT record has been fetched",
             TlsRptEvent::RecordFetchError => "An error occurred while fetching the TLS-RPT record",
+            TlsRptEvent::RecordNotFound => "No TLS-RPT records were found",
         }
     }
 }
@@ -1015,29 +1007,31 @@ impl PushSubscriptionEvent {
 impl SpamEvent {
     pub fn description(&self) -> &'static str {
         match self {
+            SpamEvent::Pyzor => "Pyzor success",
             SpamEvent::PyzorError => "Pyzor error",
-            SpamEvent::ListUpdated => "Spam list updated",
             SpamEvent::Train => "Training spam filter",
-            SpamEvent::TrainBalance => "Balancing spam filter training data",
+            SpamEvent::TrainBalance => "Spam filter model balance verify",
             SpamEvent::TrainError => "Error training spam filter",
             SpamEvent::Classify => "Classifying message for spam",
-            SpamEvent::ClassifyError => "Error classifying message for spam",
-            SpamEvent::NotEnoughTrainingData => "Not enough training data for spam filter",
+            SpamEvent::ClassifyError => "Not enough training data for spam filter",
+            SpamEvent::Dnsbl => "DNSBL query",
+            SpamEvent::DnsblError => "Error querying DNSBL",
+            SpamEvent::TrainAccount => "Training spam filter for account",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
             SpamEvent::PyzorError => "An error occurred with Pyzor",
-            SpamEvent::ListUpdated => "The spam list has been updated",
             SpamEvent::Train => "The spam filter is being trained with the message",
-            SpamEvent::TrainBalance => "The spam filter training data is being balanced",
+            SpamEvent::TrainBalance => "The spam filter training data is verified for balance",
             SpamEvent::TrainError => "An error occurred while training the spam filter",
             SpamEvent::Classify => "The message is being classified for spam",
-            SpamEvent::ClassifyError => "An error occurred while classifying the message for spam",
-            SpamEvent::NotEnoughTrainingData => {
-                "There is not enough training data for the spam filter"
-            }
+            SpamEvent::ClassifyError => "There is not enough training data for the spam filter",
+            SpamEvent::Pyzor => "Pyzor query successful",
+            SpamEvent::Dnsbl => "The DNSBL query was successful",
+            SpamEvent::DnsblError => "An error occurred while querying the DNSBL",
+            SpamEvent::TrainAccount => "The spam filter has been trained for the account",
         }
     }
 }
@@ -1146,12 +1140,11 @@ impl ServerEvent {
     pub fn description(&self) -> &'static str {
         match self {
             ServerEvent::Startup => {
-                concat!("Starting Stalwart Mail Server v", env!("CARGO_PKG_VERSION"))
+                concat!("Starting Stalwart Server v", env!("CARGO_PKG_VERSION"))
             }
-            ServerEvent::Shutdown => concat!(
-                "Shutting down Stalwart Mail Server v",
-                env!("CARGO_PKG_VERSION")
-            ),
+            ServerEvent::Shutdown => {
+                concat!("Shutting down Stalwart Server v", env!("CARGO_PKG_VERSION"))
+            }
             ServerEvent::StartupError => "Server startup error",
             ServerEvent::ThreadError => "Server thread error",
             ServerEvent::Licensing => "Server licensing event",
@@ -1160,8 +1153,8 @@ impl ServerEvent {
 
     pub fn explain(&self) -> &'static str {
         match self {
-            ServerEvent::Startup => "Stalwart Mail Server has started",
-            ServerEvent::Shutdown => "Stalwart Mail Server is shutting down",
+            ServerEvent::Startup => "Stalwart Server has started",
+            ServerEvent::Shutdown => "Stalwart Server is shutting down",
             ServerEvent::StartupError => "An error occurred while starting the server",
             ServerEvent::ThreadError => "An error occurred with a server thread",
             ServerEvent::Licensing => "A licensing event occurred",
@@ -1274,7 +1267,7 @@ impl PurgeEvent {
             PurgeEvent::Finished => "Purge finished",
             PurgeEvent::Running => "Purge running",
             PurgeEvent::Error => "Purge error",
-            PurgeEvent::PurgeActive => "Active purge in progress",
+            PurgeEvent::InProgress => "Active purge in progress",
             PurgeEvent::AutoExpunge => "Auto-expunge executed",
             PurgeEvent::TombstoneCleanup => "Tombstone cleanup executed",
         }
@@ -1286,7 +1279,7 @@ impl PurgeEvent {
             PurgeEvent::Finished => "The purge has finished",
             PurgeEvent::Running => "The purge is running",
             PurgeEvent::Error => "An error occurred with the purge",
-            PurgeEvent::PurgeActive => "An active purge is in progress",
+            PurgeEvent::InProgress => "An active purge is in progress",
             PurgeEvent::AutoExpunge => "Auto-expunge has been executed",
             PurgeEvent::TombstoneCleanup => "Tombstone cleanup has been executed",
         }
@@ -1329,7 +1322,6 @@ impl ConfigEvent {
             ConfigEvent::ParseWarning => "Configuration parse warning",
             ConfigEvent::BuildWarning => "Configuration build warning",
             ConfigEvent::ImportExternal => "Importing external configuration",
-            ConfigEvent::ExternalKeyIgnored => "External configuration key ignored",
             ConfigEvent::AlreadyUpToDate => "Configuration already up to date",
         }
     }
@@ -1347,7 +1339,6 @@ impl ConfigEvent {
             ConfigEvent::ParseWarning => "A warning occurred while parsing the configuration",
             ConfigEvent::BuildWarning => "A warning occurred while building the configuration",
             ConfigEvent::ImportExternal => "An external configuration is being imported",
-            ConfigEvent::ExternalKeyIgnored => "An external configuration key is ignored",
             ConfigEvent::AlreadyUpToDate => "The configuration is already up to date",
         }
     }
@@ -1540,6 +1531,7 @@ impl StoreEvent {
             StoreEvent::ElasticsearchError => "ElasticSearch error",
             StoreEvent::RedisError => "Redis error",
             StoreEvent::S3Error => "S3 error",
+            StoreEvent::AzureError => "Azure error",
             StoreEvent::FilesystemError => "Filesystem error",
             StoreEvent::PoolError => "Connection pool error",
             StoreEvent::DataCorruption => "Data corruption detected",
@@ -1553,12 +1545,18 @@ impl StoreEvent {
             StoreEvent::BlobMissingMarker => "Blob missing marker",
             StoreEvent::SqlQuery => "SQL query executed",
             StoreEvent::LdapQuery => "LDAP query executed",
-            StoreEvent::LdapBind => "LDAP bind operation",
+            StoreEvent::LdapWarning => "LDAP authentication warning",
             StoreEvent::DataWrite => "Write batch operation",
             StoreEvent::BlobRead => "Blob read operation",
             StoreEvent::BlobWrite => "Blob write operation",
             StoreEvent::BlobDelete => "Blob delete operation",
             StoreEvent::DataIterate => "Data store iteration operation",
+            StoreEvent::HttpStoreFetch => "HTTP store updated",
+            StoreEvent::HttpStoreError => "Error updating HTTP store",
+            StoreEvent::CacheMiss => "Cache miss",
+            StoreEvent::CacheHit => "Cache hit",
+            StoreEvent::CacheStale => "Cache is stale",
+            StoreEvent::CacheUpdate => "Cache update",
         }
     }
 
@@ -1574,6 +1572,7 @@ impl StoreEvent {
             StoreEvent::ElasticsearchError => "An ElasticSearch error occurred",
             StoreEvent::RedisError => "A Redis error occurred",
             StoreEvent::S3Error => "An S3 error occurred",
+            StoreEvent::AzureError => "An Azure error occurred",
             StoreEvent::FilesystemError => "A filesystem error occurred",
             StoreEvent::PoolError => "A connection pool error occurred",
             StoreEvent::DataCorruption => "Data corruption was detected",
@@ -1587,12 +1586,18 @@ impl StoreEvent {
             StoreEvent::BlobMissingMarker => "The blob is missing a marker",
             StoreEvent::SqlQuery => "An SQL query was executed",
             StoreEvent::LdapQuery => "An LDAP query was executed",
-            StoreEvent::LdapBind => "An LDAP bind operation was executed",
+            StoreEvent::LdapWarning => "An LDAP authentication warning occurred",
             StoreEvent::DataWrite => "A write batch operation was executed",
             StoreEvent::BlobRead => "A blob read operation was executed",
             StoreEvent::BlobWrite => "A blob write operation was executed",
             StoreEvent::BlobDelete => "A blob delete operation was executed",
             StoreEvent::DataIterate => "A data store iteration operation was executed",
+            StoreEvent::HttpStoreFetch => "The HTTP store was updated",
+            StoreEvent::HttpStoreError => "An error occurred while updating the HTTP store",
+            StoreEvent::CacheMiss => "No cache entry found for the account",
+            StoreEvent::CacheHit => "Cache entry found for the account, no update needed",
+            StoreEvent::CacheStale => "Cache is too old, rebuilding",
+            StoreEvent::CacheUpdate => "Cache updated with latest database changes",
         }
     }
 }
@@ -1606,6 +1611,7 @@ impl MessageIngestEvent {
             MessageIngestEvent::JmapAppend => "Message appended via JMAP",
             MessageIngestEvent::Duplicate => "Skipping duplicate message",
             MessageIngestEvent::Error => "Message ingestion error",
+            MessageIngestEvent::FtsIndex => "Full-text search index updated",
         }
     }
 
@@ -1617,6 +1623,7 @@ impl MessageIngestEvent {
             MessageIngestEvent::JmapAppend => "The message has been appended via JMAP",
             MessageIngestEvent::Duplicate => "The message is a duplicate and has been skipped",
             MessageIngestEvent::Error => "An error occurred while ingesting the message",
+            MessageIngestEvent::FtsIndex => "The full-text search index has been updated",
         }
     }
 }
@@ -1691,6 +1698,7 @@ impl LimitEvent {
             LimitEvent::Quota => "Quota limit reached",
             LimitEvent::BlobQuota => "Blob quota limit reached",
             LimitEvent::TooManyRequests => "Too many requests",
+            LimitEvent::TenantQuota => "Tenant quota limit reached",
         }
     }
 
@@ -1705,6 +1713,7 @@ impl LimitEvent {
             LimitEvent::Quota => "The quota limit has been reached",
             LimitEvent::BlobQuota => "The blob quota limit has been reached",
             LimitEvent::TooManyRequests => "Too many requests have been made",
+            LimitEvent::TenantQuota => "One of the tenant quota limits has been reached",
         }
     }
 }
@@ -1741,6 +1750,8 @@ impl AuthEvent {
             AuthEvent::MissingTotp => "Missing TOTP for authentication",
             AuthEvent::TooManyAttempts => "Too many authentication attempts",
             AuthEvent::Error => "Authentication error",
+            AuthEvent::TokenExpired => "OAuth token expired",
+            AuthEvent::ClientRegistration => "OAuth Client registration",
         }
     }
 
@@ -1751,6 +1762,8 @@ impl AuthEvent {
             AuthEvent::MissingTotp => "TOTP is missing for authentication",
             AuthEvent::TooManyAttempts => "Too many authentication attempts have been made",
             AuthEvent::Error => "An error occurred with authentication",
+            AuthEvent::TokenExpired => "OAuth authentication token has expired",
+            AuthEvent::ClientRegistration => "OAuth client successfully registered",
         }
     }
 }
@@ -1781,9 +1794,11 @@ impl SecurityEvent {
     pub fn description(&self) -> &'static str {
         match self {
             SecurityEvent::AuthenticationBan => "Banned due to authentication errors",
-            SecurityEvent::BruteForceBan => "Banned due to brute force attack",
+            SecurityEvent::AbuseBan => "Banned due to abuse",
             SecurityEvent::LoiterBan => "Banned due to loitering",
             SecurityEvent::IpBlocked => "Blocked IP address",
+            SecurityEvent::ScanBan => "Banned due to scan",
+            SecurityEvent::Unauthorized => "Unauthorized access",
         }
     }
 
@@ -1792,11 +1807,112 @@ impl SecurityEvent {
             SecurityEvent::AuthenticationBan => {
                 "IP address was banned due to multiple authentication errors"
             }
-            SecurityEvent::BruteForceBan => {
-                "IP address was banned due to possible brute force attack"
+            SecurityEvent::AbuseBan => {
+                "IP address was banned due to abuse, such as RCPT TO attacks"
             }
+            SecurityEvent::ScanBan => "IP address was banned due to exploit scanning",
             SecurityEvent::LoiterBan => "IP address was banned due to multiple loitering events",
             SecurityEvent::IpBlocked => "Rejected connection from blocked IP address",
+            SecurityEvent::Unauthorized => "Account does not have permission to access resource",
+        }
+    }
+}
+
+impl AiEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            AiEvent::LlmResponse => "LLM response",
+            AiEvent::ApiError => "AI API error",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            AiEvent::LlmResponse => "An LLM response has been received",
+            AiEvent::ApiError => "An AI API error occurred",
+        }
+    }
+}
+
+impl WebDavEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            WebDavEvent::Propfind => "WebDAV PROPFIND request",
+            WebDavEvent::Proppatch => "WebDAV PROPPATCH request",
+            WebDavEvent::Get => "WebDAV GET request",
+            WebDavEvent::Report => "WebDAV REPORT request",
+            WebDavEvent::Mkcol => "WebDAV MKCOL request",
+            WebDavEvent::Delete => "WebDAV DELETE request",
+            WebDavEvent::Put => "WebDAV PUT request",
+            WebDavEvent::Post => "WebDAV POST request",
+            WebDavEvent::Patch => "WebDAV PATCH request",
+            WebDavEvent::Copy => "WebDAV COPY request",
+            WebDavEvent::Move => "WebDAV MOVE request",
+            WebDavEvent::Lock => "WebDAV LOCK request",
+            WebDavEvent::Unlock => "WebDAV UNLOCK request",
+            WebDavEvent::Acl => "WebDAV ACL request",
+            WebDavEvent::Error => "WebDAV error",
+            WebDavEvent::Head => "WebDAV HEAD request",
+            WebDavEvent::Mkcalendar => "WebDAV MKCALENDAR request",
+            WebDavEvent::Options => "WebDAV OPTIONS request",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            WebDavEvent::Propfind => "A PROPFIND request has been made to the server",
+            WebDavEvent::Proppatch => "A PROPPATCH request has been made to the server",
+            WebDavEvent::Get => "A GET request has been made to the server",
+            WebDavEvent::Report => "A REPORT request has been made to the server",
+            WebDavEvent::Mkcol => "A MKCOL request has been made to the server",
+            WebDavEvent::Delete => "A DELETE request has been made to the server",
+            WebDavEvent::Put => "A PUT request has been made to the server",
+            WebDavEvent::Post => "A POST request has been made to the server",
+            WebDavEvent::Patch => "A PATCH request has been made to the server",
+            WebDavEvent::Copy => "A COPY request has been made to the server",
+            WebDavEvent::Move => "A MOVE request has been made to the server",
+            WebDavEvent::Lock => "A LOCK request has been made to the server",
+            WebDavEvent::Unlock => "An UNLOCK request has been made to the server",
+            WebDavEvent::Acl => {
+                "An ACL request has been made to the
+                server"
+            }
+            WebDavEvent::Error => "An error occurred with the WebDAV request",
+            WebDavEvent::Head => "A HEAD request has been made to the server",
+            WebDavEvent::Mkcalendar => "A MKCALENDAR request has been made to the server",
+            WebDavEvent::Options => "An OPTIONS request has been made to the server",
+        }
+    }
+}
+
+impl CalendarEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            CalendarEvent::RuleExpansionError => "Calendar rule expansion error",
+            CalendarEvent::AlarmSent => "Calendar alarm sent",
+            CalendarEvent::AlarmSkipped => "Calendar alarm skipped",
+            CalendarEvent::AlarmRecipientOverride => "Calendar alarm recipient overriden",
+            CalendarEvent::AlarmFailed => "Calendar alarm could not be sent",
+            CalendarEvent::ItipMessageSent => "Calendar iTIP message sent",
+            CalendarEvent::ItipMessageReceived => "Calendar iTIP message received",
+            CalendarEvent::ItipMessageError => "iTIP message error",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            CalendarEvent::RuleExpansionError => {
+                "An error occurred while expanding calendar recurrences"
+            }
+            CalendarEvent::AlarmSent => "A calendar alarm has been sent to the recipient",
+            CalendarEvent::AlarmSkipped => "A calendar alarm was skipped",
+            CalendarEvent::AlarmRecipientOverride => "A calendar alarm recipient was overridden",
+            CalendarEvent::AlarmFailed => "A calendar alarm could not be sent to the recipient",
+            CalendarEvent::ItipMessageSent => "A calendar iTIP message has been sent",
+            CalendarEvent::ItipMessageReceived => "A calendar iTIP/iMIP message has been received",
+            CalendarEvent::ItipMessageError => {
+                "An error occurred while processing an iTIP/iMIP message"
+            }
         }
     }
 }

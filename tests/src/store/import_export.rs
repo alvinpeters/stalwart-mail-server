@@ -1,23 +1,25 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::store::TempDir;
 use ahash::AHashSet;
-use common::Core;
-use jmap_proto::types::{collection::Collection, property::Property};
+use common::{Core, manager::backup::BackupParams};
+use jmap_proto::types::{
+    collection::{Collection, SyncCollection},
+    property::Property,
+};
 use store::{
     rand,
     write::{
-        AnyKey, BatchBuilder, BitmapClass, BitmapHash, BlobOp, DirectoryClass, LookupClass,
-        MaybeDynamicId, MaybeDynamicValue, Operation, QueueClass, QueueEvent, TagValue, ValueClass,
+        AnyKey, BatchBuilder, BitmapClass, BitmapHash, BlobOp, DirectoryClass, InMemoryClass,
+        Operation, QueueClass, QueueEvent, TagValue, ValueClass,
     },
     *,
 };
 use utils::BlobHash;
-
-use crate::store::TempDir;
 
 pub async fn test(db: Store) {
     let mut core = Core::default();
@@ -35,7 +37,7 @@ pub async fn test(db: Store) {
     let mut blob_hashes = Vec::new();
     for blob_size in [16, 128, 1024, 2056, 102400] {
         let data = random_bytes(blob_size);
-        let hash = BlobHash::from(data.as_slice());
+        let hash = BlobHash::generate(data.as_slice());
         blob_hashes.push(hash.clone());
         core.storage
             .blob
@@ -44,7 +46,7 @@ pub async fn test(db: Store) {
             .unwrap();
         batch.set(ValueClass::Blob(BlobOp::Commit { hash }), vec![]);
     }
-    db.write(batch.build()).await.unwrap();
+    db.write(batch.build_all()).await.unwrap();
 
     // Create account data
     println!("Creating account data...");
@@ -57,7 +59,7 @@ pub async fn test(db: Store) {
             batch.with_collection(collection);
 
             for document_id in [0, 10, 20, 30, 40] {
-                batch.create_document_with_id(document_id);
+                batch.create_document(document_id);
 
                 if collection == u8::from(Collection::Mailbox) {
                     batch
@@ -98,28 +100,30 @@ pub async fn test(db: Store) {
                     );
                 }
 
-                batch.ops.push(Operation::ChangeId {
+                batch.log_item_insert(SyncCollection::from(collection), None);
+
+                /*batch.any_op(Operation::ChangeId {
                     change_id: document_id as u64 + account_id as u64 + collection as u64,
                 });
 
-                batch.ops.push(Operation::Log {
+                batch.any_op(Operation::Log {
                     set: MaybeDynamicValue::Static(vec![
                         account_id as u8,
                         collection,
                         document_id as u8,
                     ]),
-                });
+                });*/
 
                 for field in 0..5 {
-                    batch.ops.push(Operation::Bitmap {
+                    batch.any_op(Operation::Bitmap {
                         class: BitmapClass::Tag {
                             field,
-                            value: TagValue::Id(MaybeDynamicId::Static(rand::random())),
+                            value: TagValue::Id(rand::random()),
                         },
                         set: true,
                     });
 
-                    batch.ops.push(Operation::Bitmap {
+                    batch.any_op(Operation::Bitmap {
                         class: BitmapClass::Tag {
                             field,
                             value: TagValue::Text(random_bytes(field as usize + 2)),
@@ -127,7 +131,7 @@ pub async fn test(db: Store) {
                         set: true,
                     });
 
-                    batch.ops.push(Operation::Bitmap {
+                    batch.any_op(Operation::Bitmap {
                         class: BitmapClass::Text {
                             field,
                             token: BitmapHash::new(random_bytes(field as usize + 2)),
@@ -135,7 +139,7 @@ pub async fn test(db: Store) {
                         set: true,
                     });
 
-                    batch.ops.push(Operation::Index {
+                    batch.any_op(Operation::Index {
                         field,
                         key: random_bytes(field as usize + 2),
                         set: true,
@@ -144,7 +148,7 @@ pub async fn test(db: Store) {
             }
         }
 
-        db.write(batch.build()).await.unwrap();
+        db.write(batch.build_all()).await.unwrap();
     }
 
     // Create queue, config and lookup data
@@ -159,15 +163,16 @@ pub async fn test(db: Store) {
             ValueClass::Queue(QueueClass::MessageEvent(QueueEvent {
                 due: rand::random(),
                 queue_id: rand::random(),
+                queue_name: rand::random(),
             })),
             random_bytes(idx),
         );
         batch.set(
-            ValueClass::Lookup(LookupClass::Key(random_bytes(idx))),
+            ValueClass::InMemory(InMemoryClass::Key(random_bytes(idx))),
             random_bytes(idx),
         );
         batch.add(
-            ValueClass::Lookup(LookupClass::Counter(random_bytes(idx))),
+            ValueClass::InMemory(InMemoryClass::Counter(random_bytes(idx))),
             rand::random(),
         );
         batch.set(
@@ -175,7 +180,7 @@ pub async fn test(db: Store) {
             random_bytes(idx + 10),
         );
     }
-    db.write(batch.build()).await.unwrap();
+    db.write(batch.build_all()).await.unwrap();
 
     // Create directory data
     println!("Creating directory data...");
@@ -186,7 +191,7 @@ pub async fn test(db: Store) {
 
     for account_id in [1, 2, 3, 4, 5] {
         batch
-            .create_document_with_id(account_id)
+            .create_document(account_id)
             .add(
                 ValueClass::Directory(DirectoryClass::UsedQuota(account_id)),
                 rand::random(),
@@ -204,33 +209,25 @@ pub async fn test(db: Store) {
                 random_bytes(4),
             )
             .set(
-                ValueClass::Directory(DirectoryClass::Domain(random_bytes(
-                    4 + account_id as usize,
-                ))),
-                random_bytes(4),
-            )
-            .set(
-                ValueClass::Directory(DirectoryClass::Principal(MaybeDynamicId::Static(
-                    account_id,
-                ))),
+                ValueClass::Directory(DirectoryClass::Principal(account_id)),
                 random_bytes(30),
             )
             .set(
                 ValueClass::Directory(DirectoryClass::MemberOf {
-                    principal_id: MaybeDynamicId::Static(account_id),
-                    member_of: MaybeDynamicId::Static(rand::random()),
+                    principal_id: account_id,
+                    member_of: rand::random(),
                 }),
                 random_bytes(15),
             )
             .set(
                 ValueClass::Directory(DirectoryClass::Members {
-                    principal_id: MaybeDynamicId::Static(account_id),
-                    has_member: MaybeDynamicId::Static(rand::random()),
+                    principal_id: account_id,
+                    has_member: rand::random(),
                 }),
                 random_bytes(15),
             );
     }
-    db.write(batch.build()).await.unwrap();
+    db.write(batch.build_all()).await.unwrap();
 
     // Obtain store hash
     println!("Calculating store hash...");
@@ -240,7 +237,7 @@ pub async fn test(db: Store) {
     // Export store
     println!("Exporting store...");
     let temp_dir = TempDir::new("art_vandelay_tests", true);
-    core.backup(temp_dir.path.clone()).await;
+    core.backup(BackupParams::new(temp_dir.path.clone())).await;
 
     // Destroy store
     println!("Destroying store...");
@@ -275,10 +272,7 @@ struct KeyValue {
 
 impl Snapshot {
     async fn new(db: &Store) -> Self {
-        let is_sql = matches!(
-            db,
-            Store::SQLite(_) | Store::PostgreSQL(_) | Store::MySQL(_)
-        );
+        let is_sql = db.is_sql();
 
         let mut keys = AHashSet::new();
 
@@ -288,14 +282,15 @@ impl Snapshot {
             (SUBSPACE_BITMAP_TAG, false),
             (SUBSPACE_BITMAP_TEXT, false),
             (SUBSPACE_DIRECTORY, true),
-            (SUBSPACE_FTS_QUEUE, true),
+            (SUBSPACE_TASK_QUEUE, true),
             (SUBSPACE_INDEXES, false),
             (SUBSPACE_BLOB_RESERVE, true),
             (SUBSPACE_BLOB_LINK, true),
             (SUBSPACE_BLOBS, true),
             (SUBSPACE_LOGS, true),
             (SUBSPACE_COUNTER, !is_sql),
-            (SUBSPACE_LOOKUP_VALUE, true),
+            (SUBSPACE_IN_MEMORY_COUNTER, !is_sql),
+            (SUBSPACE_IN_MEMORY_VALUE, true),
             (SUBSPACE_PROPERTY, true),
             (SUBSPACE_SETTINGS, true),
             (SUBSPACE_QUEUE_MESSAGE, true),

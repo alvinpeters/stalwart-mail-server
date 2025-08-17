@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
@@ -24,6 +24,7 @@ pub mod login;
 pub mod logout;
 pub mod namespace;
 pub mod noop;
+pub mod quota;
 pub mod rename;
 pub mod search;
 pub mod select;
@@ -50,9 +51,9 @@ impl FromModSeq for Query {
     }
 }
 
-impl ToModSeq for Option<u64> {
+impl ToModSeq for u64 {
     fn to_modseq(&self) -> u64 {
-        self.map(|modseq| modseq + 1).unwrap_or(0)
+        if *self > 0 { *self + 1 } else { 0 }
     }
 }
 

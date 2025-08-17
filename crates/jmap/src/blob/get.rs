@@ -1,34 +1,52 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{Server, auth::AccessToken};
+use email::message::metadata::MessageData;
 use jmap_proto::{
     method::{
         get::{GetRequest, GetResponse},
         lookup::{BlobInfo, BlobLookupRequest, BlobLookupResponse},
     },
-    object::{blob::GetArguments, Object},
+    object::blob::GetArguments,
     types::{
+        MaybeUnparsable,
         collection::Collection,
         id::Id,
         property::{DataProperty, DigestProperty, Property},
         type_state::DataType,
-        value::Value,
-        MaybeUnparsable,
+        value::{Object, Value},
     },
 };
 use mail_builder::encoders::base64::base64_encode;
 use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha512};
 use store::BlobClass;
+use trc::AddContext;
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, mailbox::UidMailbox, JMAP};
+use std::future::Future;
 
-impl JMAP {
-    pub async fn blob_get(
+use super::download::BlobDownload;
+
+pub trait BlobOperations: Sync + Send {
+    fn blob_get(
+        &self,
+        request: GetRequest<GetArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn blob_lookup(
+        &self,
+        request: BlobLookupRequest,
+    ) -> impl Future<Output = trc::Result<BlobLookupResponse>> + Send;
+}
+
+impl BlobOperations for Server {
+    async fn blob_get(
         &self,
         mut request: GetRequest<GetArguments>,
         access_token: &AccessToken,
@@ -67,8 +85,7 @@ impl JMAP {
                     } else {
                         range_to
                     };
-                    let bytes_range = bytes.get(range_from..range_to).unwrap_or_default();
-                    bytes_range
+                    bytes.get(range_from..range_to).unwrap_or_default()
                 };
 
                 for property in &properties {
@@ -147,7 +164,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn blob_lookup(&self, request: BlobLookupRequest) -> trc::Result<BlobLookupResponse> {
+    async fn blob_lookup(&self, request: BlobLookupRequest) -> trc::Result<BlobLookupResponse> {
         let mut include_email = false;
         let mut include_mailbox = false;
         let mut include_thread = false;
@@ -195,47 +212,36 @@ impl JMAP {
                         } if *account_id == req_account_id => {
                             let collection = Collection::from(*collection);
                             if collection == Collection::Email {
-                                if include_email || include_thread {
-                                    if let Some(thread_id) = self
-                                        .get_property::<u32>(
-                                            req_account_id,
-                                            Collection::Email,
-                                            *document_id,
-                                            Property::ThreadId,
-                                        )
-                                        .await?
-                                    {
-                                        if include_email {
-                                            matched_ids.append(
-                                                DataType::Email,
-                                                vec![Id::from_parts(thread_id, *document_id)],
-                                            );
-                                        }
-                                        if include_thread {
-                                            matched_ids.append(
-                                                DataType::Thread,
-                                                vec![Id::from(thread_id)],
-                                            );
-                                        }
+                                if let Some(data_) = self
+                                    .get_archive(req_account_id, Collection::Email, *document_id)
+                                    .await?
+                                {
+                                    let data = data_
+                                        .unarchive::<MessageData>()
+                                        .caused_by(trc::location!())?;
+                                    if include_email {
+                                        matched_ids.append(
+                                            DataType::Email,
+                                            vec![Id::from_parts(
+                                                u32::from(data.thread_id),
+                                                *document_id,
+                                            )],
+                                        );
                                     }
-                                }
-                                if include_mailbox {
-                                    if let Some(mailboxes) = self
-                                        .get_property::<Vec<UidMailbox>>(
-                                            req_account_id,
-                                            Collection::Email,
-                                            *document_id,
-                                            Property::MailboxIds,
-                                        )
-                                        .await?
-                                    {
+                                    if include_thread {
+                                        matched_ids.append(
+                                            DataType::Thread,
+                                            vec![Id::from(u32::from(data.thread_id))],
+                                        );
+                                    }
+                                    if include_mailbox {
                                         matched_ids.append(
                                             DataType::Mailbox,
-                                            mailboxes
-                                                .into_iter()
+                                            data.mailboxes
+                                                .iter()
                                                 .map(|m| {
                                                     debug_assert!(m.uid != 0);
-                                                    Id::from(m.mailbox_id)
+                                                    Id::from(u32::from(m.mailbox_id))
                                                 })
                                                 .collect::<Vec<_>>(),
                                         );

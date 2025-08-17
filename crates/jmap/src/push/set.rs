@@ -1,41 +1,54 @@
 /*
- * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use base64::{engine::general_purpose, Engine};
+use super::get::PushSubscriptionFetch;
+use base64::{Engine, engine::general_purpose};
+use common::{Server, auth::AccessToken};
+use email::push::{Keys, PushSubscription};
 use jmap_proto::{
     error::set::SetError,
     method::set::{RequestArguments, SetRequest, SetResponse},
-    object::Object,
     response::references::EvalObjectReferences,
     types::{
         collection::Collection,
         date::UTCDate,
         property::Property,
         type_state::DataType,
-        value::{MaybePatchValue, Value},
+        value::{MaybePatchValue, Object, Value},
     },
 };
+use rand::distr::Alphanumeric;
+use std::future::Future;
 use store::{
-    rand::{distributions::Alphanumeric, thread_rng, Rng},
-    write::{now, BatchBuilder, F_CLEAR, F_VALUE},
+    Serialize,
+    rand::{Rng, rng},
+    write::{Archiver, BatchBuilder, now},
 };
-
-use crate::{auth::AccessToken, JMAP};
+use trc::AddContext;
+use utils::map::bitmap::Bitmap;
 
 const EXPIRES_MAX: i64 = 7 * 24 * 3600; // 7 days
 const VERIFICATION_CODE_LEN: usize = 32;
 
-impl JMAP {
-    pub async fn push_subscription_set(
+pub trait PushSubscriptionSet: Sync + Send {
+    fn push_subscription_set(
+        &self,
+        request: SetRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+}
+
+impl PushSubscriptionSet for Server {
+    async fn push_subscription_set(
         &self,
         mut request: SetRequest<RequestArguments>,
         access_token: &AccessToken,
     ) -> trc::Result<SetResponse> {
         let account_id = access_token.primary_id();
-        let mut push_ids = self
+        let push_ids = self
             .get_document_ids(account_id, Collection::PushSubscription)
             .await?
             .unwrap_or_default();
@@ -43,8 +56,9 @@ impl JMAP {
         let will_destroy = request.unwrap_destroy();
 
         // Process creates
+        let mut batch = BatchBuilder::new();
         'create: for (id, object) in request.unwrap_create() {
-            let mut push = Object::with_capacity(object.properties.len());
+            let mut push = PushSubscription::default();
 
             if push_ids.len() as usize >= self.core.jmap.push_max_total {
                 response.not_created.append(id, SetError::forbidden().with_description(
@@ -53,25 +67,17 @@ impl JMAP {
                 continue 'create;
             }
 
-            for (property, value) in object.properties {
-                match response
+            for (property, value) in object.0 {
+                if let Err(err) = response
                     .eval_object_references(value)
-                    .and_then(|value| validate_push_value(&property, value, None))
+                    .and_then(|value| validate_push_value(&property, value, &mut push, true))
                 {
-                    Ok(Value::Null) => (),
-                    Ok(value) => {
-                        push.set(property, value);
-                    }
-                    Err(err) => {
-                        response.not_created.append(id, err);
-                        continue 'create;
-                    }
+                    response.not_created.append(id, err);
+                    continue 'create;
                 }
             }
 
-            if !push.properties.contains_key(&Property::DeviceClientId)
-                || !push.properties.contains_key(&Property::Url)
-            {
+            if push.device_client_id.is_empty() || push.url.is_empty() {
                 response.not_created.append(
                     id,
                     SetError::invalid_properties()
@@ -82,35 +88,35 @@ impl JMAP {
             }
 
             // Add expiry time if missing
-            let expires = if let Some(expires) = push.properties.get(&Property::Expires) {
-                expires.clone()
-            } else {
-                let expires = Value::Date(UTCDate::from_timestamp(now() as i64 + EXPIRES_MAX));
-                push.append(Property::Expires, expires.clone());
-                expires
-            };
+            if push.expires == 0 {
+                push.expires = now() + EXPIRES_MAX as u64;
+            }
+            let expires = UTCDate::from_timestamp(push.expires as i64);
 
             // Generate random verification code
-            push.append(
-                Property::Value,
-                Value::Text(
-                    thread_rng()
-                        .sample_iter(Alphanumeric)
-                        .take(VERIFICATION_CODE_LEN)
-                        .map(char::from)
-                        .collect::<String>(),
-                ),
-            );
+            push.verification_code = rng()
+                .sample_iter(Alphanumeric)
+                .take(VERIFICATION_CODE_LEN)
+                .map(char::from)
+                .collect::<String>();
 
             // Insert record
-            let mut batch = BatchBuilder::new();
+            let document_id = self
+                .store()
+                .assign_document_ids(account_id, Collection::PushSubscription, 1)
+                .await
+                .caused_by(trc::location!())?;
             batch
                 .with_account_id(account_id)
                 .with_collection(Collection::PushSubscription)
-                .create_document()
-                .value(Property::Value, push, F_VALUE);
-            let document_id = self.write_batch_expect_id(batch).await?;
-            push_ids.insert(document_id);
+                .create_document(document_id)
+                .set(
+                    Property::Value,
+                    Archiver::new(push)
+                        .serialize()
+                        .caused_by(trc::location!())?,
+                )
+                .commit_point();
             response.created.insert(
                 id,
                 Object::with_capacity(1)
@@ -131,46 +137,38 @@ impl JMAP {
             // Obtain push subscription
             let document_id = id.document_id();
             let mut push = if let Some(push) = self
-                .get_property::<Object<Value>>(
-                    account_id,
-                    Collection::PushSubscription,
-                    document_id,
-                    Property::Value,
-                )
+                .get_archive(account_id, Collection::PushSubscription, document_id)
                 .await?
             {
-                push
+                push.deserialize::<email::push::PushSubscription>()
+                    .caused_by(trc::location!())?
             } else {
                 response.not_updated.append(id, SetError::not_found());
                 continue 'update;
             };
 
-            for (property, value) in object.properties {
-                match response
+            for (property, value) in object.0 {
+                if let Err(err) = response
                     .eval_object_references(value)
-                    .and_then(|value| validate_push_value(&property, value, Some(&push)))
+                    .and_then(|value| validate_push_value(&property, value, &mut push, false))
                 {
-                    Ok(Value::Null) => {
-                        push.remove(&property);
-                    }
-                    Ok(value) => {
-                        push.set(property, value);
-                    }
-                    Err(err) => {
-                        response.not_updated.append(id, err);
-                        continue 'update;
-                    }
-                };
+                    response.not_updated.append(id, err);
+                    continue 'update;
+                }
             }
 
             // Update record
-            let mut batch = BatchBuilder::new();
             batch
                 .with_account_id(account_id)
                 .with_collection(Collection::PushSubscription)
                 .update_document(document_id)
-                .value(Property::Value, push, F_VALUE);
-            self.write_batch(batch).await?;
+                .set(
+                    Property::Value,
+                    Archiver::new(push)
+                        .serialize()
+                        .caused_by(trc::location!())?,
+                )
+                .commit_point();
             response.updated.append(id, None);
         }
 
@@ -179,17 +177,21 @@ impl JMAP {
             let document_id = id.document_id();
             if push_ids.contains(document_id) {
                 // Update record
-                let mut batch = BatchBuilder::new();
                 batch
                     .with_account_id(account_id)
                     .with_collection(Collection::PushSubscription)
                     .delete_document(document_id)
-                    .value(Property::Value, (), F_VALUE | F_CLEAR);
-                self.write_batch(batch).await?;
+                    .clear(Property::Value)
+                    .commit_point();
                 response.destroyed.push(id);
             } else {
                 response.not_destroyed.append(id, SetError::not_found());
             }
+        }
+
+        // Write changes
+        if !batch.is_empty() {
+            self.commit_batch(batch).await.caused_by(trc::location!())?;
         }
 
         // Update push subscriptions
@@ -204,78 +206,94 @@ impl JMAP {
 fn validate_push_value(
     property: &Property,
     value: MaybePatchValue,
-    current: Option<&Object<Value>>,
-) -> Result<Value, SetError> {
-    Ok(match (property, value) {
+    push: &mut PushSubscription,
+    is_create: bool,
+) -> Result<(), SetError> {
+    match (property, value) {
         (Property::DeviceClientId, MaybePatchValue::Value(Value::Text(value)))
-            if current.is_none() && value.len() < 255 =>
+            if is_create && value.len() < 255 =>
         {
-            Value::Text(value)
+            push.device_client_id = value;
         }
         (Property::Url, MaybePatchValue::Value(Value::Text(value)))
-            if current.is_none() && value.len() < 512 && value.starts_with("https://") =>
+            if is_create && value.len() < 512 && value.starts_with("https://") =>
         {
-            Value::Text(value)
+            push.url = value;
         }
         (Property::Keys, MaybePatchValue::Value(Value::Object(value)))
-            if current.is_none()
-                && value.properties.len() == 2
-                && matches!(value.get(&Property::Auth), Value::Text(auth) if auth.len() < 1024 &&
-                general_purpose::URL_SAFE.decode(auth).is_ok())
-                && matches!(value.get(&Property::P256dh), Value::Text(p256dh) if p256dh.len() < 1024 &&
-                general_purpose::URL_SAFE.decode(p256dh).is_ok()) =>
+            if is_create && value.0.len() == 2 =>
         {
-            Value::Object(value)
+            if let (Some(auth), Some(p256dh)) = (
+                value
+                    .get(&Property::Auth)
+                    .as_string()
+                    .and_then(|v| general_purpose::URL_SAFE.decode(v).ok()),
+                value
+                    .get(&Property::P256dh)
+                    .as_string()
+                    .and_then(|v| general_purpose::URL_SAFE.decode(v).ok()),
+            ) {
+                push.keys = Some(Keys { auth, p256dh });
+            } else {
+                return Err(SetError::invalid_properties()
+                    .with_property(property.clone())
+                    .with_description("Failed to decode keys."));
+            }
         }
         (Property::Expires, MaybePatchValue::Value(Value::Date(value))) => {
             let current_time = now() as i64;
             let expires = value.timestamp();
-            Value::Date(UTCDate::from_timestamp(
-                if expires > current_time && (expires - current_time) > EXPIRES_MAX {
-                    current_time + EXPIRES_MAX
-                } else {
-                    expires
-                },
-            ))
+            push.expires = if expires > current_time && (expires - current_time) > EXPIRES_MAX {
+                current_time + EXPIRES_MAX
+            } else {
+                expires
+            } as u64;
         }
         (Property::Expires, MaybePatchValue::Value(Value::Null)) => {
-            Value::Date(UTCDate::from_timestamp(now() as i64 + EXPIRES_MAX))
+            push.expires = now() + EXPIRES_MAX as u64;
         }
-        (Property::Types, MaybePatchValue::Value(Value::List(value)))
-            if value.iter().all(|value| {
-                value
+        (Property::Types, MaybePatchValue::Value(Value::List(value))) => {
+            push.types.clear();
+
+            for item in value {
+                if let Some(dt) = item
                     .as_string()
                     .and_then(|value| DataType::try_from(value).ok())
-                    .is_some()
-            }) =>
-        {
-            Value::List(value)
+                {
+                    push.types.insert(dt);
+                } else {
+                    return Err(SetError::invalid_properties()
+                        .with_property(property.clone())
+                        .with_description("Invalid data type."));
+                }
+            }
         }
-        (Property::VerificationCode, MaybePatchValue::Value(Value::Text(value)))
-            if current.is_some() =>
-        {
-            if current
-                .as_ref()
-                .unwrap()
-                .properties
-                .get(&Property::Value)
-                .map_or(false, |v| matches!(v, Value::Text(v) if v == &value))
-            {
-                Value::Text(value)
+        (Property::VerificationCode, MaybePatchValue::Value(Value::Text(value))) if !is_create => {
+            if push.verification_code == value {
+                push.verified = true;
             } else {
                 return Err(SetError::invalid_properties()
                     .with_property(property.clone())
                     .with_description("Verification code does not match.".to_string()));
             }
         }
-        (
-            Property::Keys | Property::Types | Property::VerificationCode,
-            MaybePatchValue::Value(Value::Null),
-        ) => Value::Null,
+        (Property::Keys, MaybePatchValue::Value(Value::Null)) => {
+            push.keys = None;
+        }
+        (Property::Types, MaybePatchValue::Value(Value::Null)) => {
+            push.types = Bitmap::all();
+        }
+        (Property::VerificationCode, MaybePatchValue::Value(Value::Null)) => {}
         (property, _) => {
             return Err(SetError::invalid_properties()
                 .with_property(property.clone())
                 .with_description("Field could not be set."));
         }
-    })
+    }
+
+    if is_create && push.types.is_empty() {
+        push.types = Bitmap::all();
+    }
+
+    Ok(())
 }
